@@ -17,7 +17,8 @@ M1 tasks gate all app work; M2 slice gates M3/M4 polish.
 
 ## Prerequisites
 
-- Rust stable 1.90 (`rustup`), `git`, Linux dev box (cross-builds for Win/macOS only in M5).
+- Rust stable 1.95 (`rustup`; Bevy 0.19.1 MSRV is rustc 1.95.0 — bumped from 1.90 during T1),
+  `git`, Linux dev box (cross-builds for Win/macOS only in M5).
 - Verified dependency versions (crates.io, 2026-09-26 amendment — **author directive: use
   latest stable Bevy, supersedes the 0.18.1 pin**):
   - `bevy = 0.19.1` (max stable; 0.20.0-rc.1 exists — do **not** use). Feature collections:
