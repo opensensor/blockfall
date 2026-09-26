@@ -462,9 +462,32 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: Unit-test the letterbox rect math (cell size/offset at several window
   sizes); headless render-app smoke test; visual: stack/active/ghost correct under resize;
   ≥58 FPS avg measured via frame-time log in a 60 s scripted run (method stated in test).
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-09-26 — commit 62d38e3. Cells drawn **only** from
+  `GameCore.game.snapshot()` (non-send: system param `Option<NonSend<GameCore>>`); zero
+  rules recomputed. One `Sprite` entity per cell (Bevy 0.19.1: `Sprite` itself is the
+  component — `Sprite2d` gone; color-tint + `custom_size`, built-in quad from sprite
+  pipeline), pooled in private `CellPool` resource, fully refreshed each `Update`
+  (≤~210 entities; sim already ran: `RunFixedMainLoop` precedes `Update`, so latest
+  snapshot is read once per frame — sim/render decoupling is free). Visible field =
+  board rows `HIDDEN_ROWS..ROWS` (10×20), square cells, centered letterbox; cells above
+  `HIDDEN_ROWS` (spawn buffer) are clipped — hidden active piece still draws its ghost.
+  Layers via transform-z (renderer relies on `Transparent2d` sort key = z; no `ZIndex`
+  in 0.19): Board 0 < Ghost 1 < Active 2. Ghost = active color `with_alpha(0.3)`.
+  Plain background (no grid lines) — allowed by plan. **Pub API for T13/T17/T19**:
+  `PIECE_COLORS: [Color; 7]` + `PIECE_RGB` indexed by `Piece::ALL` order (I cyan, J blue,
+  L orange, O yellow, S green, T purple, Z red — Guideline palette; PRD §3 names pieces
+  only, no hexes) and `piece_color(Piece) -> Color` for HUD mini-grids/hold box;
+  `GHOST_ALPHA: f32`; `letterbox(window_w, window_h) -> (cell, offset_x, offset_y)`
+  for any playfield-anchored UI/juice math; `frame_cells(&GameSnapshot) -> Vec<SnapshotCell>`
+  (`{row, col, piece, kind}`, clipped to visible rows, `.color()/.z()`) reusable for HUD
+  previews; `CellKind {Board, Active, Ghost}` + `pub struct PlayfieldCell { pub kind }`
+  marker (T19 juice can filter/transform sprites by kind); `VISIBLE_ROWS = 20`.
+  4 new tests (letterbox math at 5 window shapes; hidden-spawn clipping; scripted
+  actions → entity counts vs independently recomputed expectation + palette/ghost-alpha/
+  position/z checks; resize reflow): 131 workspace total green. fmt/clippy clean.
+  Deferred to T14 human gate: ≥58 FPS frame-time log run + visual resize sanity.
+- **files edited/created**: `crates/tetris-app/src/render.rs`
 
 ### T12: Input map, DAS/ARR
 - **depends_on**: [T10]
