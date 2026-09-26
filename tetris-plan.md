@@ -223,9 +223,22 @@ T23: [T22]       WASM build (stretch, M6)
   (level up every 10 lines).
 - **validation**: Boundary tests: level 1 = 1.000 s/row = 60 ticks @ 60 Hz, level 19 = 1/19 s,
   level 20 = 1/20 s = 3 ticks (20G cap), lines 9/10/19/20 → levels 1/2/2/3.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T5): Implemented test-first (RED captured: 26 compile errors, then GREEN:
+    14 unit tests; crate total 56, T2/T3's 42 untouched). API: `TICK_HZ = 60`,
+    `GRAVITY_CAP_LEVEL = 20`, `TICKS_20G = 3`, `interval_for(level: u32) -> u32` (whole
+    ticks between forced rows), `level_for(lines_cleared_total: u32) -> u32`
+    (= lines/10 + 1). Rounding rule: `round(60/level)` ticks, halves round up via integer
+    `(2*60 + level) / (2*level)` — level 1 = 60 (exact 1 s/row), level 8 = 7.5 → 8,
+    level 19 = 3.16 → 3 ticks (0.050 s/row, nearest whole tick to 1/19 s), level 20 = 3
+    exact. Clamp policy: level 0 treated defensively as level 1; every level ≥ 20 clamps
+    to `TICKS_20G` before any division (u32::MAX safe; >20G speeds out of scope). Covers
+    plan boundaries plus monotonic non-increasing interval over levels 1..=30 and
+    level_for 0/9/10/19/20 → 1/1/2/2/3 sanity sweep over 0..100 lines. `cargo fmt
+    --check` and `cargo clippy -p tetris-core --all-targets -- -D warnings` clean. Core
+    stays pure: no wall-clock, interval is consumed per logical tick by T8's Game loop.
+- **files edited/created**: `crates/tetris-core/src/gravity.rs` (replaced stub)
 
 ### T6: Actions, hold, lock delay
 - **depends_on**: [T2, T3, T4]
