@@ -181,9 +181,26 @@ T23: [T22]       WASM build (stretch, M6)
   same sequence.
 - **validation**: Unit tests — permutation invariant over 1000 bags, determinism, peek ≤ queue
   depth auto-refills.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T3): Implemented test-first (RED captured: 20 compile errors, then GREEN:
+    14 unit tests — 6 in `prng.rs`, 8 in `bag.rs`; crate total 42, T2's 28 untouched).
+    PRNG choice: SplitMix64 (`Rng::new(seed)`, `next_u64()`, `next_below(n)` — unbiased
+    Lemire multiply-shift, no deps, no std RNG/wall-clock; seed 0/1/MAX verified
+    non-degenerate). Bag: `Bag::new(seed)`, `next() -> Piece`, `peek(n) -> Vec<Piece>`;
+    internal `RefCell<BagState { rng, queue: VecDeque<Piece> }>` so `peek(&self, n)`
+    auto-refills across bag boundaries and always returns exactly `n` pieces without
+    consuming (repeat peeks stable). Each bag is a fresh Fisher–Yates shuffle of
+    `Piece::ALL` driven by the PRNG; permutation invariant confirmed over 1000 bags
+    (every aligned group of 7 is a full permutation), plus determinism (same seed →
+    identical 700-piece sequences), seed divergence, peek/drain agreement over 100
+    rounds, and first-piece distribution (all 7 appear across 200 seeds). PRNG not
+    exposed. Notes for T8: `Game::new(seed)` should own one `Bag::new(seed)` and call
+    `bag.next()` per spawn (keep `&mut self` access; `next` is `&mut self`, `peek` is
+    `&self`); for the snapshot's next-queue (1–6 pieces) use `bag.peek(n)` — it never
+    disturbs the deal sequence, so replays from the same seed stay identical. `cargo fmt
+    --check` and `cargo clippy -p tetris-core --all-targets -- -D warnings` clean.
+- **files edited/created**: `crates/tetris-core/src/prng.rs`, `crates/tetris-core/src/bag.rs`
 
 ### T4: SRS rotation, wall kicks, 180°
 - **depends_on**: [T2]
