@@ -152,9 +152,26 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: Unit tests — collision at walls/floor/stack, full-row detection, shift-down
   ordering, spawn rows, out-of-bounds guards, `ghost_row` on partial-stack fixtures.
   `cargo test -p tetris-core` green.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T2): Implemented test-first (RED captured, then GREEN: 28 unit tests,
+    12 in `piece.rs`, 16 in `board.rs`). Design decisions: piece geometry fully owned by
+    `piece.rs` — `Piece::cells(rot)` returns the 4 pure SRS rotation-state cell tables
+    (no kicks; `srs.rs` left as stub); `Rotation` = Spawn/Cw/R180/Ccw with mod-4
+    `clockwise()/counter_clockwise()/half_turn()` plus `index()/from_index()`;
+    `PieceState.row/col` is the bounding-box top-left (3x3 JLSTZ, 4x4 I, 2x2 O) and may be
+    negative. Spawn convention for T8: `spawn_state(piece)` places box at `row=0` (cells land
+    fully in hidden rows 0..2) with `col=(COLS-box_size)/2` → guideline cols (I 3..=6, JLSTZ
+    box 3..=5, O 4..=5). `collides` treats `row<0` as non-colliding (block-out detection);
+    `merge`/`set` silently skip OOB cells (never panic). Line clear is in-place
+    `clear_full_rows(&mut self) -> usize`, bottom-up survivor compaction preserving shift-down
+    ordering across non-adjacent lines. `ghost_row(&Board,&PieceState)->i32` free fn:
+    rests on floor/stack, returns input row unchanged when already colliding. Added
+    `Board::get/set` accessors (needed by tests/fixtures and T8 `GameSnapshot` board cells).
+    Notes for T4: consume `Piece::cells` + `Rotation::index` for kick tables; JLSTZ/I tables
+    verified against canonical SRS; rotation tables are kick-free by design. `cargo fmt
+    --check` and `cargo clippy -p tetris-core --all-targets -- -D warnings` clean.
+- **files edited/created**: `crates/tetris-core/src/piece.rs`, `crates/tetris-core/src/board.rs`
 
 ### T3: 7-bag randomizer
 - **depends_on**: [T1]
