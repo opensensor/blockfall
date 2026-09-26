@@ -642,9 +642,42 @@ T23: [T22]       WASM build (stretch, M6)
   `GameEvent` variant — exactly one SFX play per event incl. TSpinDetected/HoldPerformed/
   PerfectClear/ComboChanged (no duplicates on re-entrant frames); volumes react to
   programmatic `Settings` changes (slider wiring verified in T16); pause ducks music.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Kira **real path used** — `bevy_kira_audio 0.26.0` compiles and runs against Bevy
+  0.19.1; no fallback needed. Workspace dep gained `features = ["wav"]` (default is
+  ogg-only → no WAV loader). Headless behavior: kira's `AudioManager` init failure
+  warns and degrades (no panic) on this host; the committed interop test still runs
+  with the `AudioEnabled(false)` guard so device-less CI boxes stay deterministic —
+  an unguarded experiment run also passed (no cpal panic).
+  Assets (`assets/generate.py`, committed, deterministic seed): 44.1 kHz mono 16-bit —
+  `sfx/move` (5.3 KB), `sfx/rotate` (4.5), `sfx/lock` (8.0), `sfx/line-clear` (13.3),
+  `sfx/tetris` (25.2, 0.285 s), `sfx/tspin` (19.4), `sfx/level-up` (22.1),
+  `sfx/hard-drop` (6.2 noise), `sfx/hold` (6.2), `sfx/game-over` (26.5, 0.3 s),
+  `bgm_loop.wav` (176 KB, exactly 2.000 s, integer-period seam → click-free loop).
+  SfxDirector pub API: `plays: HashMap<&'static str, u32>` (per event-variant label,
+  exactly one increment per `CoreEvent` message via `MessageReader` — no polling),
+  `pending_sfx: VecDeque<Sfx>` (drained by the kira system), `master/sfx/music_volume`,
+  `ducked`, `sfx_gain`, `music_gain`, `bgm_started`, methods `handle_event`,
+  `set_gains`, `set_ducked`; `DUCK_GAIN = 0.25`. Mapping: `sfx_for_event` is a
+  wildcard-free match (new variants fail to compile): LineCleared{4}→tetris, other
+  LineCleared→line-clear, PerfectClear→tetris fanfare (own label), ComboChanged→move
+  tick; spawn/score silent. Two typed kira channels (`SfxTrack`, `MusicTrack`) carry
+  `master*sfx` / `master*music*duck` gains; BGM starts once, loops, ducks on
+  `SimPaused(true)` **or** `AppState != Playing`. Guard: `AudioEnabled(pub bool)`
+  (plugin defaults true; tests insert false before the plugin) makes all `AudioControl`
+  calls inert while counting/gains stay live; the kira stack is only wired at all when
+  `AssetPlugin` is present (keeps T1 MinimalPlugins smoke tests device-free). Move/
+  rotate/hard-drop WAVs ship as cues but no `GameEvent` exists for them — T12/T19 can
+  call `SfxDirector::handle_event`-adjacent playback via `pending_sfx` if desired
+  (deferred, out of scope). Asset root resolves relative to process CWD, so run the
+  binary from `crates/tetris-app/` (or ship `assets/` next to the executable — T20).
+  5 new tests (162 workspace total, was 157): exhaustive mapping + distinct wavs,
+  every-variant fixture one-play-per-counter incl. TSpinDetected/HoldPerformed/
+  PerfectClear/ComboChanged with empty-second-frame duplicate check, settings-change
+  gain reaction, SimPaused/AppState duck + restore, kira headless wiring smoke.
+- **files edited/created**: `crates/tetris-app/src/audio.rs` (rewritten from stub),
+  `crates/tetris-app/assets/generate.py`, `crates/tetris-app/assets/sfx/*.wav` (10),
+  `crates/tetris-app/assets/bgm_loop.wav`, `Cargo.toml` (wav feature), `Cargo.lock`.
 
 ### T19: Juice — flash, freeze frames, shake
 - **depends_on**: [T11, T15, T18]
