@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 tetris-core = { workspace = true }
-bevy = { workspace = true }
+bevy = { workspace = true, features = ["serialize"] }
 bevy_kira_audio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
