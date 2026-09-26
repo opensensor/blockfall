@@ -272,9 +272,17 @@ T23: [T22]       WASM build (stretch, M6)
   one-per-piece flag, first press swaps in from bag head, hold cell persists.
 - **validation**: Unit tests — force-lock after 15 resets, timer resets on successful shift but
   not on failed move, double-hold rejected, first-hold consumes bag not previous hold slot.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26: TDD (RED stubs-only → GREEN). `Action` enum per PRD §13 (Copy/Eq/Debug + serde);
+    `LockTimer` 30-tick grounded countdown (`LOCK_DELAY_TICKS=30`, `MAX_RESETS=15`), reset only on
+    successful manipulation, 16th reset force-locks, unground cancels window, `force_now()` for
+    next-tick lock; `HoldSlot` with `try_hold(active, bag_next) -> Option<HoldSwap>` (None = rejected
+    double press), first press consumes bag head, cell persists, `end_piece()` clears used flag.
+    14 new unit tests; suite 83 passed. `cargo fmt --all --check` and
+    `cargo clippy -p tetris-core --all-targets -- -D warnings` clean.
+- **files edited/created**: `crates/tetris-core/src/actions.rs`, `crates/tetris-core/src/lock.rs`,
+  `crates/tetris-core/src/hold.rs`
 
 ### T7: Scoring, B2B/combo, T-spin detection
 - **depends_on**: [T2, T4]
