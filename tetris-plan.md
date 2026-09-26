@@ -120,9 +120,26 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: `cargo test` green incl. a headless smoke test (App with `visible: false`
   windows builds and exits after N frames); `cargo run` opens a window manually; `cargo fmt
   --check` and `cargo clippy --all-targets -- -D warnings` clean.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-09-26 — commit 429b93e. Bevy bumped 0.18.1→0.19.1 per author directive;
+  bevy_kira_audio 0.26.0 compat confirmed (builds against 0.19.1, no fallback needed).
+  Toolchain: `rust-toolchain.toml` pinned 1.90→**1.95** — Bevy 0.19.1's MSRV is rustc 1.95.0
+  (cargo refused to resolve under 1.90); prerequisites' "Rust stable 1.90" line is superseded
+  by this. 0.19 API drift fixed in stubs: `init_resource` requires `FromWorld`/`Default`
+  (`RebindingCapture` given a final shape with `capturing: bool` flag — a presence-only unit
+  struct was incompatible with `main.rs`'s permanent `init_resource` wiring); plugin tuples no
+  longer implement `PluginGroup` (plain `add_plugins((..))` still works); winit refuses
+  event-loop creation off the main thread, so the hidden-window smoke test uses
+  `MinimalPlugins + WindowPlugin` (no winit) — fully headless, no display needed, <0.1 s.
+  `cargo build/test --workspace` green (2 headless smoke tests), `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean. TDD `reason_not_testable`: scaffold task;
+  the headless smoke test is itself the acceptance artifact. Deferred manual check: interactive
+  `cargo run` window (no display exercised in this environment).
+- **files edited/created**: Cargo.toml, Cargo.lock, rust-toolchain.toml, rustfmt.toml,
+  crates/tetris-core/Cargo.toml, crates/tetris-core/src/{lib,actions,bag,board,event,game,
+  gravity,hold,lock,piece,prng,score,srs,tspin}.rs, crates/tetris-app/Cargo.toml,
+  crates/tetris-app/src/{main,state,core_bridge,render,input,hud,screens_menu,
+  screens_settings,settings_persist,audio,juice}.rs
 
 ### T2: Core types & board
 - **depends_on**: [T1]
