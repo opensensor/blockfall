@@ -211,9 +211,32 @@ T23: [T22]       WASM build (stretch, M6)
   standard set). Pure function of board + piece state.
 - **validation**: Table-driven tests for every piece/state/direction incl. classic kicks
   (I against left wall, T spin setup, O no-op). Kick index reported correctly.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T4): Implemented test-first (RED captured: unresolved-import compile
+    error, then GREEN: 13 unit tests; crate total 69, the 56 pre-existing tests
+    untouched). API: `RotateDir {Clockwise, CounterClockwise, HalfTurn}`,
+    `RotationAttempt {state: PieceState, kick_index: u8}`,
+    `try_rotate(&Board, &PieceState, RotateDir) -> Option<RotationAttempt>`,
+    `kick_offsets(RotateDir, Piece, Rotation) -> &'static [(i32, i32)]`. Coord
+    convention: tables hold the SRS spec's (x, y) with +y UP; board rows grow DOWN, so
+    `try_rotate` applies `col += x, row -= y` — the JLSTZ 0→R and I 0→R rows are
+    pinned verbatim in tests to catch sign errors. Tables JLSTZ_CW/CCW and I_CW/CCW
+    are indexed `[from][trial]`, 5 trials each, first always (0,0), verbatim per spec;
+    O returns the single no-offset trial and always succeeds at kick_index 0.
+    180 policy (SRS defines none): guideline-style
+    `HALF_TURN = [(0,0), (-1,0), (1,0), (0,-1), (1,-1)]` — in place first, then ±1-col
+    nudges, 1-row drop, drop+right nudge; same set for every transition; new rot =
+    `ps.rot.half_turn()`; `None` when wedged. `kick_index` is the 0-based trial index
+    (0 = no offset, 4 = far SRS kick). Note for T7: persist `kick_index` from the last
+    successful rotation — the T-spin Mini rule hinges on kick_index == 4 vs < 4, so
+    `tspin` needs the index, not just the rotated state. Tests: open-space index 0 for
+    all 7 pieces × 8 quarter transitions and all half turns; I floor kicks off both
+    walls (index 4 CW left, index 3 CCW right); T left-wall kick (index 1); O no-op
+    success in every direction; 1-high-slit wedged I → None for every quarter dir;
+    half-turn open index 0, notched-slot kick (index 1), 2×3-chamber wedged → None;
+    negative-row overhang rotates at index 0 (T2 convention).
+- **files edited/created**: `crates/tetris-core/src/srs.rs`
 
 ### T5: Gravity & level curve
 - **depends_on**: [T1]
