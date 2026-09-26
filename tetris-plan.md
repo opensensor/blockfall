@@ -395,9 +395,31 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: `cargo test -p tetris-core` green; `cargo test -p tetris-core -- --ignored`
   completes the timed soak without panic; shrinking yields minimal failing cases on injected
   bugs (spot-check).
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26: `tests/invariants.rs` — 3 proptest properties @ 256 cases (random
+    `Vec<(Action, 0..5 ticks)>` drives) + 3 plain tests; `tests/soak.rs` — `#[ignore]`d
+    `crash_free_soak_1h` (splitmix64-driven random play, 1 h wall-clock budget, per-step
+    spot-checks). Properties asserted every step: active piece never overlaps filled/OOB
+    cells (`board.collides` false while `!game_over`); score monotonic non-decreasing;
+    board dims valid (22×10, `full_rows` indices in range) and never a full row left
+    uncleared (incl. explicit scan after every `LineCleared`); `hold_used` exactly mirrors
+    the event model (true after `HoldPerformed`, re-armed only by `PieceLocked`);
+    `game_over` freezes all state (`apply`/`tick` silent no-ops, snapshot unchanged);
+    snapshot next-queue length in 1..=6; combo/b2b never invalid (combo `u32` ≥ 0 and
+    ≤ total lines; `combo`/`lines` cross-checked against event stream).
+  - GREEN: `cargo test -p tetris-core` → 111 lib + 6 invariants passed, 0 failed, soak
+    ignored, whole suite in 0.04 s (well under 60 s budget). `cargo fmt --all --check`
+    clean; `cargo clippy -p tetris-core --all-targets -- -D warnings` clean; soak binary
+    confirmed compiling via `cargo test -p tetris-core --no-run`.
+  - Spot-check (RED evidence for the assertions without touching core source): two
+    negative-control tests plant deliberate violations into crafted `GameSnapshot`s
+    (active O overlapping filled cells; a full uncleared row; empty/oversized next queue;
+    combo > lines) and assert the shared checkers reject each — proving the invariant
+    expressions bite, so a real regression would shrink to a minimal case.
+  - Run soak: `cargo test -p tetris-core -- --ignored` (nightly CI only, per plan).
+- **files edited/created**: `crates/tetris-core/tests/invariants.rs` (new),
+  `crates/tetris-core/tests/soak.rs` (new), `tetris-plan.md`
 
 ### T10: App bootstrap & fixed-step core bridge
 - **depends_on**: [T1, T8]
