@@ -434,9 +434,23 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: Headless test: simulated ticks advance core; restart resets core AND
   snapshot is fully re-renderable from tick 0; no sim work in render schedule; `SimPaused`
   truly halts core stepping while events still drain.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-09-26 — commit 52b1c97. Names later tasks import from `core_bridge`:
+  `GameCore` (fields `game`, `seed`, `steps`, `pending_events`; `restart()`/`restart_with(seed)`)
+  — **non-send resource** (`Res<NonSend<GameCore>>`/`NonSendMut<GameCore>`/`world.non_send()`)
+  because `Game`'s bag `RefCell` makes it `!Sync`; `PendingActions { pub queue: VecDeque<Action> }`
+  (`push()`); `SimPaused(pub bool)`; `CoreEvent(pub GameEvent)` message newtype consumed via
+  `MessageReader<CoreEvent>` (`add_message::<CoreEvent>()`). Bevy 0.19.1 API drift absorbed:
+  `Events<T>`→`Messages<M>`, `add_event`→`add_message`, `send`→`write` (core crate stays
+  Bevy-free → newtype needed anyway by orphan rules). System `core_bridge_system` in
+  `FixedUpdate` (sub-schedule of `bevy::app::FixedMain`, run inside `RunFixedMainLoop` between
+  `PreUpdate` and `Update`, i.e. ahead of render); `Time<Fixed>` overwritten to 60 Hz
+  (TimePlugin default 64). Flow: Playing && !SimPaused → drain `PendingActions` → `game.apply()`
+  each → `game.tick()` → events buffered in `GameCore::pending_events`, then flushed to
+  `Messages<CoreEvent>` **every** fixed step even while gated (actions HOLD, not dropped).
+  `GameEvent::GameOver` → `AppState::GameOver`. Guarded Startup system spawns `Camera2d`
+  (render.rs stub has none). 8 new headless tests (127 workspace total green).
+- **files edited/created**: `crates/tetris-app/src/core_bridge.rs`
 
 ### T11: Playfield renderer
 - **depends_on**: [T10]
