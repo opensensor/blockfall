@@ -505,9 +505,36 @@ T23: [T22]       WASM build (stretch, M6)
   first repeat after exactly DAS-ticks, then ARR-tick cadence; release stops; rotate/hold/
   hard-drop single-trigger per press; emission suppressed while `RebindingCapture` set;
   wheel events map to rotations.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-09-26. `gameplay_input_system` runs on **`FixedPreUpdate`** — the `FixedMain`
+  sub-schedule immediately before the bridge's `FixedUpdate` drain, giving the PRD §10.3
+  `input → apply actions → core step` order with same-step queue consumption. Repeat machine
+  is **tick-count based** (no wall clock): `RepeatTimer::advance()` per fixed step; DAS/ARR ms
+  converted via pure `ticks_for(ms, hz)` (150→9, 33→2, ARR clamped ≥1); press fires on the
+  step it is sampled, first repeat exactly 9 ticks later, then every 2nd — verified by
+  integration test at `[1, 10, 12, 14, 16]` over 16 steps (press tick consumes step 1).
+  Per-press-tick edge detection is snapshot-based (`InputMachine::prev_pressed`), not
+  `just_pressed`, so multiple fixed steps per frame can't double-fire and reopening the gate
+  never replays a stale press. Single repeat **focus** across left/right ⇒ at most one action
+  kind per step; reversal press emits immediately and steals the focus; release resets that
+  key's timer, release-of-focus falls back to the still-held other direction. Soft drop has
+  **no DAS**: press + held cadence `soft_drop_period_ticks(mult, 60)` (×20 → every 3rd tick).
+  Wheel: Bevy 0.19.1 renamed the wheel event to a **`MouseWheel` Message** (`MessageReader`)
+  — aggregated per step, net direction, ≤1 rotation/kind, gated consumption (drained even
+  while suppressed so nothing bursts later). Emission gated on `AppState::Playing` ∧
+  `!RebindingCapture.capturing`; `Pause` slot in the table, never emitted here. PRD §6.4 "Q/E"
+  superseded by §9 + wheel, recorded in the module doc comment. §9 table + plan implemented
+  verbatim; `InputPlugin` also `init_resource`s `ButtonInput<KeyCode>`/`MouseWheel` message
+  defensively for headless `MinimalPlugins` tests. New pub items for **T16** rebinding UI:
+  `KeyBindings` (`slot`/`slot_mut`/`set_slot`/`reset_slot`/`default_slot`), `Bind`
+  (`Key`/`WheelUp`/`WheelDown`), `BindSlot` + `ALL_BIND_SLOTS` (display order), capture helper
+  `pressed_key_to_bind(&ButtonInput<KeyCode>) -> Option<Bind>`, and `RepeatTimer`
+  (`new(ms, ms)`/`with_ticks`/`press`/`advance`/`release`/`is_held`,
+  `DEFAULT_DAS_TICKS`/`DEFAULT_ARR_TICKS`) for live DAS/ARR preview.
+  Tests: +14 (7 pure state machine, 7 headless integration incl. core-step handoff);
+  workspace 145 passed, 0 failed; fmt/clippy(-D warnings) green.
+- **files edited/created**: `crates/tetris-app/src/input.rs` (full implementation;
+  main.rs registration already in place from scaffold).
 
 ### T13: HUD
 - **depends_on**: [T11]
