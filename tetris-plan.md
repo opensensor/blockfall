@@ -18,16 +18,19 @@ M1 tasks gate all app work; M2 slice gates M3/M4 polish.
 ## Prerequisites
 
 - Rust stable 1.90 (`rustup`), `git`, Linux dev box (cross-builds for Win/macOS only in M5).
-- Verified dependency versions (crates.io, 2026-09-25):
-  - `bevy = 0.18.1` (stable; 0.20 is RC-only — do **not** use). Feature collections: use
-    `default-features = false, features = ["2d", "ui"]` (`2d` already pulls `ui`, `audio`,
+- Verified dependency versions (crates.io, 2026-09-26 amendment — **author directive: use
+  latest stable Bevy, supersedes the 0.18.1 pin**):
+  - `bevy = 0.19.1` (max stable; 0.20.0-rc.1 exists — do **not** use). Feature collections:
+    use `default-features = false, features = ["2d", "ui"]` (`2d` already pulls `ui`, `audio`,
     `scene`, `picking`).
-  - `bevy_kira_audio = 0.26.0` (0.27.0-rc exists; verify Bevy 0.18 compatibility in T18 —
-    fallback is Bevy's built-in `audio` feature, already enabled by `2d`).
+  - `bevy_kira_audio = 0.26.0` — declares `bevy ^0.19.0`, so compatibility with 0.19.1 is
+    confirmed from its manifest (T18's compile spike is now a formality; fallback remains
+    Bevy's built-in `audio` feature, already enabled by `2d`).
   - `serde = 1.0.229` + `serde_json`, `dirs = 7.0.0`, `proptest = 1.11.0` (dev-dep).
-- Bevy 0.18 references for app tasks: standard UI widgets emit `ValueChange<T>` events;
+- Bevy 0.19 references for app tasks: standard UI widgets emit `ValueChange<T>` events;
   `AutoDirectionalNavigation` for keyboard/gamepad menu focus; `EasyScreenshotPlugin` for
-  M5 README screenshots; fixed-timestep update pattern per Bevy 0.18 `FixedTimestep` docs.
+  M5 README screenshots; fixed-timestep update pattern per Bevy 0.19 `FixedTimestep` docs.
+  API names verified at T1 scaffold; app tasks re-verify against `cargo doc` before use.
 - Parallel-agent rules:
   - **T1 pre-creates the full module tree and ALL workspace dependencies** so parallel tasks
     never co-edit `Cargo.toml` or `lib.rs`/`mod.rs` wiring. After T1: **no dependency
@@ -99,7 +102,7 @@ T23: [T22]       WASM build (stretch, M6)
 ### T1: Workspace scaffold
 - **depends_on**: []
 - **location**: `Cargo.toml`, `rust-toolchain.toml`, `crates/tetris-core/**`, `crates/tetris-app/**`, `rustfmt.toml`
-- **description**: Cargo workspace with `tetris-core` (lib) and `tetris-app` (bin, Bevy 0.18.1,
+- **description**: Cargo workspace with `tetris-core` (lib) and `tetris-app` (bin, Bevy 0.19.1,
   `default-features = false, features = ["2d","ui"]`). Pre-create the FULL module stub tree so
   parallel tasks never share files: core = `board.rs`, `piece.rs`, `bag.rs`, `srs.rs`,
   `gravity.rs`, `actions.rs`, `lock.rs`, `hold.rs`, `score.rs`, `tspin.rs`, `game.rs`,
@@ -326,7 +329,7 @@ T23: [T22]       WASM build (stretch, M6)
 ### T16: Settings screen, rebinding, sliders
 - **depends_on**: [T12, T15]
 - **location**: `crates/tetris-app/src/screens_settings.rs`
-- **description**: Settings UI in the `SettingsScreenPlugin` stub (Bevy 0.18 widgets +
+- **description**: Settings UI in the `SettingsScreenPlugin` stub (Bevy 0.19 widgets +
   `ValueChange` events, `AutoDirectionalNavigation`): key rebinding capture flow (incl. the
   `Pause` chord — sets/clears `RebindingCapture` so T12 mutes emission during capture),
   master/SFX/music volumes, DAS/ARR, next-queue size (1–6), **effects quality
@@ -359,7 +362,8 @@ T23: [T22]       WASM build (stretch, M6)
 - **depends_on**: [T10]
 - **location**: `crates/tetris-app/src/audio.rs`, `crates/tetris-app/assets/`
 - **description**: First sub-step: verify `bevy_kira_audio 0.26.0` compiles against Bevy
-  0.18.1; if not, fall back to built-in audio (`2d` feature) — record choice. Wire core
+  0.19.1 (kira 0.26.0 declares `bevy ^0.19` — compat confirmed pre-spike); if not, fall back
+  to built-in audio (`2d` feature) — record choice. Wire core
   events → SFX set (move/rotate/lock/clear/tetris/t-spin/level/hard-drop/hold/game-over),
   looping BGM, per-volume settings, ducking on pause.
 - **validation**: Machine-checked with an `EventReader` count against a fixture spawning every
@@ -466,12 +470,13 @@ T23: [T22]       WASM build (stretch, M6)
 
 ## Risks & Mitigations
 
-- **bevy_kira_audio 0.26 ↔ Bevy 0.18 compat unknown** → T18 opens with a 15-minute compile
-  spike; fallback to built-in audio already enabled by the `2d` feature. Zero schedule impact.
+- **bevy_kira_audio 0.26 ↔ Bevy 0.19 compat** → resolved: kira 0.26.0 requires `bevy ^0.19.0`.
+  T18 keeps a short compile spike; fallback to built-in audio already enabled by the `2d`
+  feature. Zero schedule impact.
 - **Parallel file contention** (agents editing same files) → T1 pre-creates module stubs and
   ALL dependencies; plan assigns exclusive file ownership per task; no shared `Cargo.toml`
   edits after T1.
-- **Bevy 0.18 API churn at upgrade time** → pinned minor; upgrades only between milestones,
+- **Bevy 0.19 API churn at upgrade time** → pinned minor; upgrades only between milestones,
   core crate keeps it cheap (PRD §13).
 - **Freeze-frame vs fixed-step bridge** can eat inputs or double-lock pieces → T19 freezes
   simulation stepping only and buffers actions; covered by its validation clause.

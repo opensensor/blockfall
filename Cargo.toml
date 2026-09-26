@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/tetris-core", "crates/tetris-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui"] }
+bevy_kira_audio = "0.26.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+dirs = "7.0.0"
+proptest = "1.11.0"
+tetris-core = { path = "crates/tetris-core" }
+
+# Dependencies compile optimized even in dev builds (Bevy is heavy);
+# workspace crates stay at opt-level 0 for fast incremental rebuilds.
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 1

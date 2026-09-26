@@ -1,0 +1,14 @@
+[package]
+name = "tetris-app"
+description = "Bevy presentation layer for the Tetris-like game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tetris-core = { workspace = true }
+bevy = { workspace = true }
+bevy_kira_audio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }

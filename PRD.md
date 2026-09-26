@@ -130,7 +130,8 @@ capped at 20G; UI displays current level, lines, score.
 ### 10.1 Stack
 
 - **Rust** (stable, pinned via `rust-toolchain.toml` at scaffold), **edition 2021**.
-- **Bevy** pinned to latest stable minor at scaffold time (0.18.x as of this PRD; bump deliberately).
+- **Bevy** pinned to latest stable minor at scaffold time (0.19.x as of the 2026-09-26
+  author amendment; bump deliberately).
 - Plugins: `bevy_ecs` (in engine), `bevy_kira_audio` for audio, `serde` + `bevy_mod_rpchandling`-free
   simple JSON persistence (no extra state crate unless proven necessary).
 - `cargo clippy -D warnings`, `cargo fmt`, `cargo test` gate in CI.
