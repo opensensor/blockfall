@@ -293,9 +293,42 @@ T23: [T22]       WASM build (stretch, M6)
   index from T4.
 - **validation**: Table tests per PRD row; B2B break on plain clear; combo cap; TSD vs TST vs
   mini fixtures; drop points unaffected by level.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T7): Implemented test-first (RED captured: unresolved-import compile errors
+    for `detect_tspin`/`TSpinKind`/`ScoreState`/`b2b_scale`, then GREEN: 22 unit tests;
+    crate total 105, the 83 pre-existing tests untouched). `tspin.rs`:
+    `TSpinKind {None, Mini, Full}` + `detect_tspin(&Board, &PieceState, last_action_was_rotation:
+    bool, last_kick_index: u8) -> TSpinKind` — pure 3-corner classifier on the four diagonal
+    corners of the T's 3×3 box; corners project to walls/floor = filled, rows above the top
+    edge = open; front corners = nub side per rotation. Full = both front corners filled;
+    Mini = one front + both back, upgraded to Full when `last_kick_index == 4` (far SRS
+    kick relaxes the front-corner rule, per T4 note); non-T piece or no preceding rotation
+    → None. T8 must track: `last_action_was_rotation` (set true by a successful rotation,
+    false by any successful move/drop) and `last_kick_index` (`RotationAttempt.kick_index`
+    of the latest successful rotation, reset to 0 on move/drop). `score.rs`: PRD §6.7 table
+    copied exactly — Single/Double/Triple/Tetris 100/300/500/800, T-spin mini/full (no
+    lines) 100/400, T-spin single/double/triple 800/1200/1600, all ×level; soft/hard drop
+    points arrive pre-computed (1/2 per cell) and are FLAT (never level-scaled); B2B ×1.5
+    for consecutive difficult clears (Tetris or any T-spin with ≥1 line; mini-with-lines
+    scores the T-spin row literally per the table), floor-rounded (`x + x/2`), broken by
+    any plain line clear, untouched by no-clear locks; combo `50 × min(n, 10) × level`
+    where n = consecutive line-clearing locks − 1 (0 = first clear, reset on no-clear);
+    perfect clear +3500 flat whenever the board is empty after merge+clear, stacking on
+    top of line-clear/combo (no B2B/combo interaction beyond stacking — PRD specifies none).
+    Stateful API: `ScoreState {total, b2b, combo}` with
+    `on_lock(lines: usize, tspin: TSpinKind, drop_points: u64, level: u32,
+    board_empty_after_clear: bool) -> ScoreDelta {points, b2b_now, combo_now}` per lock,
+    plus `new()`/`reset()`. Tests: 13-row PRD table × level 1 and 2 (pins ×level);
+    Tetris→Tetris and Tetris→TSD→Tetris B2B chains (incl. combo stacking); broken by
+    single; no-clear T-spin neither triggers nor breaks B2B; mini-single is difficult;
+    combo ladder 0..500 with cap at n=10 (and 11th+ clear stays 500) + reset + ×level;
+    PC flat 3500 at levels 1 and 5, PC+Tetris under B2B = 1200+50+3500; drop points flat
+    at level 5; `b2b_scale` floor on odd inputs; tspin fixtures: TSD full, TST (nub-right)
+    full, mini (1 front + 2 back, kicks 0..3) with kick-4 upgrade, wall/floor corner
+    fixtures (box col −1 Cw, floor-resting Spawn), above-top corners open, <3 corners None
+    even at kick 4, no-rotation lock None, all non-T pieces None. fmt/clippy clean.
+- **files edited/created**: `crates/tetris-core/src/score.rs`, `crates/tetris-core/src/tspin.rs`
 
 ### T8: `Game` facade — headless deterministic loop
 - **depends_on**: [T4, T5, T6, T7]
