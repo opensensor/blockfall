@@ -1,10 +1,806 @@
 //! Input map, key bindings, and DAS/ARR state machine (T12).
+//!
+//! Reads raw keyboard state through [`ButtonInput<KeyCode>`] plus
+//! [`MouseWheel`] messages, resolves them against the rebindable
+//! [`KeyBindings`] resource (owned here, PRD §9 defaults), and pushes
+//! `tetris_core::actions::Action` values into
+//! [`PendingActions`](crate::core_bridge::PendingActions).
+//!
+//! Scheduling: [`gameplay_input_system`] runs on `FixedPreUpdate`, the
+//! `FixedMain` sub-schedule that precedes the core bridge's `FixedUpdate`
+//! drain (PRD §10.3 order `input → apply actions → core step`). Repeat
+//! cadence therefore advances in **fixed-step ticks** (60 Hz), not wall
+//! clock — framerate-independent by construction. Settings ms values are
+//! converted to tick counts at use time via [`ticks_for`] (defaults:
+//! DAS 150 ms → 9 ticks, ARR 33 ms → 2 ticks, ARR clamped to ≥ 1 tick).
+//!
+//! Emission gate: gameplay actions flow only while
+//! [`AppState::Playing`](crate::state::AppState::Playing) and
+//! [`RebindingCapture`](crate::state::RebindingCapture) is idle; edge
+//! bookkeeping still advances while gated so no spurious press fires when
+//! the gate reopens. The `Pause` binding slot lives in the same table but
+//! is consumed by the menu-state handler (T17) and never emitted here.
+//!
+//! Note on PRD cross-reference: §6.4's "Q/E" rotate suggestion is
+//! superseded by §9 (↑/Z, X alias) plus the wheel bindings required by
+//! this task's plan entry; resolved in favor of §9 + wheel.
 
-use bevy::app::{App, Plugin};
+use std::collections::HashMap;
+
+use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::MouseWheel;
+use bevy::prelude::*;
+
+use tetris_core::actions::Action;
+
+use crate::core_bridge::{PendingActions, SIM_HZ};
+use crate::state::{AppState, RebindingCapture, Settings};
+
+/// Fixed-step rate as an integer, for [`ticks_for`] conversions.
+const SIM_HZ_U32: u32 = SIM_HZ as u32;
+
+/// Round milliseconds to fixed-step ticks at `hz`, half-up.
+///
+/// PRD §6.5 defaults at 60 Hz: 150 ms → 9, 33 ms → 2.
+pub const fn ticks_for(ms: u32, hz: u32) -> u32 {
+    ms.saturating_mul(hz).saturating_add(500) / 1000
+}
+
+/// Soft-drop repeat period in ticks for `multiplier × gravity` at `hz`.
+///
+/// Default multiplier 20 at 60 Hz → a `SoftDrop` action every 3rd tick.
+pub fn soft_drop_period_ticks(multiplier: u8, hz: u32) -> u32 {
+    let m = multiplier.max(1) as f64;
+    ((hz as f64 / m).round_ties_even()).max(1.0) as u32
+}
+
+/// Pure DAS/ARR repeat state machine, driven one fixed-step tick at a
+/// time by [`RepeatTimer::advance`] — unit-testable without any clock.
+///
+/// Semantics: [`press`](Self::press) fires immediately; after `das_ticks`
+/// of hold, a repeat fires every `arr_ticks` ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatTimer {
+    held: bool,
+    elapsed: u32,
+    das_ticks: u32,
+    arr_ticks: u32,
+}
+
+impl Default for RepeatTimer {
+    fn default() -> Self {
+        Self::with_ticks(Self::DEFAULT_DAS_TICKS, Self::DEFAULT_ARR_TICKS)
+    }
+}
+
+impl RepeatTimer {
+    /// PRD §6.5 default DAS: 150 ms at 60 Hz → 9 ticks.
+    pub const DEFAULT_DAS_TICKS: u32 = ticks_for(150, SIM_HZ_U32);
+    /// PRD §6.5 default ARR: 33 ms at 60 Hz → 2 ticks.
+    pub const DEFAULT_ARR_TICKS: u32 = {
+        let ticks = ticks_for(33, SIM_HZ_U32);
+        if ticks == 0 {
+            1
+        } else {
+            ticks
+        }
+    };
+
+    /// Build from millisecond settings (ARR clamped to ≥ 1 tick).
+    pub fn new(das_ms: u32, arr_ms: u32) -> Self {
+        Self::with_ticks(
+            ticks_for(das_ms, SIM_HZ_U32),
+            ticks_for(arr_ms, SIM_HZ_U32).max(1),
+        )
+    }
+
+    /// Build directly from tick counts; `arr_ticks` is clamped to ≥ 1.
+    pub const fn with_ticks(das_ticks: u32, arr_ticks: u32) -> Self {
+        Self {
+            held: false,
+            elapsed: 0,
+            das_ticks,
+            arr_ticks: if arr_ticks == 0 { 1 } else { arr_ticks },
+        }
+    }
+
+    /// Register a press; `true` = emit the immediate first action.
+    /// Re-pressing while held restarts the DAS window.
+    pub fn press(&mut self) -> bool {
+        self.held = true;
+        self.elapsed = 0;
+        true
+    }
+
+    /// Advance one fixed-step tick; `true` = emit a repeat action.
+    pub fn advance(&mut self) -> bool {
+        if !self.held {
+            return false;
+        }
+        self.elapsed += 1;
+        self.elapsed >= self.das_ticks
+            && (self.elapsed - self.das_ticks).is_multiple_of(self.arr_ticks)
+    }
+
+    /// Release: resets all repeat state.
+    pub fn release(&mut self) {
+        self.held = false;
+        self.elapsed = 0;
+    }
+
+    /// Whether the key is currently registered as held.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+}
+
+/// Which horizontal direction a [`ShiftRepeat`] focus/emit refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftDir {
+    /// Emit `Action::MoveLeft`.
+    Left,
+    /// Emit `Action::MoveRight`.
+    Right,
+}
+
+/// Paired left/right [`RepeatTimer`]s with a single repeat *focus*, so a
+/// step can never emit both directions. A direction press (edge) fires
+/// immediately and steals the focus — direction reversal therefore repeats
+/// from the press tick. Releasing the focused direction falls back to the
+/// other if still held (its own DAS/ARR progress is preserved); releasing
+/// a key always resets that key's timer.
+#[derive(Debug, Default, Clone, Copy, Resource)]
+pub struct ShiftRepeat {
+    left: RepeatTimer,
+    right: RepeatTimer,
+    focus: Option<ShiftDir>,
+}
+
+impl ShiftRepeat {
+    /// Drive one fixed-step tick. `*_edge` = pressed this step but not
+    /// the previous one. Returns the direction to emit, if any.
+    pub fn step(
+        &mut self,
+        left: bool,
+        right: bool,
+        left_edge: bool,
+        right_edge: bool,
+        das_ticks: u32,
+        arr_ticks: u32,
+    ) -> Option<ShiftDir> {
+        if !left {
+            self.left.release();
+        }
+        if !right {
+            self.right.release();
+        }
+        match self.focus {
+            Some(ShiftDir::Left) if !left => {
+                self.focus = if right { Some(ShiftDir::Right) } else { None };
+            }
+            Some(ShiftDir::Right) if !right => {
+                self.focus = if left { Some(ShiftDir::Left) } else { None };
+            }
+            _ => {}
+        }
+        if left_edge {
+            self.left = RepeatTimer::with_ticks(das_ticks, arr_ticks);
+            self.left.press();
+            self.focus = Some(ShiftDir::Left);
+            return Some(ShiftDir::Left);
+        }
+        if right_edge {
+            self.right = RepeatTimer::with_ticks(das_ticks, arr_ticks);
+            self.right.press();
+            self.focus = Some(ShiftDir::Right);
+            return Some(ShiftDir::Right);
+        }
+        match self.focus {
+            Some(ShiftDir::Left) if self.left.advance() => Some(ShiftDir::Left),
+            Some(ShiftDir::Right) if self.right.advance() => Some(ShiftDir::Right),
+            _ => None,
+        }
+    }
+
+    /// Focused direction, if any key is held.
+    pub fn focus(&self) -> Option<ShiftDir> {
+        self.focus
+    }
+}
+
+/// One rebindable input: a keyboard key or a mouse-wheel notch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bind {
+    /// A physical keyboard key.
+    Key(KeyCode),
+    /// One mouse-wheel notch upward (bound to RotateCw).
+    WheelUp,
+    /// One mouse-wheel notch downward (bound to RotateCcw).
+    WheelDown,
+}
+
+/// Every bindable action slot, including the menu-owned `Pause` chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindSlot {
+    /// `Action::MoveLeft` (DAS/ARR repeat).
+    MoveLeft,
+    /// `Action::MoveRight` (DAS/ARR repeat).
+    MoveRight,
+    /// `Action::SoftDrop` (held cadence from the soft-drop multiplier).
+    SoftDrop,
+    /// `Action::HardDrop` (single trigger per press).
+    HardDrop,
+    /// `Action::RotateCw` (single trigger; also wheel-up).
+    RotateCw,
+    /// `Action::RotateCcw` (single trigger; also wheel-down).
+    RotateCcw,
+    /// `Action::Rotate180` (single trigger per press).
+    Rotate180,
+    /// `Action::Hold` (single trigger per press).
+    Hold,
+    /// Pause chord — consumed by the menu-state handler (T17), never
+    /// emitted as a core `Action` by this plugin.
+    Pause,
+}
+
+/// All bindable slots, in display order (useful for the T16 settings UI).
+pub const ALL_BIND_SLOTS: [BindSlot; 9] = [
+    BindSlot::MoveLeft,
+    BindSlot::MoveRight,
+    BindSlot::SoftDrop,
+    BindSlot::HardDrop,
+    BindSlot::RotateCw,
+    BindSlot::RotateCcw,
+    BindSlot::Rotate180,
+    BindSlot::Hold,
+    BindSlot::Pause,
+];
+
+/// Rebindable key bindings (PRD §9 defaults), owned by this module and
+/// edited by the settings screen (T16 via [`BindSlot`] accessors).
+#[derive(Debug, Clone, PartialEq, Eq, Resource)]
+pub struct KeyBindings {
+    move_left: Vec<Bind>,
+    move_right: Vec<Bind>,
+    soft_drop: Vec<Bind>,
+    hard_drop: Vec<Bind>,
+    rotate_cw: Vec<Bind>,
+    rotate_ccw: Vec<Bind>,
+    rotate_180: Vec<Bind>,
+    hold: Vec<Bind>,
+    pause: Vec<Bind>,
+}
+
+impl KeyBindings {
+    /// PRD §9 defaults plus the plan-required wheel-up/down →
+    /// RotateCw/Ccw, the X rotate alias, the Shift hold alias, and the
+    /// Esc/P pause chord.
+    pub fn default_slot(slot: BindSlot) -> Vec<Bind> {
+        let k = |key| vec![Bind::Key(key)];
+        match slot {
+            BindSlot::MoveLeft => k(KeyCode::ArrowLeft),
+            BindSlot::MoveRight => k(KeyCode::ArrowRight),
+            BindSlot::SoftDrop => k(KeyCode::ArrowDown),
+            BindSlot::HardDrop => k(KeyCode::Space),
+            BindSlot::RotateCw => vec![
+                Bind::Key(KeyCode::ArrowUp),
+                Bind::Key(KeyCode::KeyX),
+                Bind::WheelUp,
+            ],
+            BindSlot::RotateCcw => vec![Bind::Key(KeyCode::KeyZ), Bind::WheelDown],
+            BindSlot::Rotate180 => k(KeyCode::KeyA),
+            BindSlot::Hold => vec![
+                Bind::Key(KeyCode::KeyC),
+                Bind::Key(KeyCode::ShiftLeft),
+                Bind::Key(KeyCode::ShiftRight),
+            ],
+            BindSlot::Pause => vec![Bind::Key(KeyCode::Escape), Bind::Key(KeyCode::KeyP)],
+        }
+    }
+
+    /// Binds currently assigned to `slot`.
+    pub fn slot(&self, slot: BindSlot) -> &Vec<Bind> {
+        match slot {
+            BindSlot::MoveLeft => &self.move_left,
+            BindSlot::MoveRight => &self.move_right,
+            BindSlot::SoftDrop => &self.soft_drop,
+            BindSlot::HardDrop => &self.hard_drop,
+            BindSlot::RotateCw => &self.rotate_cw,
+            BindSlot::RotateCcw => &self.rotate_ccw,
+            BindSlot::Rotate180 => &self.rotate_180,
+            BindSlot::Hold => &self.hold,
+            BindSlot::Pause => &self.pause,
+        }
+    }
+
+    /// Mutable view of `slot`'s binds (T16 rebinding UI).
+    pub fn slot_mut(&mut self, slot: BindSlot) -> &mut Vec<Bind> {
+        match slot {
+            BindSlot::MoveLeft => &mut self.move_left,
+            BindSlot::MoveRight => &mut self.move_right,
+            BindSlot::SoftDrop => &mut self.soft_drop,
+            BindSlot::HardDrop => &mut self.hard_drop,
+            BindSlot::RotateCw => &mut self.rotate_cw,
+            BindSlot::RotateCcw => &mut self.rotate_ccw,
+            BindSlot::Rotate180 => &mut self.rotate_180,
+            BindSlot::Hold => &mut self.hold,
+            BindSlot::Pause => &mut self.pause,
+        }
+    }
+
+    /// Replace `slot`'s binds wholesale.
+    pub fn set_slot(&mut self, slot: BindSlot, binds: Vec<Bind>) {
+        *self.slot_mut(slot) = binds;
+    }
+
+    /// Restore `slot` to its PRD §9 default.
+    pub fn reset_slot(&mut self, slot: BindSlot) {
+        self.set_slot(slot, Self::default_slot(slot));
+    }
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        let slot = KeyBindings::default_slot;
+        Self {
+            move_left: slot(BindSlot::MoveLeft),
+            move_right: slot(BindSlot::MoveRight),
+            soft_drop: slot(BindSlot::SoftDrop),
+            hard_drop: slot(BindSlot::HardDrop),
+            rotate_cw: slot(BindSlot::RotateCw),
+            rotate_ccw: slot(BindSlot::RotateCcw),
+            rotate_180: slot(BindSlot::Rotate180),
+            hold: slot(BindSlot::Hold),
+            pause: slot(BindSlot::Pause),
+        }
+    }
+}
+
+/// Capture helper for the T16 rebinding UI: the first key just pressed
+/// this frame as a [`Bind`], if any (call from an `Update` system while
+/// [`RebindingCapture`] is active).
+pub fn pressed_key_to_bind(keys: &ButtonInput<KeyCode>) -> Option<Bind> {
+    keys.get_just_pressed().next().copied().map(Bind::Key)
+}
+
+/// Per-step edge bookkeeping plus the two repeat machines. Kept in one
+/// resource so the input system takes a single mutable parameter.
+#[derive(Debug, Default, Resource)]
+pub struct InputMachine {
+    prev_pressed: HashMap<BindSlot, bool>,
+    shift: ShiftRepeat,
+    soft: RepeatTimer,
+}
+
+fn slot_pressed(bindings: &KeyBindings, keys: &ButtonInput<KeyCode>, slot: BindSlot) -> bool {
+    bindings
+        .slot(slot)
+        .iter()
+        .any(|b| matches!(b, Bind::Key(key) if keys.pressed(*key)))
+}
+
+fn edge(prev: &mut HashMap<BindSlot, bool>, slot: BindSlot, now: bool) -> bool {
+    let was = prev.insert(slot, now).unwrap_or(false);
+    now && !was
+}
+
+/// All fixed-step parameters for [`gameplay_input_system`] in one struct
+/// (keeps the system under clippy's argument limits).
+#[derive(SystemParam)]
+struct InputParams<'w, 's> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    wheel: MessageReader<'w, 's, MouseWheel>,
+    bindings: Res<'w, KeyBindings>,
+    settings: Res<'w, Settings>,
+    app_state: Res<'w, AppState>,
+    capture: Res<'w, RebindingCapture>,
+    machine: ResMut<'w, InputMachine>,
+    pending: ResMut<'w, PendingActions>,
+}
+
+/// Samples bound inputs once per fixed step and pushes core `Action`s
+/// into `PendingActions`. Registered on `FixedPreUpdate`, i.e. before the
+/// core bridge drains the queue in `FixedUpdate` (PRD §10.3).
+fn gameplay_input_system(mut params: InputParams) {
+    // Edge bookkeeping runs even while gated, so reopening the gate
+    // never replays a stale press as a fresh edge.
+    let bindings = &params.bindings;
+    let keys = &params.keys;
+    let now = |slot| slot_pressed(bindings, keys, slot);
+    let held_left = now(BindSlot::MoveLeft);
+    let held_right = now(BindSlot::MoveRight);
+    let held_soft = now(BindSlot::SoftDrop);
+    let held_hard = now(BindSlot::HardDrop);
+    let held_cw = now(BindSlot::RotateCw);
+    let held_ccw = now(BindSlot::RotateCcw);
+    let held_180 = now(BindSlot::Rotate180);
+    let held_hold = now(BindSlot::Hold);
+    let prev = &mut params.machine.prev_pressed;
+    let move_left = edge(prev, BindSlot::MoveLeft, held_left);
+    let move_right = edge(prev, BindSlot::MoveRight, held_right);
+    let soft = edge(prev, BindSlot::SoftDrop, held_soft);
+    let hard = edge(prev, BindSlot::HardDrop, held_hard);
+    let rotate_cw = edge(prev, BindSlot::RotateCw, held_cw);
+    let rotate_ccw = edge(prev, BindSlot::RotateCcw, held_ccw);
+    let rotate_180 = edge(prev, BindSlot::Rotate180, held_180);
+    let hold = edge(prev, BindSlot::Hold, held_hold);
+
+    // Wheel notches: aggregate the step, net direction, ≤ 1 rotation per
+    // kind per step. Consumed even while gated so nothing bursts later.
+    let mut wheel_notch: i32 = 0;
+    for event in params.wheel.read() {
+        if event.y > 0.0 {
+            wheel_notch += 1;
+        } else if event.y < 0.0 {
+            wheel_notch -= 1;
+        }
+    }
+
+    let gated = *params.app_state != AppState::Playing || params.capture.capturing;
+    if gated {
+        return;
+    }
+
+    let das_ticks = ticks_for(params.settings.das_ms, SIM_HZ_U32);
+    let arr_ticks = ticks_for(params.settings.arr_ms, SIM_HZ_U32).max(1);
+    let pending = &mut params.pending;
+    let machine = &mut params.machine;
+
+    if let Some(dir) = machine.shift.step(
+        held_left, held_right, move_left, move_right, das_ticks, arr_ticks,
+    ) {
+        pending.push(match dir {
+            ShiftDir::Left => Action::MoveLeft,
+            ShiftDir::Right => Action::MoveRight,
+        });
+    }
+
+    if soft {
+        // Soft drop has no DAS: press fires, then a held cadence set by
+        // the multiplier (PRD §6.5, default ×20 → every 3rd tick).
+        let period = soft_drop_period_ticks(params.settings.soft_drop_multiplier, SIM_HZ_U32);
+        machine.soft = RepeatTimer::with_ticks(0, period);
+        machine.soft.press();
+        pending.push(Action::SoftDrop);
+    } else if machine.soft.advance() {
+        pending.push(Action::SoftDrop);
+    }
+
+    if hard {
+        pending.push(Action::HardDrop);
+    }
+    let wheel_cw = wheel_notch > 0
+        && params
+            .bindings
+            .slot(BindSlot::RotateCw)
+            .contains(&Bind::WheelUp);
+    let wheel_ccw = wheel_notch < 0
+        && params
+            .bindings
+            .slot(BindSlot::RotateCcw)
+            .contains(&Bind::WheelDown);
+    if rotate_cw || wheel_cw {
+        pending.push(Action::RotateCw);
+    }
+    if rotate_ccw || wheel_ccw {
+        pending.push(Action::RotateCcw);
+    }
+    if rotate_180 {
+        pending.push(Action::Rotate180);
+    }
+    if hold {
+        pending.push(Action::Hold);
+    }
+}
 
 /// Translates bound inputs into core `Action`s with DAS/ARR repeat handling.
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
-    fn build(&self, _app: &mut App) {}
+    fn build(&self, app: &mut App) {
+        // Defensive inits keep the system parameters satisfied in headless
+        // `MinimalPlugins` tests that lack Bevy's own `InputPlugin`; both
+        // are no-ops when it is present.
+        if !app.world().contains_resource::<ButtonInput<KeyCode>>() {
+            app.init_resource::<ButtonInput<KeyCode>>();
+        }
+        if !app.world().contains_resource::<Messages<MouseWheel>>() {
+            app.add_message::<MouseWheel>();
+        }
+        app.init_resource::<KeyBindings>()
+            .init_resource::<InputMachine>()
+            .add_systems(FixedPreUpdate, gameplay_input_system);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use bevy::app::App;
+    use bevy::input::mouse::MouseScrollUnit;
+    use bevy::input::touch::TouchPhase;
+
+    use crate::core_bridge::{CoreBridgePlugin, GameCore};
+    use crate::state::{AppState, RebindingCapture, Settings};
+
+    // ---- pure repeat state machine (fake tick clock) ----
+
+    #[test]
+    fn ticks_for_matches_prd_defaults() {
+        assert_eq!(ticks_for(150, 60), 9);
+        assert_eq!(ticks_for(33, 60), 2);
+        assert_eq!(ticks_for(0, 60), 0);
+        assert_eq!(RepeatTimer::DEFAULT_DAS_TICKS, 9);
+        assert_eq!(RepeatTimer::DEFAULT_ARR_TICKS, 2);
+        assert_eq!(RepeatTimer::new(150, 33).arr_ticks, 2);
+        assert_eq!(RepeatTimer::new(150, 0).arr_ticks, 1, "ARR ≥ 1 tick");
+        assert_eq!(soft_drop_period_ticks(20, 60), 3);
+        assert_eq!(soft_drop_period_ticks(255, 60), 1);
+        assert_eq!(soft_drop_period_ticks(0, 60), 60);
+    }
+
+    #[test]
+    fn press_is_immediate_then_das_then_arr_cadence() {
+        let mut t = RepeatTimer::new(150, 33);
+        assert!(t.press(), "immediate first action");
+        for tick in 1..9 {
+            assert!(!t.advance(), "silent during the DAS window (tick {tick})");
+        }
+        assert!(t.advance(), "first repeat lands exactly at DAS ticks");
+        assert!(!t.advance(), "odd tick between repeats");
+        assert!(t.advance(), "repeat every ARR ticks");
+        assert!(!t.advance());
+        assert!(t.advance());
+    }
+
+    #[test]
+    fn release_resets_repeat_state() {
+        let mut t = RepeatTimer::new(150, 33);
+        t.press();
+        for _ in 0..11 {
+            t.advance();
+        }
+        t.release();
+        assert!(!t.advance(), "released timer never fires");
+        assert!(!t.is_held());
+        assert!(t.press(), "re-press is immediate again");
+        for tick in 1..9 {
+            assert!(!t.advance(), "DAS restarted (tick {tick})");
+        }
+        assert!(t.advance());
+    }
+
+    #[test]
+    fn direction_reversal_fires_immediately_and_steals_focus() {
+        let mut s = ShiftRepeat::default();
+        // Hold Right through its DAS and one repeat.
+        assert_eq!(
+            s.step(false, true, false, true, 9, 2),
+            Some(ShiftDir::Right)
+        );
+        for tick in 1..9 {
+            assert_eq!(s.step(false, true, false, false, 9, 2), None, "tick {tick}");
+        }
+        assert_eq!(
+            s.step(false, true, false, false, 9, 2),
+            Some(ShiftDir::Right)
+        );
+        // Reverse: Left press emits on the spot and takes repeat focus.
+        assert_eq!(s.step(true, true, true, false, 9, 2), Some(ShiftDir::Left));
+        assert_eq!(s.focus(), Some(ShiftDir::Left));
+        // While both are held only the focus repeats — and Left restarted
+        // its own DAS, so nothing before its tick 9.
+        for tick in 1..9 {
+            assert_eq!(s.step(true, true, false, false, 9, 2), None, "tick {tick}");
+        }
+        assert_eq!(s.step(true, true, false, false, 9, 2), Some(ShiftDir::Left));
+    }
+
+    #[test]
+    fn shift_release_resets_and_falls_back_to_other_held_key() {
+        let mut s = ShiftRepeat::default();
+        assert_eq!(s.step(true, false, true, false, 9, 2), Some(ShiftDir::Left));
+        // Right press steals focus immediately (reversal).
+        assert_eq!(s.step(true, true, false, true, 9, 2), Some(ShiftDir::Right));
+        // Releasing Left (not the focus) changes nothing; Right keeps
+        // its own DAS progress.
+        for tick in 1..9 {
+            assert_eq!(s.step(false, true, false, false, 9, 2), None, "tick {tick}");
+        }
+        assert_eq!(
+            s.step(false, true, false, false, 9, 2),
+            Some(ShiftDir::Right)
+        );
+        // Releasing the focus stops everything and clears the focus.
+        assert_eq!(s.step(false, false, false, false, 9, 2), None);
+        assert_eq!(s.focus(), None);
+    }
+
+    #[test]
+    fn soft_drop_is_das_free_multiplier_cadence() {
+        let mut soft = RepeatTimer::with_ticks(0, soft_drop_period_ticks(20, 60));
+        assert!(soft.press());
+        assert!(!soft.advance());
+        assert!(!soft.advance());
+        assert!(soft.advance(), "fires every 3rd tick (×20 at 60 Hz)");
+        assert!(!soft.advance());
+        assert!(!soft.advance());
+        assert!(soft.advance());
+        soft.release();
+        assert!(!soft.advance());
+    }
+
+    // ---- integration: InputPlugin + CoreBridgePlugin, headless ----
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins((CoreBridgePlugin, InputPlugin));
+        app.insert_non_send(GameCore::new(0xBEEF));
+        app.init_resource::<AppState>()
+            .init_resource::<Settings>()
+            .init_resource::<RebindingCapture>();
+        app
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+    }
+
+    fn release(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(key);
+    }
+
+    fn set_state(app: &mut App, state: AppState) {
+        *app.world_mut().resource_mut::<AppState>() = state;
+    }
+
+    /// One fixed step, mirroring the real order: `FixedPreUpdate` (input)
+    /// then `FixedUpdate` (core bridge drain). Returns the actions the
+    /// input system queued for this step.
+    fn fixed_step(app: &mut App) -> Vec<Action> {
+        let _ = app.world_mut().try_run_schedule(FixedPreUpdate);
+        let queued: Vec<Action> = app
+            .world()
+            .resource::<PendingActions>()
+            .queue
+            .iter()
+            .copied()
+            .collect();
+        let _ = app.world_mut().try_run_schedule(FixedUpdate);
+        queued
+    }
+
+    fn scroll(app: &mut App, y: f32) {
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y,
+            window: Entity::PLACEHOLDER,
+            phase: TouchPhase::Moved,
+        });
+    }
+
+    #[test]
+    fn left_tap_emits_exactly_one_moveleft() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::ArrowLeft);
+        assert_eq!(fixed_step(&mut app), vec![Action::MoveLeft]);
+        // Still held (ButtonInput keeps the press), but inside the DAS
+        // window: no repeat before tick 9.
+        for step in 2..8 {
+            assert_eq!(fixed_step(&mut app), Vec::new(), "DAS tick {step}");
+        }
+        release(&mut app, KeyCode::ArrowLeft);
+        assert_eq!(fixed_step(&mut app), Vec::new());
+    }
+
+    #[test]
+    fn held_left_matches_das_arr_math() {
+        // Settings defaults 150/33 → DAS 9 ticks, ARR 2 ticks. The press
+        // consumes step 1; the first repeat lands 9 ticks later (exactly
+        // 150 ms after the press action): steps 1, 10, 12, 14, 16.
+        let mut app = test_app();
+        press(&mut app, KeyCode::ArrowLeft);
+        let mut emitted = Vec::new();
+        for step in 1..=16 {
+            if !fixed_step(&mut app).is_empty() {
+                emitted.push(step);
+            }
+        }
+        assert_eq!(emitted, vec![1, 10, 12, 14, 16]);
+    }
+
+    #[test]
+    fn one_shot_actions_trigger_once_per_press() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Space);
+        press(&mut app, KeyCode::ArrowUp);
+        press(&mut app, KeyCode::KeyC);
+        let first = fixed_step(&mut app);
+        assert_eq!(
+            first,
+            vec![Action::HardDrop, Action::RotateCw, Action::Hold],
+            "each one-shot action fires once, in system order"
+        );
+        for step in 2..6 {
+            assert_eq!(fixed_step(&mut app), Vec::new(), "held step {step}");
+        }
+    }
+
+    #[test]
+    fn wheel_notches_map_to_rotations() {
+        let mut app = test_app();
+        scroll(&mut app, 1.0);
+        assert_eq!(fixed_step(&mut app), vec![Action::RotateCw]);
+        scroll(&mut app, -1.0);
+        assert_eq!(fixed_step(&mut app), vec![Action::RotateCcw]);
+    }
+
+    #[test]
+    fn nothing_emits_outside_playing_state() {
+        let mut app = test_app();
+        set_state(&mut app, AppState::Paused);
+        press(&mut app, KeyCode::ArrowLeft);
+        for step in 1..12 {
+            assert_eq!(fixed_step(&mut app), Vec::new(), "step {step}");
+        }
+        assert!(
+            app.world().resource::<PendingActions>().queue.is_empty(),
+            "gated inputs never leak into the core queue"
+        );
+    }
+
+    #[test]
+    fn nothing_emits_while_rebinding_capture_is_active() {
+        let mut app = test_app();
+        app.world_mut().resource_mut::<RebindingCapture>().capturing = true;
+        press(&mut app, KeyCode::ArrowLeft);
+        press(&mut app, KeyCode::Space);
+        scroll(&mut app, 1.0);
+        for step in 1..12 {
+            assert_eq!(fixed_step(&mut app), Vec::new(), "step {step}");
+        }
+        // Gate reopens while the key is still held: no stale press edge,
+        // so the next emission is the DAS repeat at tick 9 of the hold.
+        app.world_mut().resource_mut::<RebindingCapture>().capturing = false;
+        assert_eq!(fixed_step(&mut app), Vec::new(), "no stale edge");
+    }
+
+    #[test]
+    fn queued_action_is_drained_by_the_same_core_step() {
+        let mut app = test_app();
+        let col_before = app
+            .world()
+            .non_send::<GameCore>()
+            .game
+            .snapshot()
+            .active
+            .expect("piece spawns at tick 0")
+            .col;
+        press(&mut app, KeyCode::ArrowLeft);
+        assert_eq!(fixed_step(&mut app), vec![Action::MoveLeft]);
+        assert!(
+            app.world().resource::<PendingActions>().queue.is_empty(),
+            "the very next fixed step drains the queue"
+        );
+        let col_after = app
+            .world()
+            .non_send::<GameCore>()
+            .game
+            .snapshot()
+            .active
+            .expect("piece still active")
+            .col;
+        assert_eq!(
+            col_after,
+            col_before - 1,
+            "the MoveLeft action reached the core"
+        );
+    }
 }
