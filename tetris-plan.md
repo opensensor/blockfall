@@ -572,9 +572,31 @@ T23: [T22]       WASM build (stretch, M6)
   change.
 - **validation**: Round-trip unit tests w/ temp dir; corrupt file recovery test; input DAS/ARR
   and next-queue size read from loaded settings.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `settings.json` (T1 `Settings` serialized directly + a field-for-field
+  `BindingsFile` mirror of T12 `KeyBindings`) and `best.json` (`score`/`level`/`lines`)
+  live in `dirs::config_dir()/tetris/` (e.g. `~/.config/tetris/`), overridable via
+  `TETRIS_CONFIG_DIR` env var (tests inject a temp dir; a lock serializes env-mutating
+  tests). Missing/corrupt file → defaults + `warn!`, never panics; saves are atomic
+  (`.json.tmp` + fsync + rename). Saves: debounced 0.4 s after any Settings/bindings
+  fingerprint change, immediate on `CoreEvent(GameEvent::GameOver)` (final score/level/lines
+  read from `GameCore` snapshot, max-kept via `record_final_run`), and a last-chance flush
+  on `AppExit` (`Last`). Bind wire format (`BindDto`): `{"Key":"KeyA"}` (Bevy `KeyCode`
+  serde names via new `bevy/serialize` feature) and `"WheelUp"`/`"WheelDown"`. Pub API for
+  T16/T17: `SettingsPersistPlugin`, resource `PersistedBestScore { score, level, lines }`
+  (T17 renders it; T16 just mutates `Settings`/`KeyBindings` — persistence is automatic),
+  `load()`/`save_once(...)`, path-injected `load_from(&Path)`/`save_to(&Path, ...)` twins,
+  `config_dir()`, `record_final_run(&mut best, score, level, lines) -> bool`, consts
+  `APP_DIR_NAME`/`SETTINGS_FILE`/`BEST_FILE`/`CONFIG_DIR_ENV`. 13 tests (round-trip
+  defaults + edited incl. wheel binds + custom `KeyCode`s, missing/half/corrupt file →
+  defaults, DTO string-format pinning, max-score logic, no `.tmp` left behind + valid JSON,
+  debounce-arms-without-write, exit flush, env override, and an integration test booting
+  MinimalPlugins + CoreBridge + persist → defaults at Startup, hard-drops to game over on
+  the fixed schedule, best score lands on disk). Gate: 157 workspace tests green,
+  `cargo fmt --all --check` + `cargo clippy --all-targets -- -D warnings` clean. Deps: no
+  new crates — `bevy/serialize` feature enabled in tetris-app for `KeyCode` serde.
+- **files edited/created**: `crates/tetris-app/src/settings_persist.rs` (full impl),
+  `crates/tetris-app/Cargo.toml` (`bevy` + `serialize` feature), `Cargo.lock`
 
 ### T16: Settings screen, rebinding, sliders
 - **depends_on**: [T12, T15]
