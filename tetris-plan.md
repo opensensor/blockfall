@@ -346,9 +346,44 @@ T23: [T22]       WASM build (stretch, M6)
   exactly expected value; block-out triggers GameOver; snapshot completeness test (fields
   cover everything T11/T13/T18 need; assert TSpinDetected/HoldPerformed/PerfectClear/
   ComboChanged emitted in a fixture run).
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - 2026-09-26 (T8): Implemented test-first (RED captured: 13 compile errors on
+    tests-only skeleton, then GREEN: 6 integration tests; crate total 111, the
+    105 pre-existing tests untouched). **Frozen contract for T9-T23:**
+    `Game::new(seed) -> Game`, `Game::tick() -> Vec<GameEvent>`,
+    `Game::apply(Action) -> Vec<GameEvent>`, `Game::snapshot() -> GameSnapshot`,
+    `Game::snapshot_with_next(n)` / `Game::peek_next(n)` (cap 6, `NEXT_PREVIEW=5`).
+    `GameEvent::{PieceSpawned{piece,state}, PieceLocked{piece,state},
+    LineCleared{lines}, ScoreChanged{total,delta}, LevelUp{level},
+    TSpinDetected{kind}, HoldPerformed{stored,incoming,from_bag}, PerfectClear,
+    ComboChanged{n}, GameOver}` (Clone/Debug/PartialEq/Eq/serde).
+    `GameSnapshot{board, active: Option<PieceState>, ghost_row: Option<i32>,
+    hold: Option<Piece>, hold_used, next: Vec<Piece>, score, level, lines, combo,
+    b2b, game_over}`. Semantics: gravity per `interval_for(level)` (counter reset
+    on spawn); lock timer per T6 (grounded countdown, successful move/rotate
+    re-arm, exhaustion force-locks inside `apply`); hard drop locks same tick with
+    drop points merged into the single `on_lock` call (soft +1, hard +2/cell
+    accumulated across the piece); T7 tracking wired: `last_action_was_rotation`
+    true only on successful rotation, false on move/soft/hard drop (gravity is
+    not a player action), `last_kick_index` = latest `RotationAttempt.kick_index`,
+    0 on move/drop/spawn. Block-out at spawn → `GameOver` once, then
+    `tick`/`apply` are no-ops; hold press keeps `hold_used` armed for the
+    swapped-in piece (flag resets only when the piece locks) — T6 `end_piece`
+    called from the lock path only. Event order per lock: PieceLocked →
+    TSpinDetected → LineCleared → ScoreChanged → ComboChanged → PerfectClear →
+    LevelUp → PieceSpawned/GameOver; `ScoreChanged`/`ComboChanged` only on
+    change. Tests: fresh-snapshot completeness (queue = bag tail after first
+    deal), replay determinism (seed+action-log → identical events+snapshots,
+    seeds diverge), marathon with exact hand-computed score
+    (Tetris+PC 4336 → Single-combo 4522 → TSD-combo 5822 → B2B Tetris+LevelUp
+    7208 → no-clear combo reset 7248; emits TSpinDetected{Full}, PerfectClear,
+    ComboChanged 1/2/3/0, LevelUp), block-out GameOver then no-ops, hold
+    swap/reject/re-arm, drop-point merge (37 = 3 soft + 17×2 hard). Gotcha for
+    T9: full-row compaction shifts survivors down, so multi-step fixtures must
+    rebuild the board per step. fmt/clippy clean.
+- **files edited/created**: `crates/tetris-core/src/event.rs`,
+  `crates/tetris-core/src/game.rs`
 
 ### T9: Property tests & fuzz soak
 - **depends_on**: [T8]
