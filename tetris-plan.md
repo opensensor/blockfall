@@ -903,6 +903,7 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: CI green on tag push; artifacts downloadable for ubuntu/windows/macos.
 - **status**: Completed (2026-09-27)
 - **log**: Created `.github/workflows/ci.yml`: `linux` job on push/PR (ubuntu-latest;
+  - **Post-review (2026-09-27)**: first CI run failed on Linux (missing `libwayland-dev`/`libxkbcommon-dev` -> fixed); Windows release job failed (stale `windows` 0.54 in lock vs windows-core 0.62 wgpu-hal bounds -> lock updated `bf1b8b6`); added Windows compile-check job to ci.yml. **Nightly 1 h core soak: GREEN in CI** (workflow_dispatch run 36324710184, 14:06->15:06Z, PRD §12 wall-clock criterion met).
   apt `libasound2-dev libudev-dev` for headless Bevy 0.19 compile; `cargo fmt --all
   --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`) and
   `nightly-soak` job (cron nightly + workflow_dispatch, `timeout-minutes: 30`,
@@ -972,7 +973,7 @@ T23: [T22]       WASM build (stretch, M6)
   notes; verify success criteria PRD §12 (playtest cadence, green nightly wall-clock soak run
   from T20's schedule, clippy, fresh-machine `cargo run`).
 - **validation**: Tag triggers T20 pipeline; fresh clone + `cargo run` works on clean machine.
-- **status**: Not Completed
+- **status**: In Progress — v0.1.0 tag + docs done (`998f23b`); soak GREEN (`bf1b8b6` era); GitHub artifacts incomplete (Windows job failed pre-lockfix, archives predate L-shape fix `028c17a`) -> supersede with **v0.1.1** after author retest
 - **log**:
 - **files edited/created**:
 
@@ -989,6 +990,26 @@ T23: [T22]       WASM build (stretch, M6)
 - **status**: Not Completed
 - **log**:
 - **files edited/created**:
+
+### T24: 1v1 versus core (pure headless logic)
+- **depends_on**: [T8]
+- **location**: `crates/tetris-core/src/versus.rs` (new), `crates/tetris-core/src/lib.rs`, contract exception in `crates/tetris-core/src/game.rs`
+- **description**: `Match` over two independent `Game`s: `AttackRule::Garbage`
+  (attack table N lines → N queued, consecutive-chain clears add +1; batch pushes
+  in under the receiver's stack on its next lock, one hole column per batch) and
+  `AttackRule::Race { target_lines }` (default 40, no garbage). `MatchEvent`,
+  `MatchSnapshot`, `Side`, `pending_attack`. Top-out (normal or garbage overflow)
+  crowns the opponent; post-winner `apply` is a no-op. All deterministic from the
+  match seed (per-side game seeds + hole draws from one splitmix64 stream).
+  Contract exception: additive crate-internal `Game::install_board` hook (garbage
+  push-up); `Game`'s public API and `board.rs` untouched.
+- **validation**: `cargo test --workspace` green incl. 15 new `versus::tests`;
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
+- **status**: Completed
+- **log**: 2026-09-27 — versus.rs + 15 tests; gates green (240 total tests,
+  225 pre-existing untouched).
+- **files edited/created**: `crates/tetris-core/src/versus.rs` (new),
+  `crates/tetris-core/src/lib.rs`, `crates/tetris-core/src/game.rs` (contract exception)
 
 ## Parallel Execution Groups
 

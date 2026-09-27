@@ -245,6 +245,25 @@ impl Game {
         self.bag.peek(n.min(6))
     }
 
+    /// T24 versus contract exception (crate-internal only; not part of the
+    /// frozen public `Game` API): replace the settled stack with `board`
+    /// after [`crate::versus`] has pushed garbage rows underneath it.
+    /// `top_out` marks garbage that ran past the ceiling; overlap with the
+    /// active piece is treated the same way. Either condition ends the game
+    /// exactly like a block-out (`active` cleared, `game_over` set) and
+    /// returns `false`; otherwise the board is installed and `true` is
+    /// returned.
+    pub(crate) fn install_board(&mut self, board: Board, top_out: bool) -> bool {
+        let overlap = !top_out && self.active.is_some_and(|ps| board.collides(&ps));
+        self.board = board;
+        if top_out || overlap {
+            self.active = None;
+            self.game_over = true;
+            return false;
+        }
+        true
+    }
+
     fn is_grounded(&self, ps: PieceState) -> bool {
         let mut down = ps;
         down.row += 1;

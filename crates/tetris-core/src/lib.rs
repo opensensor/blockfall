@@ -11,6 +11,7 @@
 //! - [`actions`], [`lock`], [`hold`] — input schema, lock delay, hold (T6)
 //! - [`score`], [`tspin`] — guideline scoring, B2B/combo, T-spin detection (T7)
 //! - [`game`], [`event`] — deterministic facade and `GameEvent` contract (T8)
+//! - [`versus`] — deterministic 1v1 match wrapper over two games (T24)
 
 pub mod actions;
 pub mod bag;
@@ -25,3 +26,4 @@ pub mod prng;
 pub mod score;
 pub mod srs;
 pub mod tspin;
+pub mod versus;
