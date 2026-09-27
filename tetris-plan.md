@@ -624,9 +624,47 @@ T23: [T22]       WASM build (stretch, M6)
   quality persists; entering capture blocks gameplay actions (assert via `RebindingCapture`);
   screen content verified via `AppState::Settings` transition test — end-user reachability
   from title/pause is verified in T17 (its gate).
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Bevy 0.19 retained UI spawned once on `Startup` under a `SettingsRoot` node
+  (Node flex column + `Text`/`TextFont`/`TextColor` labels, `Button` widgets with
+  `Interaction`, `ImageNode` slider fills) and toggled `Visibility::Visible/Hidden` by the
+  plain-resource `AppState::Settings` check — no new AppState variants; hidden UI also stops
+  receiving `Interaction` (Bevy clears it for invisible nodes). Rows: master/SFX/music volume
+  sliders (0.0–1.0), DAS (0–500 ms) / ARR (0–200 ms) sliders with 10 ms snap, Effects
+  Low→Med→High cycler and Next-queue 1–6 cycler (PRD §8/§6.3), one bind row per
+  `ALL_BIND_SLOTS` slot (name + current `Bind` labels via pub `slot_display`/`bind_display`/
+  `slot_name` helpers + per-slot reset button), footer Back + global "Reset keys"
+  (`reset_all_bindings`). All logic is pub handlers taking plain refs — `begin_rebind`,
+  `cancel_rebind`, `apply_capture(&ButtonInput<KeyCode>, ...)`, `reset_all_bindings`,
+  `slider_value_from_pos`/`norm_from_pos`/`snap_ms`/`apply_slider`/`slider_norm`,
+  `cycle_effects`, `cycle_next_queue_size`, `handle_back`, label formatters — systems are thin
+  glue (`button_clicks` on `Changed<Interaction>`, `slider_pointer` on `Pointer<Press|Drag|
+  Release|DragEnd>` messages with press-capture focus, `sync_labels`). Capture flow: row click
+  → `begin_rebind` sets shared `RebindingCapture.capturing` (T12's emission gate mutes
+  gameplay; no second gate added) + `CaptureTarget.slot` and the row shows "press key…";
+  next frame `pressed_key_to_bind` Some → `set_slot(vec![bind])` + clear; `Escape` cancels
+  *without* binding; leaving Settings mid-capture also clears. Persistence: screen only
+  mutates `Settings`/`KeyBindings` — T15 fingerprints and auto-saves; DAS mid-game reload
+  works because T12 reads `Settings` per fixed step. **T17 chaining**: enter by setting
+  `AppState::Settings` (title/pause buttons); `track_settings_entry` records the screen we
+  arrived from into `SettingsReturn` (Playing maps to Title) and the Back button
+  (`handle_back`) restores it and resets the memory — so Pause→Settings→Back returns to
+  Pause; T17 may also write `SettingsReturn.state` before entering. `SettingsReturn` + all
+  marker components (`BindRow`, `SliderTrack`, `BackButton`, `EffectsButton`,
+  `QueueButton`, `ResetSlot`) are pub for T17 wiring/tests. 21 tests (13 unit: capture
+  begin/key/Esc/idle, slider clamp+snap, apply/reset slot+global, cycles, back, label
+  formatting; 8 headless integration w/ MinimalPlugins + hidden WindowPlugin: rows ==
+  `ALL_BIND_SLOTS::len()` + visibility toggling, click→capture, key→`KeyBindings` updated +
+  cleared, Esc cancel, capture cleared on exit, back returns to recorded state, reset buttons,
+  effects/queue cycling, Settings mutation round-trip through T15's `save_to`/`load_from` —
+  temp dir injected via the path twins rather than `TETRIS_CONFIG_DIR`, which T15's parallel
+  env-locking tests own). Visual pointer-drag fidelity (real picking coords through
+  `Pointer<Press/Drag>`) deferred to T14 on-device; the drag glue shares the unit-tested
+  `slider_value_from_pos` math. Gate: 200 workspace tests green (170 prior + 21 T16 + 9 T19
+  landed meanwhile), `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings`
+  clean.
+- **files edited/created**: `crates/tetris-app/src/screens_settings.rs` (implementation +
+  tests; plugin already registered in `main.rs` by T1)
 
 ### T17: Title / pause / game-over screens — **M3 GATE**
 - **depends_on**: [T14, T15, T16]
