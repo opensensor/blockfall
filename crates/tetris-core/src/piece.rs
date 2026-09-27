@@ -54,9 +54,9 @@ impl Piece {
             (J, Ccw) => [(0, 1), (1, 1), (2, 0), (2, 1)],
 
             (L, Spawn) => [(0, 2), (1, 0), (1, 1), (1, 2)],
-            (L, Cw) => [(0, 1), (1, 1), (1, 2), (2, 1)],
+            (L, Cw) => [(0, 1), (1, 1), (2, 1), (2, 2)],
             (L, R180) => [(1, 0), (1, 1), (1, 2), (2, 0)],
-            (L, Ccw) => [(0, 1), (1, 0), (1, 1), (2, 1)],
+            (L, Ccw) => [(0, 0), (0, 1), (1, 1), (2, 1)],
 
             (O, _) => [(0, 0), (0, 1), (1, 0), (1, 1)],
 
@@ -439,5 +439,55 @@ mod tests {
                 "{piece:?} must not collide on empty board at spawn"
             );
         }
+    }
+    /// Regression (M3 playtest, shipped broken in v0.1.0): L's Cw/Ccw had
+    /// their nub attached to the MIDDLE of the 3-cell bar — the shape of a
+    /// T — so "rotating L turned it into a partial E". Nothing pinned the
+    /// shape tables; now every rotation state must equal the pure matrix
+    /// rotation of the spawn state within the piece's box.
+    #[test]
+    fn all_rotations_are_pure_rotations_of_spawn() {
+        let n = 0; // silence unused warning path
+        let _ = n;
+        let rot_cw = |(r, c): (i32, i32), size: i32| (c, size - 1 - r);
+        let rot_ccw = |(r, c): (i32, i32), size: i32| (size - 1 - c, r);
+        let rot_180 = |(r, c): (i32, i32), size: i32| (size - 1 - r, size - 1 - c);
+        let norm = |mut cells: [(i32, i32); 4]| {
+            cells.sort_unstable();
+            cells
+        };
+        for piece in Piece::ALL {
+            let size = piece.box_size() as i32;
+            let spawn = piece.cells(Rotation::Spawn);
+            assert_eq!(
+                norm(spawn.map(|p| rot_cw(p, size))),
+                norm(piece.cells(Rotation::Cw)),
+                "{piece:?} Cw is not a pure 90° CW rotation of spawn"
+            );
+            assert_eq!(
+                norm(spawn.map(|p| rot_180(p, size))),
+                norm(piece.cells(Rotation::R180)),
+                "{piece:?} R180 is not a pure 180° rotation of spawn"
+            );
+            assert_eq!(
+                norm(spawn.map(|p| rot_ccw(p, size))),
+                norm(piece.cells(Rotation::Ccw)),
+                "{piece:?} Ccw is not a pure 90° CCW rotation of spawn"
+            );
+        }
+    }
+
+    /// Explicit anchor for the M3 defect: rotated L stays an L (nub at the
+    /// end of the bar), never a T (nub in the middle).
+    #[test]
+    fn l_piece_rotations_keep_nub_at_bar_end() {
+        assert_eq!(
+            Piece::L.cells(Rotation::Cw),
+            [(0, 1), (1, 1), (2, 1), (2, 2)]
+        );
+        assert_eq!(
+            Piece::L.cells(Rotation::Ccw),
+            [(0, 0), (0, 1), (1, 1), (2, 1)]
+        );
     }
 }

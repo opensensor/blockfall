@@ -746,7 +746,16 @@ T23: [T22]       WASM build (stretch, M6)
   sit above `MIN_ROT_ROW` (= -HIDDEN_ROWS), bounding the ratchet the same
   way spawn bounds it. Tests: `headroom_rows_render_kick_lifted_cells`,
   `rotation_kicks_never_lift_cells_above_headroom` (223 workspace tests
-  green, fmt/clippy clean). `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
+  green, fmt/clippy clean). **Post-approval defect (v0.1.0, same day)**:
+  author still saw 'L turns into partial E / P'. Root cause NOT rendering:
+  the L piece's `Cw`/`Ccw` shape-table entries had the nub attached to the
+  MIDDLE of the 3-cell bar (the T-piece signature) instead of its end —
+  nothing pinned the shape tables, so all rotation/kick tests agreed with
+  the wrong shape. Fixed Cw nub to (2,2) and Ccw to (0,0) (pure 90-degree
+  rotations of spawn, matching the verbatim SRS kick tables); added
+  `all_rotations_are_pure_rotations_of_spawn` (property pin for all 28
+  states) + `l_piece_rotations_keep_nub_at_bar_end`; 225 tests green.
+  v0.1.0 GitHub artifacts predate this fix -> roll v0.1.1 after retest. `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
   `AppState` machine (three `Startup`-spawned UI roots toggled by state, T16
   Button/`Interaction` pattern). **Startup state**: PRD §7.1 wants Title, but
   `AppState::default()` is `Playing` and T1's permanent `state.rs` smoke tests run this
