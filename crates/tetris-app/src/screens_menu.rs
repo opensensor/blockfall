@@ -240,7 +240,9 @@ pub struct QuitRequested(pub bool);
 // Systems (UI glue)
 // ---------------------------------------------------------------------------
 
-/// Root visibility query over the three menu screens.
+/// Root visibility query over the three menu screens. The `Or` filter is
+/// load-bearing: `Visibility` is a default component on every entity, so a
+/// bare `Has<…>` query would match (and hide) the entire world.
 type MenuRoots<'w, 's> = Query<
     'w,
     's,
@@ -250,6 +252,7 @@ type MenuRoots<'w, 's> = Query<
         Has<PauseRoot>,
         Has<GameOverRoot>,
     ),
+    Or<(With<TitleRoot>, With<PauseRoot>, With<GameOverRoot>)>,
 >;
 
 #[derive(SystemParam)]
@@ -524,7 +527,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
     );
 
     add_menu_root(&mut commands, TitleRoot, PANEL_BG, |root| {
-        root.spawn(label_node("TETRIS".to_string(), 64.0));
+        root.spawn(label_node("BLOCKFALL".to_string(), 64.0));
         root.spawn(label_node(format!("v{VERSION}"), 14.0));
         root.spawn((BestText, label_node(String::new(), 20.0)));
         root.spawn(label_node(pause_hint, 14.0));
@@ -836,6 +839,43 @@ mod tests {
         assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Visible);
         assert_eq!(vis_of::<PauseRoot>(&mut app), Visibility::Hidden);
         assert_eq!(vis_of::<GameOverRoot>(&mut app), Visibility::Hidden);
+    }
+
+    #[test]
+    fn root_visibility_sync_never_touches_foreign_entities() {
+        // Regression: the unfiltered root query (bare `Has<..>`, no Or-filter)
+        // matched every entity's default `Visibility` and hid the camera,
+        // sprites, HUD and every menu child — real window showed a flat panel
+        // with no text, buttons or playfield.
+        let mut app = menu_test_app();
+        let foreign = app.world_mut().spawn(Visibility::default()).id();
+        let child = app
+            .world_mut()
+            .spawn(Visibility::default())
+            .insert(TitleRoot)
+            .id();
+        set_state(&mut app, AppState::Playing);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(foreign).unwrap(),
+            Visibility::Inherited,
+            "foreign entity visibility was hijacked"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(child).unwrap(),
+            Visibility::Hidden,
+            "root itself must still sync"
+        );
+        set_state(&mut app, AppState::Title);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(foreign).unwrap(),
+            Visibility::Inherited
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(child).unwrap(),
+            Visibility::Visible
+        );
     }
 
     #[test]

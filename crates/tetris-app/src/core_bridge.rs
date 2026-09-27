@@ -427,13 +427,19 @@ fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
 fn bot_marathon_system(
     bot: Res<BotMode>,
     mut bot_state: ResMut<BotState>,
-    core: NonSendMut<GameCore>,
-    app_state: ResMut<AppState>,
+    mut core: NonSendMut<GameCore>,
+    mut app_state: ResMut<AppState>,
     time: Res<Time>,
     mut exits: MessageWriter<AppExit>,
 ) {
     if !bot.0 {
         return;
+    }
+    if *app_state == AppState::Title && !bot_state.awaiting_restart {
+        // T17 moved the app to Title at startup; QA bot mode presses "Start"
+        // the same way R restarts.
+        info!("BOT start from Title (Start-equivalent)");
+        restart_run(&mut core, &mut app_state);
     }
     if *app_state == AppState::GameOver && !bot_state.awaiting_restart {
         bot_state.games_done += 1;
@@ -454,7 +460,7 @@ fn bot_marathon_system(
         bot_state.restart_in -= time.delta_secs();
         if bot_state.restart_in <= 0.0 {
             info!("BOT restart (R-equivalent)");
-            restart_run(core.into_inner(), app_state.into_inner());
+            restart_run(&mut core, &mut app_state);
             bot_state.awaiting_restart = false;
         }
     }
