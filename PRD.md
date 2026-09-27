@@ -1,9 +1,9 @@
 # PRD — Tetris-like Falling-Block Puzzle Game (Rust / Bevy)
 
-- **Status:** M2-vertical-slice
+- **Status:** Released v0.1.0
 - **Date:** 2026-09-27
 - **Owner:** Project author
-- **Working title:** `tetris` (placeholder — rename before release)
+- **Name:** Blockfall (final — resolved 2026-09-27, §14 item 1 closed)
 
 ---
 
