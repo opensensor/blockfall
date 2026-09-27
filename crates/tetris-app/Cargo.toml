@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# T21 (PRD §14 #1): user-visible binary name is `blockfall`; the package id
+# stays `tetris-app` so `cargo run -p tetris-app` keeps working.
+[[bin]]
+name = "blockfall"
+path = "src/main.rs"
+
 [dependencies]
 tetris-core = { workspace = true }
 bevy = { workspace = true, features = ["serialize", "bevy_text", "default_font"] }

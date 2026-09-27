@@ -34,6 +34,7 @@
 //! input-layer concern (T12), not juice.
 
 use bevy::prelude::*;
+use bevy::render::view::window::screenshot::{save_to_disk, Screenshot};
 
 use tetris_core::event::GameEvent;
 
@@ -371,8 +372,68 @@ impl Plugin for JuicePlugin {
             .add_systems(
                 Update,
                 (juice_from_events, freeze_gate, juice_painter).chain(),
-            );
+            )
+            .add_systems(Update, apply_window_identity);
+        if let Some(schedule) = parse_shot_schedule() {
+            app.insert_resource(schedule)
+                .add_systems(Update, schedule_shots);
+        }
     }
+}
+
+/// T21 (PRD §14 #1): single source of truth for the user-visible app name
+/// ("Blockfall"). `main.rs` is frozen with the placeholder title `tetris`,
+/// so the display rename is applied from this registered plugin. The
+/// compare-first guard keeps `Window` change detection quiet once applied.
+fn apply_window_identity(mut windows: Query<&mut Window>) {
+    const TITLE: &str = "Blockfall";
+    for mut window in &mut windows {
+        if window.title != TITLE {
+            window.title = TITLE.into();
+        }
+    }
+}
+
+/// Env hook (T21 screenshot capture): `TETRIS_SHOT=/abs/a.png@90,/abs/b.png@1200`
+/// captures the primary window at the given `Update` frame numbers using
+/// Bevy 0.19's built-in [`Screenshot`] component + `save_to_disk` observer
+/// (no external CLI needed on Wayland). Unset in normal runs: zero cost.
+const SHOT_ENV: &str = "TETRIS_SHOT";
+
+#[derive(Resource)]
+struct ShotSchedule {
+    frame: u64,
+    remaining: Vec<(u64, String)>,
+}
+
+fn parse_shot_schedule() -> Option<ShotSchedule> {
+    let raw = std::env::var_os(SHOT_ENV)?.to_str()?.to_owned();
+    let mut remaining = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (path, frame) = item.split_once('@')?;
+        remaining.push((frame.parse().ok()?, path.to_owned()));
+    }
+    if remaining.is_empty() {
+        return None;
+    }
+    Some(ShotSchedule {
+        frame: 0,
+        remaining,
+    })
+}
+
+fn schedule_shots(mut schedule: ResMut<ShotSchedule>, mut commands: Commands) {
+    schedule.frame += 1;
+    let frame = schedule.frame;
+    schedule.remaining.retain(|(due, path)| {
+        if *due != frame {
+            return true;
+        }
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.clone()));
+        false
+    });
 }
 
 #[cfg(test)]
