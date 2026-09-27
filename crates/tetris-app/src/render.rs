@@ -33,14 +33,16 @@ use bevy::window::Window;
 use tetris_core::board::{COLS, ROWS};
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::Piece;
+use tetris_core::srs;
 
 use crate::core_bridge::GameCore;
 
-/// Rows of the drawn field. The 2 spawn-buffer rows are rendered (M3
-/// playtest fix): clipping them made piece cells "vanish outside the
-/// boundary" whenever a kick or spawn touched rows 0..1, so the whole
-/// board (10x22) is now visible.
-pub const VISIBLE_ROWS: usize = ROWS;
+/// Topmost drawn row: 2 rows of headroom above the board (`srs::MIN_ROT_ROW`)
+/// so kick-lifted pieces stay fully visible instead of clipping (M3 playtest).
+pub const DRAWN_TOP: i32 = srs::MIN_ROT_ROW;
+
+/// Rows of the drawn field: full board (22) plus the headroom above it.
+pub const VISIBLE_ROWS: usize = ROWS + DRAWN_TOP.unsigned_abs() as usize;
 
 /// Srgba channels (red, green, blue) per piece, in [`Piece::ALL`] order,
 /// following the Tetris Guideline palette (PRD: flat colored cells, one
@@ -125,8 +127,9 @@ pub enum CellKind {
 /// One visible cell of a render frame, derived purely from a snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnapshotCell {
-    /// Full board row (`HIDDEN_ROWS..ROWS`).
-    pub row: usize,
+    /// Row on the drawn field (`DRAWN_TOP..ROWS`); negative rows are
+    /// kick-lifted headroom cells above the board.
+    pub row: i32,
     /// Column (`0..COLS`).
     pub col: usize,
     /// Piece the cell is drawn with (board color, active/ghost color).
@@ -154,9 +157,10 @@ impl SnapshotCell {
     }
 }
 
-/// Letterbox fit of the 10x22 field inside a `window_w` x `window_h`
-/// window: returns `(cell, offset_x, offset_y)` with a single square cell
-/// size on both axes and the field centered in the remaining margin.
+/// Letterbox fit of the 10-row x [`VISIBLE_ROWS`]-row drawn field inside a
+/// `window_w` x `window_h` window: returns `(cell, offset_x, offset_y)`
+/// with a single square cell size on both axes and the field centered in
+/// the remaining margin.
 pub fn letterbox(window_w: f32, window_h: f32) -> (f32, f32, f32) {
     let cell = (window_w / COLS as f32).min(window_h / VISIBLE_ROWS as f32);
     let offset_x = (window_w - cell * COLS as f32) * 0.5;
@@ -174,7 +178,7 @@ pub fn frame_cells(snapshot: &GameSnapshot) -> Vec<SnapshotCell> {
         for col in 0..COLS {
             if let Some(piece) = snapshot.board.get(row, col) {
                 cells.push(SnapshotCell {
-                    row,
+                    row: row as i32,
                     col,
                     piece,
                     kind: CellKind::Board,
@@ -197,10 +201,10 @@ pub fn frame_cells(snapshot: &GameSnapshot) -> Vec<SnapshotCell> {
 }
 
 fn push_visible(cells: &mut Vec<SnapshotCell>, row: i32, col: i32, piece: Piece, kind: CellKind) {
-    let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
+    let Ok(col) = usize::try_from(col) else {
         return;
     };
-    if row >= ROWS || col >= COLS {
+    if !(DRAWN_TOP..ROWS as i32).contains(&row) || col >= COLS {
         return;
     }
     cells.push(SnapshotCell {
@@ -257,7 +261,7 @@ fn render_playfield(
 
     for (index, frame_cell) in cells.iter().enumerate() {
         let x = left + (frame_cell.col as f32 + 0.5) * cell;
-        let y = top - (frame_cell.row as f32 + 0.5) * cell;
+        let y = top - ((frame_cell.row - DRAWN_TOP) as f32 + 0.5) * cell;
         let sprite = Sprite {
             color: frame_cell.color(),
             custom_size: Some(Vec2::splat(cell)),
@@ -303,7 +307,8 @@ mod tests {
     use super::*;
     use crate::core_bridge::{CoreBridgePlugin, PendingActions};
     use crate::state::AppState;
-    use tetris_core::board::HIDDEN_ROWS;
+    use tetris_core::board::{Board, HIDDEN_ROWS};
+    use tetris_core::piece::{PieceState, Rotation};
 
     use bevy::app::FixedUpdate;
     use bevy::window::WindowPlugin;
@@ -312,7 +317,7 @@ mod tests {
 
     const EPS: f32 = 1e-4;
 
-    /// Letterbox math: square cells on both axes, centered, 10:20 aspect
+    /// Letterbox math: square cells on both axes, centered, field aspect
     /// preserved, cell as large as possible at several window shapes.
     #[test]
     fn letterbox_fits_and_centers_square_cells() {
@@ -341,7 +346,7 @@ mod tests {
         check(320.0, 240.0); // tiny window
         check(3440.0, 1440.0); // ultrawide
         check(800.0, 800.0); // square: height-limited
-        check(100.0, 220.0); // exact 10:22 fit, zero margin
+        check(100.0, 240.0); // exact 10:24 fit (22 board + 2 headroom rows)
     }
 
     fn render_app(seed: u64) -> App {
@@ -432,6 +437,57 @@ mod tests {
             None => (0, 0),
         };
         board + active + ghost
+    }
+
+    /// Kick-lifted cells in the headroom rows above the board must still
+    /// render (M3 playtest: an L rotated at the wall "turned into 3 squares"
+    /// because negative rows were clipped out of the frame).
+    #[test]
+    fn headroom_rows_render_kick_lifted_cells() {
+        let snapshot = GameSnapshot {
+            board: Board::new(),
+            active: Some(PieceState {
+                piece: Piece::L,
+                rot: Rotation::Cw,
+                row: DRAWN_TOP,
+                col: 4,
+            }),
+            ghost_row: None,
+            hold: None,
+            hold_used: false,
+            next: vec![],
+            score: 0,
+            level: 1,
+            lines: 0,
+            combo: 0,
+            b2b: false,
+            game_over: false,
+        };
+        let cells = frame_cells(&snapshot);
+        let active: Vec<SnapshotCell> = cells
+            .iter()
+            .filter(|c| c.kind == CellKind::Active)
+            .copied()
+            .collect();
+        assert_eq!(active.len(), 4, "L must render all four cells: {active:?}");
+        assert!(active
+            .iter()
+            .all(|c| (DRAWN_TOP..ROWS as i32).contains(&c.row)));
+        assert!(active.iter().any(|c| c.row < 0), "headroom cell expected");
+        // Cells above the drawn top are dropped, never wrapped into view.
+        let mut lifted = snapshot;
+        lifted.active = Some(PieceState {
+            piece: Piece::L,
+            rot: Rotation::Cw,
+            row: DRAWN_TOP - 1,
+            col: 4,
+        });
+        assert!(
+            frame_cells(&lifted)
+                .iter()
+                .all(|c| c.row >= DRAWN_TOP && c.row < ROWS as i32),
+            "off-field rows must be clipped"
+        );
     }
 
     #[test]

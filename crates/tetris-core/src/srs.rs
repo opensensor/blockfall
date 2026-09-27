@@ -100,6 +100,14 @@ pub fn kick_offsets(dir: RotateDir, piece: Piece, from: Rotation) -> &'static [(
 /// per the T2 convention). `kick_index` is the 0-based trial index
 /// (0 = no offset; 4 = the far SRS kick T7's T-spin rule keys on).
 /// Returns `None` if every trial collides (the piece is wedged).
+/// Lowest row a rotation may place a cell in. SRS kicks can lift pieces up
+/// to 2 rows; cascading kicks near the ceiling could walk cells arbitrarily
+/// high. Rendering draws a fixed 2-row headroom above the board, so rotation
+/// trials whose cells would sit above `MIN_ROT_ROW` are rejected — the piece
+/// stays fully visible instead of clipping out of the frame (M3 playtest:
+/// L-at-wall rotations visibly losing their nub above row 0).
+pub const MIN_ROT_ROW: i32 = -(crate::board::HIDDEN_ROWS as i32);
+
 pub fn try_rotate(board: &Board, ps: &PieceState, dir: RotateDir) -> Option<RotationAttempt> {
     let rot = match dir {
         RotateDir::Clockwise => ps.rot.clockwise(),
@@ -113,6 +121,9 @@ pub fn try_rotate(board: &Board, ps: &PieceState, dir: RotateDir) -> Option<Rota
             row: ps.row - y,
             col: ps.col + x,
         };
+        if candidate.cells().iter().any(|&(r, _)| r < MIN_ROT_ROW) {
+            continue;
+        }
         if !board.collides(&candidate) {
             return Some(RotationAttempt {
                 state: candidate,
@@ -125,7 +136,7 @@ pub fn try_rotate(board: &Board, ps: &PieceState, dir: RotateDir) -> Option<Rota
 
 #[cfg(test)]
 mod tests {
-    use super::{kick_offsets, try_rotate, RotateDir, RotationAttempt};
+    use super::{kick_offsets, try_rotate, RotateDir, RotationAttempt, MIN_ROT_ROW};
     use crate::board::{Board, COLS, ROWS};
     use crate::piece::{Piece, PieceState, Rotation};
 
@@ -384,5 +395,31 @@ mod tests {
         assert_eq!(a.kick_index, 0);
         assert_eq!(a.state.row, -1);
         assert_eq!(a.state.cells(), [(1, 3), (1, 4), (1, 5), (1, 6)]);
+    }
+
+    #[test]
+    fn rotation_kicks_never_lift_cells_above_headroom() {
+        // Regression (M3 playtest): cascading up-kicks could walk piece cells
+        // above the rendered headroom, so an L at the wall visibly lost its
+        // nub ("turns into 3 squares"). Kicks whose cells would sit above
+        // MIN_ROT_ROW are rejected like any colliding trial.
+        let mut board = Board::new();
+        for c in 0..3 {
+            board.set(0, c, Some(Piece::O));
+        }
+        // L in Cw on box row -2: only the y=+2 kicks remain (all low trials
+        // collide with the wall of blockers) and those land cells on rows
+        // -3/-4 — beyond the 2-row headroom — so every trial must fail.
+        let lifted = ps(Piece::L, Rotation::Cw, -2, 0);
+        assert!(try_rotate(&board, &lifted, RotateDir::Clockwise).is_none());
+        // One row lower still rotates (cells stay within headroom).
+        let lower = ps(Piece::L, Rotation::Cw, -1, 0);
+        let a = try_rotate(&board, &lower, RotateDir::Clockwise)
+            .expect("kicked rotation within headroom succeeds");
+        assert!(
+            a.state.cells().iter().all(|&(r, _)| r >= MIN_ROT_ROW),
+            "{:?}",
+            a.state.cells()
+        );
     }
 }
