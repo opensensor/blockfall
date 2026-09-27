@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Lint & test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # System libs needed to compile Bevy 0.19 + bevy_kira_audio headlessly.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  nightly-soak:
+    name: Nightly soak (tetris-core, --ignored)
+    runs-on: ubuntu-latest
+    # Only fires on the nightly schedule or manual dispatch, never on push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # T9's wall-clock soak test (1 h crash-free run) plus headroom.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release soak
+        run: cargo test --release -p tetris-core -- --ignored

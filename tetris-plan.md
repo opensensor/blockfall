@@ -892,9 +892,26 @@ T23: [T22]       WASM build (stretch, M6)
   release binaries. **Nightly job**: `cargo test --release -p tetris-core -- --ignored`
   (T9's wall-clock soak) with failure notifications.
 - **validation**: CI green on tag push; artifacts downloadable for ubuntu/windows/macos.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed (2026-09-27)
+- **log**: Created `.github/workflows/ci.yml`: `linux` job on push/PR (ubuntu-latest;
+  apt `libasound2-dev libudev-dev` for headless Bevy 0.19 compile; `cargo fmt --all
+  --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`) and
+  `nightly-soak` job (cron nightly + workflow_dispatch, `timeout-minutes: 30`,
+  `cargo test --release -p tetris-core -- --ignored`) gated with an event-name `if` so it
+  never fires on push/PR. Both use dtolnay/rust-toolchain@stable (fmt/clippy components)
+  + Swatinem/rust-cache@v2. Created `.github/workflows/release.yml`: on `v*` tag push,
+  matrix ubuntu/windows/macos, same Linux apt deps, `cargo build --release --workspace`,
+  per-OS packaging with standard target triples (Linux `x86_64-unknown-linux-gnu`,
+  Windows `x86_64-pc-windows-msvc`; macOS via `uname -m` mapping to
+  `aarch64-apple-darwin`/`x86_64-apple-darwin`) into
+  `blockfall-<tag>-<triple>.tar.gz` / `.zip`, attached via softprops/action-gh-release@v2
+  glob patterns. Archives are binary-only — assets load relative to CWD; README gained a
+  "CI & releases" note documenting this and `cargo bundle` as future work (no bundler
+  added). Local gate: `cargo fmt --all --check` + `cargo clippy --all-targets
+  -- -D warnings` + `cargo test --workspace` → 223 passed, 0 failed. YAML validated with
+  `python3 -c "import yaml,glob;..."` → OK.
+- **files edited/created**: `.github/workflows/ci.yml`, `.github/workflows/release.yml`,
+  `README.md` (CI & releases section), `tetris-plan.md`
 
 ### T21: Icon, screenshots, docs polish
 - **depends_on**: [T14]

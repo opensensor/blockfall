@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Only tetris-app produces a bin (blockfall); --workspace keeps the
+      # build identical to CI.
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Resolve target triple (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "TARGET=x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
+
+      - name: Resolve target triple (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: echo "TARGET=x86_64-pc-windows-msvc" >> $env:GITHUB_ENV
+
+      # macos-latest runners are Apple Silicon; map `uname -m` anyway so the
+      # job stays correct on Intel-hosted runners too.
+      - name: Resolve target triple (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          case "$(uname -m)" in
+            arm64)  echo "TARGET=aarch64-apple-darwin" >> "$GITHUB_ENV" ;;
+            x86_64) echo "TARGET=x86_64-apple-darwin"  >> "$GITHUB_ENV" ;;
+            *) echo "unsupported arch: $(uname -m)" && exit 1 ;;
+          esac
+
+      - name: "Package (Unix: tar.gz)"
+        if: matrix.os != 'windows-latest'
+        run: tar czf "blockfall-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C target/release blockfall
+
+      - name: "Package (Windows: zip)"
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/blockfall.exe -DestinationPath "blockfall-${env:GITHUB_REF_NAME}-${env:TARGET}.zip"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            blockfall-${{ github.ref_name }}-*.tar.gz
+            blockfall-${{ github.ref_name }}-*.zip

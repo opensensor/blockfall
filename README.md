@@ -133,6 +133,20 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all --check
 ```
 
+## CI & releases
+
+GitHub Actions runs `fmt --check`, `clippy -D warnings` and `cargo test --workspace`
+on every push/PR (Linux; the runner installs `libasound2-dev` and `libudev-dev`
+for Bevy's audio/device backends), plus a nightly `--ignored` soak of
+`tetris-core`. Pushing a `v*` tag builds release binaries for Linux, Windows and
+macOS and attaches them to the GitHub release.
+
+Note: release archives contain the `blockfall` binary only. The game loads its
+assets from `crates/tetris-app/assets` relative to the current working
+directory, so unpack the binary next to a copy of that `assets/` directory to
+run it. Proper bundling (`cargo bundle`, desktop file, icon install) is future
+work.
+
 ## Status
 
 Pre-release (see [PRD.md](PRD.md) for milestones; release/tag flow in
