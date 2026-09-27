@@ -572,9 +572,48 @@ T23: [T22]       WASM build (stretch, M6)
   `cargo test/clippy/fmt` green. Human part — agent runs the manual checklist (full game,
   hard/soft drop, hold, 180, ghost, restart feel) in a real window, posts results, and
   **stops for author sign-off**; the gate passes only on author approval.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Partially Completed — automated part GREEN, awaiting AUTHOR sign-off
+- **log**: Automated part complete, commit `ad87aae`. All glue lives in
+  `core_bridge.rs` (main.rs/state.rs untouched). **Restart**: `restart_run()` shared
+  path (`GameCore::restart()`/`restart_with` + `AppState::Playing`); `restart_on_r_system`
+  in `Update` fires on `KeyCode::KeyR` while `AppState::GameOver` — `KeyBindings` (T12)
+  owns only the 8 action slots + pause and has **no restart slot**, so R is hardcoded per
+  plan (documented in code); system takes `Option<Res<ButtonInput<KeyCode>>>` so
+  MinimalPlugins headless worlds don't panic. **Seed**: `TETRIS_SEED=<u64>` env overrides
+  the wall-clock seed at startup (`seed_from_env_at_startup`) and on every restart; the
+  seed used (`env` vs `wall clock`) is `info!`-logged. **Bot** (`TETRIS_BOT=1`):
+  `bot_drive_system` in `FixedUpdate` before `core_bridge_system` — greedy 1-ply solver
+  (rotations × slide/drop BFS-reachable resting slots on board copy via `ghost_row`/`merge`
+  + clear; Dellacherie-flavoured weights: clears 4500 ≫ holes 500 ≫ agg height 25 ≫
+  bumpiness 12) executed closed-loop (one action/tick, stall counter replans/force-drops
+  so it can never hang); `bot_marathon_system` logs `BOT game_done seed= score= level=
+  lines=` + `MARATHON game_done` per game, auto-restarts via the R-equivalent path after
+  0.5 s, exits `AppExit::Success` after 2 games; `marathon_fps_system` logs
+  `MARATHON fps_avg=<x> frame_ms=<y>` every 2 s from real window frame times.
+  **Headless test**: `core_bridge::tests::wired_bot_bridge_full_loop_then_fresh_restart`
+  (wired bridge, no window, seed 42): real `FixedUpdate` schedule with the wired bot →
+  observed `PieceSpawned`, `LineCleared`, `LevelUp` events, forced block-out → `GameOver`
+  + `AppState::GameOver`, then shared restart path → structurally fresh snapshot (empty
+  board, score/lines 0, active+ghost present, steps reset) — zero panics. Plus
+  `bot_solver_prefers_line_clear_over_flat_stack` fixture test. 202 tests green.
+  **REAL-WINDOW marathon** (`cargo build --release`;
+  `TETRIS_SEED=42 TETRIS_BOT=1 timeout 120 ./target/release/tetris-app`, Wayland desktop):
+  exit status 0 via AppExit (no timeout kill); **13 fps windows, fps_avg 60.05
+  (min 59.9), frame_ms avg 16.65 ≥ 58 gate**; `MARATHON game_done games_done=2`
+  (both games deterministic from seed 42: score 27306, level 6, 54 lines); restart line
+  `restart: seed 42 (from TETRIS_SEED)` between games; **0 panics**; log noise = 1 startup
+  WARN (`sctk_adwaita` unknown button, env) + 11 one-time startup ERRORs
+  (`bevy_asset: Path not found assets/sfx/*.wav`) — pre-existing T18 placeholder assets
+  not in repo, zero runtime spam. **Gates**: `cargo test --workspace` 202 passed (200
+  prior + 2 new); `cargo fmt --all --check` clean; `cargo clippy --all-targets --
+  -D warnings` clean. PRD status header bumped to `M2-vertical-slice`.
+  **HUMAN PART OPEN** — manual checklist (§12 + T14 validation) for author sign-off:
+  (1) full game start→game over in real window; (2) hard drop feel/latency; (3) soft drop
+  cadence; (4) hold swap (once per piece); (5) 180 rotation kicks; (6) ghost accuracy;
+  (7) R restart feel from game over; (8) DAS/ARR defaults feel right; (9) sustained 60 FPS
+  by eye. Gate passes only on author approval.
+- **files edited/created**: `crates/tetris-app/src/core_bridge.rs` (restart glue, seed env,
+  bot solver/lifecycle/marathon logging, T14 tests), `PRD.md` (status header bump).
 
 ### T15: Settings & best-score persistence
 - **depends_on**: [T10]
