@@ -15,14 +15,27 @@
 //! `Update`, so simply reading the newest snapshot each `Update` keeps
 //! render decoupled from sim rate.
 //!
+//! While a [`VersusMatch`] is active the very same draw path runs twice into
+//! two half-window viewports (T26): both boards share one cell size (the
+//! min of the two half fits, see [`versus_layouts`]) and each field is
+//! centered in its own half. Solo rendering is untouched by the versus
+//! branch — the solo pool is even fully despawned while versus runs, and the
+//! versus pools while it does not, so no cell of one mode ever survives into
+//! the other.
+//!
 //! Public API reusable by later tasks:
 //! - [`PIECE_COLORS`] / [`piece_color`] — canonical PRD-style piece palette
 //!   (HUD mini-grids and the hold box, T13).
 //! - [`GHOST_ALPHA`] — ghost dimming factor (T13 preview dimming parity, T19).
 //! - [`letterbox`] — window size -> `(cell, offset_x, offset_y)` centering
 //!   math for any playfield-anchored UI (T13, T17 overlays, T19 juice).
+//! - [`FieldLayout`] / [`versus_layouts`] — viewport-parameterized layout
+//!   (`fit` is exactly the [`letterbox`] math; the versus pair is the two
+//!   half-window fields with a shared cell size, T26).
 //! - [`frame_cells`] — snapshot -> flat list of drawable [`SnapshotCell`]s
 //!   (board + active + ghost, clipped only to the full 10x22 board).
+//! - [`VersusCellSide`] — marks a pooled cell sprite with the match side it
+//!   belongs to (`None`-marked entities are solo).
 //!
 //! [`Game::snapshot`]: tetris_core::game::Game::snapshot
 
@@ -34,8 +47,9 @@ use tetris_core::board::{COLS, ROWS};
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::Piece;
 use tetris_core::srs;
+use tetris_core::versus::Side;
 
-use crate::core_bridge::GameCore;
+use crate::core_bridge::{GameCore, VersusMatch};
 
 /// Topmost drawn row: 2 rows of headroom above the board (`srs::MIN_ROT_ROW`)
 /// so kick-lifted pieces stay fully visible instead of clipping (M3 playtest).
@@ -168,6 +182,63 @@ pub fn letterbox(window_w: f32, window_h: f32) -> (f32, f32, f32) {
     (cell, offset_x, offset_y)
 }
 
+/// Cell size + top-left anchor of one drawn field inside a viewport (T26).
+/// [`FieldLayout::fit`] is exactly the [`letterbox`] math, so the solo
+/// full-window draw stays pixel-identical to T11.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldLayout {
+    /// Square cell edge length in world units.
+    pub cell: f32,
+    /// World position of the drawn field's top-left corner.
+    pub origin: Vec2,
+}
+
+impl FieldLayout {
+    /// Letterbox fit of the drawn field inside a `view_w` x `view_h`
+    /// viewport centered on the world origin (solo: the whole window).
+    pub fn fit(view_w: f32, view_h: f32) -> Self {
+        let (cell, offset_x, offset_y) = letterbox(view_w, view_h);
+        Self {
+            cell,
+            origin: Vec2::new(-view_w * 0.5 + offset_x, view_h * 0.5 - offset_y),
+        }
+    }
+
+    /// Place a field of a fixed `cell` size with its own center at `center`
+    /// (versus: both halves share one cell size, each field centered in its
+    /// half — margins may exceed the letterbox minimum).
+    pub fn centered(cell: f32, center: Vec2) -> Self {
+        Self {
+            cell,
+            origin: Vec2::new(
+                center.x - cell * COLS as f32 * 0.5,
+                center.y + cell * VISIBLE_ROWS as f32 * 0.5,
+            ),
+        }
+    }
+
+    /// World-space center of drawn cell `(row, col)` in this layout.
+    pub fn cell_center(&self, row: i32, col: usize) -> Vec2 {
+        Vec2::new(
+            self.origin.x + (col as f32 + 0.5) * self.cell,
+            self.origin.y - ((row - DRAWN_TOP) as f32 + 0.5) * self.cell,
+        )
+    }
+}
+
+/// The two half-window viewports of an active versus match (T26):
+/// `[left, right]`, both at the shared cell size (the min of the two half
+/// fits — the halves are equal by construction, so each half fits exactly)
+/// with every field centered in its own half of the window.
+pub fn versus_layouts(window_w: f32, window_h: f32) -> [FieldLayout; 2] {
+    let half_w = window_w * 0.5;
+    let cell = FieldLayout::fit(half_w, window_h).cell;
+    [
+        FieldLayout::centered(cell, Vec2::new(-half_w * 0.5, 0.0)),
+        FieldLayout::centered(cell, Vec2::new(half_w * 0.5, 0.0)),
+    ]
+}
+
 /// Flatten a snapshot into the cells to draw this frame: all board rows
 /// (including the 2-row spawn buffer, so kicked/spawning pieces never
 /// disappear at the top edge), active piece cells and ghost cells, clipped
@@ -223,81 +294,138 @@ pub struct PlayfieldCell {
     pub kind: CellKind,
 }
 
+/// Marks a pooled playfield cell with the match side it belongs to (T26).
+/// Solo cells never carry it, and versus cells always do, so the two modes
+/// are trivially distinguishable in tests and by later systems.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersusCellSide(pub Side);
+
 /// Pooled cell sprite entities (rebuilt to the needed count each frame).
 #[derive(Resource, Default)]
 struct CellPool {
     entities: Vec<Entity>,
 }
 
-/// Full refresh of all cell sprites from the newest snapshot. The fixed-step
-/// sim has already run for this frame (`RunFixedMainLoop` precedes
-/// `Update`), so this always reads the latest state; per-frame redraw is
-/// fine at <= ~210 cells.
-fn render_playfield(
-    mut commands: Commands,
-    core: Option<NonSend<GameCore>>,
-    windows: Query<&Window>,
-    mut pool: ResMut<CellPool>,
-) {
-    let (Some(core), Some(window)) = (core, windows.iter().next()) else {
-        return;
-    };
-    let size = window.resolution.size();
-    if size.x <= 0.0 || size.y <= 0.0 {
-        return;
-    }
-    let (cell, offset_x, offset_y) = letterbox(size.x, size.y);
-    let left = -size.x * 0.5 + offset_x;
-    let top = size.y * 0.5 - offset_y;
+/// Pooled versus cell sprites, one pool per match side (T26). Fully
+/// despawned whenever versus is inactive, and vice versa for [`CellPool`],
+/// so neither mode can leak entities into the other's frame.
+#[derive(Resource, Default)]
+struct VersusCellPools {
+    left: Vec<Entity>,
+    right: Vec<Entity>,
+}
 
-    let cells = frame_cells(&core.game.snapshot());
-    // Keep the first `cells.len()` pooled entities, despawn the surplus tail.
-    if pool.entities.len() > cells.len() {
-        let surplus = pool.entities.split_off(cells.len());
+/// Bring one pooled entity list in line with the cells of one frame: reuse
+/// the prefix, despawn the surplus tail, spawn what is missing.
+fn sync_pool(
+    commands: &mut Commands,
+    pool: &mut Vec<Entity>,
+    cells: &[SnapshotCell],
+    layout: &FieldLayout,
+    side: Option<VersusCellSide>,
+) {
+    if pool.len() > cells.len() {
+        let surplus = pool.split_off(cells.len());
         for entity in surplus {
             commands.entity(entity).despawn();
         }
     }
 
     for (index, frame_cell) in cells.iter().enumerate() {
-        let x = left + (frame_cell.col as f32 + 0.5) * cell;
-        let y = top - ((frame_cell.row - DRAWN_TOP) as f32 + 0.5) * cell;
+        let center = layout.cell_center(frame_cell.row, frame_cell.col);
         let sprite = Sprite {
             color: frame_cell.color(),
-            custom_size: Some(Vec2::splat(cell)),
+            custom_size: Some(Vec2::splat(layout.cell)),
             ..default()
         };
-        let transform = Transform::from_xyz(x, y, frame_cell.z());
-        if index < pool.entities.len() {
-            let entity = pool.entities[index];
-            commands.entity(entity).insert((
-                PlayfieldCell {
-                    kind: frame_cell.kind,
-                },
-                sprite,
-                transform,
-            ));
+        let transform = Transform::from_xyz(center.x, center.y, frame_cell.z());
+        let marker = PlayfieldCell {
+            kind: frame_cell.kind,
+        };
+        if index < pool.len() {
+            let entity = pool[index];
+            commands.entity(entity).insert((marker, sprite, transform));
+            if let Some(side) = side {
+                commands.entity(entity).insert(side);
+            }
         } else {
-            let entity = commands
-                .spawn((
-                    PlayfieldCell {
-                        kind: frame_cell.kind,
-                    },
-                    sprite,
-                    transform,
-                ))
-                .id();
-            pool.entities.push(entity);
+            let entity = commands.spawn((marker, sprite, transform)).id();
+            if let Some(side) = side {
+                commands.entity(entity).insert(side);
+            }
+            pool.push(entity);
         }
     }
 }
 
-/// Flat colored playfield renderer fed exclusively by `Game::snapshot()`.
+/// Despawn every entity of a pool (mode switch).
+fn clear_pool(commands: &mut Commands, pool: &mut Vec<Entity>) {
+    for entity in pool.drain(..) {
+        commands.entity(entity).despawn();
+    }
+}
+
+/// Full refresh of all cell sprites from the newest snapshot. The fixed-step
+/// sim has already run for this frame (`RunFixedMainLoop` precedes
+/// `Update`), so this always reads the latest state; per-frame redraw is
+/// fine at <= ~210 cells. With [`VersusMatch::active`] the solo pool is
+/// despawned and both match boards are drawn instead, one per half-viewport
+/// of [`versus_layouts`] (T26).
+fn render_playfield(
+    mut commands: Commands,
+    core: Option<NonSend<GameCore>>,
+    versus: Option<NonSend<VersusMatch>>,
+    windows: Query<&Window>,
+    mut pool: ResMut<CellPool>,
+    mut versus_pools: ResMut<VersusCellPools>,
+) {
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+    let size = window.resolution.size();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+
+    if let Some(versus) = versus.filter(|versus| versus.active) {
+        clear_pool(&mut commands, &mut pool.entities);
+        let snapshot = versus.match_.snapshot();
+        let [left, right] = versus_layouts(size.x, size.y);
+        let cells = frame_cells(&snapshot.left);
+        sync_pool(
+            &mut commands,
+            &mut versus_pools.left,
+            &cells,
+            &left,
+            Some(VersusCellSide(Side::Left)),
+        );
+        let cells = frame_cells(&snapshot.right);
+        sync_pool(
+            &mut commands,
+            &mut versus_pools.right,
+            &cells,
+            &right,
+            Some(VersusCellSide(Side::Right)),
+        );
+        return;
+    }
+
+    clear_pool(&mut commands, &mut versus_pools.left);
+    clear_pool(&mut commands, &mut versus_pools.right);
+    let Some(core) = core else { return };
+    let layout = FieldLayout::fit(size.x, size.y);
+    let cells = frame_cells(&core.game.snapshot());
+    sync_pool(&mut commands, &mut pool.entities, &cells, &layout, None);
+}
+
+/// Flat colored playfield renderer fed exclusively by `Game::snapshot()`
+/// (solo) or the active [`VersusMatch`] snapshot (1v1, two fields).
 pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CellPool>()
+            .init_resource::<VersusCellPools>()
             .add_systems(Update, render_playfield);
     }
 }
@@ -600,5 +728,249 @@ mod tests {
         for (_, _, custom_size, _) in &active {
             assert_eq!(*custom_size, Some(Vec2::splat(cell)));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // T26: versus (two-field) rendering
+    // ------------------------------------------------------------------
+
+    use crate::core_bridge::{end_versus, start_versus, VersusMatch, VersusWinner};
+    use crate::input::VersusActions;
+    use tetris_core::versus::{AttackRule, Side};
+
+    /// Activate a versus match through the shared lifecycle path (the same
+    /// one the menu buttons call), without touching the process env.
+    fn open_versus(app: &mut App, rule: AttackRule) {
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        rule,
+                        crate::core_bridge::Controller::Human,
+                        crate::core_bridge::Controller::Human,
+                    );
+                });
+            });
+    }
+
+    fn close_versus(app: &mut App) {
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    end_versus(versus.into_inner(), winner.into_inner(), state.into_inner());
+                });
+            });
+    }
+
+    fn versus_step(app: &mut App) {
+        app.world_mut().run_schedule(FixedUpdate);
+        let _ = app.world_mut().try_run_schedule(Update);
+    }
+
+    fn push_versus(app: &mut App, actions: &[Action]) {
+        let mut queue = app.world_mut().resource_mut::<VersusActions>();
+        queue.left.extend(actions.iter().copied());
+        queue.right.extend(actions.iter().copied());
+    }
+
+    fn versus_cells(app: &mut App) -> Vec<(Side, Vec3)> {
+        let mut query = app.world_mut().query::<(&VersusCellSide, &Transform)>();
+        let mut cells: Vec<(Side, Vec3)> = query
+            .iter(app.world())
+            .map(|(side, transform)| (side.0, transform.translation))
+            .collect();
+        cells.sort_by_key(|(side, pos)| {
+            (
+                format!("{side:?}"),
+                (pos.x * 1000.0) as i64,
+                (pos.y * 1000.0) as i64,
+            )
+        });
+        cells
+    }
+
+    /// Deterministic multiset of everything on screen (kind, color, place).
+    fn snapshot_drawn(app: &mut App) -> Vec<(CellKind, Color, Vec3)> {
+        let mut items: Vec<(CellKind, Color, Vec3)> = drawn(app)
+            .into_iter()
+            .map(|(kind, color, _, translation)| (kind, color, translation))
+            .collect();
+        items.sort_by(|a, b| {
+            (format!("{:?} {:?}", a.0, a.1), a.2.to_array())
+                .partial_cmp(&(format!("{:?} {:?}", b.0, b.1), b.2.to_array()))
+                .unwrap()
+        });
+        items
+    }
+
+    #[test]
+    fn versus_layout_shares_cell_size_and_stays_in_its_half() {
+        let check = |w: f32, h: f32| {
+            let [left, right] = versus_layouts(w, h);
+            let expect_cell = (w * 0.5 / COLS as f32).min(h / VISIBLE_ROWS as f32);
+            assert!(
+                (left.cell - expect_cell).abs() < EPS,
+                "cell {} != half fit {expect_cell} for {w}x{h}",
+                left.cell
+            );
+            assert_eq!(left.cell, right.cell, "both fields share one size");
+            assert!((left.origin.y - right.origin.y).abs() < EPS, "same height");
+
+            let half = w * 0.5;
+            let field_w = left.cell * COLS as f32;
+            let field_h = left.cell * VISIBLE_ROWS as f32;
+            assert!(
+                field_w <= half + EPS && field_h <= h + EPS,
+                "fields must fit their halves: {w}x{h}"
+            );
+            assert!(
+                left.origin.x >= -half - EPS && left.origin.x + field_w <= EPS,
+                "left field outside left half: {}..{}",
+                left.origin.x,
+                left.origin.x + field_w
+            );
+            assert!(
+                right.origin.x >= -EPS && right.origin.x + field_w <= half + EPS,
+                "right field outside right half: {}..{}",
+                right.origin.x,
+                right.origin.x + field_w
+            );
+            assert!(
+                left.origin.y <= h * 0.5 + EPS && left.origin.y - field_h >= -h * 0.5 - EPS,
+                "fields outside window height"
+            );
+            // Centered in their own halves.
+            let center_l = Vec2::new(left.origin.x + field_w * 0.5, left.origin.y - field_h * 0.5);
+            let center_r = Vec2::new(
+                right.origin.x + field_w * 0.5,
+                right.origin.y - field_h * 0.5,
+            );
+            assert!(
+                (center_l.x + half * 0.5).abs() < EPS && center_l.y.abs() < EPS,
+                "left field not centered: {center_l:?}"
+            );
+            assert!(
+                (center_r.x - half * 0.5).abs() < EPS && center_r.y.abs() < EPS,
+                "right field not centered: {center_r:?}"
+            );
+        };
+        check(1280.0, 720.0);
+        check(1920.0, 1080.0);
+        check(900.0, 600.0);
+        check(500.0, 1200.0);
+        check(688.0, 1200.0); // exact 10:24 half fit
+    }
+
+    #[test]
+    fn solo_field_layout_matches_letterbox_exactly() {
+        for (w, h) in [(1280.0f32, 720.0f32), (800.0, 800.0), (320.0, 240.0)] {
+            let layout = FieldLayout::fit(w, h);
+            let (cell, offset_x, offset_y) = letterbox(w, h);
+            assert_eq!(layout.cell, cell);
+            assert_eq!(
+                layout.origin,
+                Vec2::new(-w * 0.5 + offset_x, h * 0.5 - offset_y)
+            );
+        }
+    }
+
+    #[test]
+    fn versus_frame_draws_both_boards() {
+        let mut app = render_app(1);
+        open_versus(&mut app, AttackRule::Garbage);
+        push_versus(&mut app, &[Action::HardDrop]);
+        versus_step(&mut app);
+
+        let snapshot = app.world().non_send::<VersusMatch>().match_.snapshot();
+        let expected = expected_count(&snapshot.left) + expected_count(&snapshot.right);
+        assert!(
+            snapshot.left.score > 0 && snapshot.right.score > 0,
+            "precondition: both sides dropped"
+        );
+        assert_eq!(
+            count(&mut app),
+            expected,
+            "cells from left + right snapshot"
+        );
+
+        // Every drawn cell belongs to a side; the two boards sit in their
+        // own halves with the shared cell size.
+        let mut marked = app.world_mut().query::<(&PlayfieldCell, &VersusCellSide)>();
+        assert_eq!(
+            marked.iter(app.world()).count(),
+            expected,
+            "no solo (unmarked) cells while versus is up"
+        );
+        let [left, right] = versus_layouts(1280.0, 720.0);
+        let sides = versus_cells(&mut app);
+        let (left_cells, right_cells): (Vec<_>, Vec<_>) =
+            sides.into_iter().partition(|(side, _)| *side == Side::Left);
+        assert!(!left_cells.is_empty() && !right_cells.is_empty());
+        for (side, pos) in &left_cells {
+            assert_eq!(*side, Side::Left);
+            assert!(pos.x < 0.0 && pos.x >= -640.0, "left cell at {pos:?}");
+            assert!(
+                pos.x >= left.origin.x - EPS
+                    && pos.x <= left.origin.x + left.cell * COLS as f32 + EPS
+            );
+        }
+        for (side, pos) in &right_cells {
+            assert_eq!(*side, Side::Right);
+            assert!(pos.x > 0.0 && pos.x <= 640.0, "right cell at {pos:?}");
+            assert!(
+                pos.x >= right.origin.x - EPS
+                    && pos.x <= right.origin.x + right.cell * COLS as f32 + EPS
+            );
+        }
+    }
+
+    #[test]
+    fn versus_pools_despawn_on_exit_and_solo_renders_like_fresh() {
+        // Reference: a fresh solo app scripted with two hard drops.
+        let mut fresh = render_app(5);
+        frame(&mut fresh, &[Action::HardDrop]);
+        frame(&mut fresh, &[Action::HardDrop]);
+        let reference = snapshot_drawn(&mut fresh);
+
+        let mut app = render_app(5);
+        frame(&mut app, &[Action::HardDrop]);
+        frame(&mut app, &[Action::HardDrop]);
+        open_versus(&mut app, AttackRule::Garbage);
+        push_versus(&mut app, &[Action::HardDrop]);
+        versus_step(&mut app);
+
+        let mut solo = app
+            .world_mut()
+            .query::<(&PlayfieldCell, Option<&VersusCellSide>)>();
+        let solo_only = solo
+            .iter(app.world())
+            .filter(|(.., side)| side.is_none())
+            .count();
+        assert_eq!(
+            solo_only, 0,
+            "solo pool must be despawned while versus draws"
+        );
+        assert!(
+            !versus_cells(&mut app).is_empty(),
+            "versus pools have cells"
+        );
+
+        close_versus(&mut app);
+        let _ = app.world_mut().try_run_schedule(Update);
+
+        assert!(
+            versus_cells(&mut app).is_empty(),
+            "versus pools must be despawned after end_versus"
+        );
+        assert_eq!(
+            snapshot_drawn(&mut app),
+            reference,
+            "solo after versus renders exactly like a fresh solo"
+        );
     }
 }

@@ -45,12 +45,33 @@
 //!   `handle_back` returns here, closing T16's deferred round-trip check.
 //! - Quit writes `AppExit::Success` and latches [`QuitRequested`] so headless
 //!   tests can observe the request (the App consumes/exits on the message).
+//!
+//! ## 1 v 1 (T26)
+//!
+//! Title grows a "1 v 1" entry leading through a two-step submenu flow
+//! (rule: Garbage / Race, then opponent: Human / Bot) that launches a match
+//! via [`start_versus`]; the flow lives in the [`VersusFlow`] resource
+//! ([`VersusStage`]) with Back buttons *and* Escape walking it back. While
+//! [`VersusWinner`] is set the [`VersusOverRoot`] overlay shows the winner
+//! ([`winner_text`]) plus Rematch / Menu; the pause chord is deliberately
+//! blocked for a finished match so the overlay can never be paused away.
+//! Root visibility for [`VersusHudRoot`](crate::hud::VersusHudRoot) (the
+//! versus HUD) and this overlay joins [`sync_root_visibility`] — versus has
+//! no dedicated [`AppState`] variant, so those roots toggle on match
+//! activity instead of state, still strictly through marker-filtered queries
+//! (the foreign-entity regression test covers the shared Or-filter).
 
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
-use crate::core_bridge::{restart_run, GameCore, SimPaused};
+use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
+
+use crate::core_bridge::{
+    end_versus, restart_run, start_versus, Controller, GameCore, SimPaused, VersusMatch,
+    VersusWinner,
+};
+use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
 use crate::settings_persist::PersistedBestScore;
@@ -173,6 +194,93 @@ pub fn best_text(best: &PersistedBestScore) -> String {
     format!("Best {}", best.score)
 }
 
+/// Which step of the Title → 1v1 submenu flow is showing (T26). Versus has
+/// no [`AppState`] variant (it plays inside `Playing`), so the flow state is
+/// owned here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
+pub enum VersusStage {
+    /// Plain title menu.
+    #[default]
+    Title,
+    /// Pick the attack rule (Garbage / Race).
+    Rules,
+    /// Pick the P2 opponent (Human / Bot); launches on choice.
+    Opponent,
+}
+
+/// Title 1v1 submenu flow state: current [`VersusStage`] plus the rule
+/// picked on the way through (only meaningful from [`VersusStage::Opponent`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
+pub struct VersusFlow {
+    /// Which submenu (if any) is showing.
+    pub stage: VersusStage,
+    /// Rule selected in the rules step; defaults to
+    /// [`AttackRule::default`] until the player picks one.
+    pub rule: AttackRule,
+}
+
+/// Advance the flow one step back: Opponent → Rules → Title.
+pub fn versus_flow_back(flow: &mut VersusFlow) {
+    flow.stage = match flow.stage {
+        VersusStage::Opponent => VersusStage::Rules,
+        _ => VersusStage::Title,
+    };
+}
+
+/// Launch a match from the finished flow (P1 is always a local human; the
+/// submenu picked the rule and the P2 opponent), then close the flow.
+pub fn launch_versus(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    state: &mut AppState,
+    sim: &mut SimPaused,
+    freeze: &JuiceFreeze,
+    flow: &mut VersusFlow,
+    p2: Controller,
+) {
+    release_sim(sim, freeze);
+    let rule = flow.rule;
+    *flow = VersusFlow::default();
+    start_versus(versus, winner, state, rule, Controller::Human, p2);
+}
+
+/// Winner overlay "Rematch": restart with the same rule and controllers
+/// (the T25 R-key semantics, exposed to the menu).
+pub fn rematch_versus(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    state: &mut AppState,
+    sim: &mut SimPaused,
+    freeze: &JuiceFreeze,
+) {
+    release_sim(sim, freeze);
+    let (rule, p1, p2) = (versus.rule, versus.p1, versus.p2);
+    start_versus(versus, winner, state, rule, p1, p2);
+}
+
+/// Winner overlay "Menu": leave the match back to the title.
+pub fn versus_to_title(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    state: &mut AppState,
+    sim: &mut SimPaused,
+    freeze: &JuiceFreeze,
+) {
+    release_sim(sim, freeze);
+    end_versus(versus, winner, state);
+}
+
+/// Overlay headline for a crowned match: "BOT WINS" when the winning side
+/// is bot-driven, else "PLAYER 1 WINS" / "PLAYER 2 WINS" (T26).
+pub fn winner_text(winner: Side, p1: Controller, p2: Controller) -> String {
+    let controller = if winner == Side::Left { p1 } else { p2 };
+    match controller {
+        Controller::Bot => "BOT WINS".to_string(),
+        Controller::Human if winner == Side::Left => "PLAYER 1 WINS".to_string(),
+        Controller::Human => "PLAYER 2 WINS".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UI markers
 // ---------------------------------------------------------------------------
@@ -236,13 +344,66 @@ pub struct RecordText;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Resource)]
 pub struct QuitRequested(pub bool);
 
+/// Title "1 v 1" entry → opens the rules submenu (T26).
+#[derive(Component)]
+pub struct OneVOneButton;
+
+/// Root of the 1v1 rule submenu (Garbage / Race); visible in
+/// [`AppState::Title`] while [`VersusStage::Rules`] is active.
+#[derive(Component)]
+pub struct VersusRulesRoot;
+
+/// Root of the 1v1 opponent submenu (Human / Bot); visible in
+/// [`AppState::Title`] while [`VersusStage::Opponent`] is active.
+#[derive(Component)]
+pub struct VersusOpponentRoot;
+
+/// "Garbage" rule button in the rules submenu.
+#[derive(Component)]
+pub struct RuleGarbageButton;
+
+/// "Race" rule button in the rules submenu.
+#[derive(Component)]
+pub struct RuleRaceButton;
+
+/// "Human" opponent button: launches a local-human vs local-human match.
+#[derive(Component)]
+pub struct OpponentHumanButton;
+
+/// "Bot" opponent button: launches a local-human vs bot match.
+#[derive(Component)]
+pub struct OpponentBotButton;
+
+/// "Back" button on both versus submenus ([`versus_flow_back`]).
+#[derive(Component)]
+pub struct VersusBackButton;
+
+/// Root of the versus winner overlay; visible while a match is active with
+/// [`VersusWinner`] set (T26).
+#[derive(Component)]
+pub struct VersusOverRoot;
+
+/// Winner headline label ([`winner_text`]).
+#[derive(Component)]
+pub struct VersusWinnerText;
+
+/// Winner overlay "Rematch" button ([`rematch_versus`]).
+#[derive(Component)]
+pub struct VersusRematchButton;
+
+/// Winner overlay "Menu" button ([`versus_to_title`]).
+#[derive(Component)]
+pub struct VersusMenuButton;
+
 // ---------------------------------------------------------------------------
 // Systems (UI glue)
 // ---------------------------------------------------------------------------
 
-/// Root visibility query over the three menu screens. The `Or` filter is
-/// load-bearing: `Visibility` is a default component on every entity, so a
-/// bare `Has<…>` query would match (and hide) the entire world.
+/// Root visibility query over the menu screens and the versus roots (T26).
+/// The `Or` filter is load-bearing: `Visibility` is a default component on
+/// every entity, so a bare `Has<…>` query would match (and hide) the entire
+/// world. The two versus roots toggle on *match activity* rather than an
+/// [`AppState`] variant (versus has none — it plays inside `Playing`).
 type MenuRoots<'w, 's> = Query<
     'w,
     's,
@@ -251,23 +412,79 @@ type MenuRoots<'w, 's> = Query<
         Has<TitleRoot>,
         Has<PauseRoot>,
         Has<GameOverRoot>,
+        Has<VersusHudRoot>,
+        Has<VersusOverRoot>,
     ),
-    Or<(With<TitleRoot>, With<PauseRoot>, With<GameOverRoot>)>,
+    Or<(
+        With<TitleRoot>,
+        With<PauseRoot>,
+        With<GameOverRoot>,
+        With<VersusHudRoot>,
+        With<VersusOverRoot>,
+    )>,
 >;
 
 #[derive(SystemParam)]
 struct RootVisibilityParams<'w, 's> {
     state: Res<'w, AppState>,
+    versus: Option<NonSend<'w, VersusMatch>>,
+    winner: Option<Res<'w, VersusWinner>>,
     roots: MenuRoots<'w, 's>,
 }
 
-/// Show each root only in its own [`AppState`] variant.
+/// Show each root only in its own [`AppState`] variant; the versus HUD root
+/// shows for the whole duration of an active match and the versus winner
+/// overlay while that match has a crowned winner (T26).
 fn sync_root_visibility(params: RootVisibilityParams) {
-    let RootVisibilityParams { state, mut roots } = params;
-    for (mut vis, title, pause, over) in roots.iter_mut() {
+    let RootVisibilityParams {
+        state,
+        versus,
+        winner,
+        mut roots,
+    } = params;
+    let versus_active = versus.is_some_and(|versus| versus.active);
+    let match_over = versus_active && winner.is_some_and(|winner| winner.0.is_some());
+    for (mut vis, title, pause, over, versus_hud, versus_over) in roots.iter_mut() {
         let wanted = if (title && *state == AppState::Title)
             || (pause && *state == AppState::Paused)
             || (over && *state == AppState::GameOver)
+            || (versus_hud && versus_active)
+            || (versus_over && match_over)
+        {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != wanted {
+            *vis = wanted;
+        }
+    }
+}
+
+/// Show the 1v1 submenus over the title while their [`VersusStage`] is
+/// active (T26); leaving Title hides both and resets a half-finished flow,
+/// so the next visit opens on the plain title. The `Or` filter keeps
+/// foreign entities out of the query (same discipline as [`MenuRoots`]).
+#[allow(clippy::type_complexity)]
+type VersusSubmenuRoots<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Visibility, Has<VersusRulesRoot>),
+    Or<(With<VersusRulesRoot>, With<VersusOpponentRoot>)>,
+>;
+
+fn sync_versus_menu_visibility(
+    state: Res<AppState>,
+    mut flow: ResMut<VersusFlow>,
+    mut roots: VersusSubmenuRoots,
+) {
+    if flow.stage != VersusStage::Title && *state != AppState::Title {
+        flow.stage = VersusStage::Title;
+        flow.rule = AttackRule::default();
+    }
+    for (mut vis, rules) in roots.iter_mut() {
+        let wanted = if (rules && flow.stage == VersusStage::Rules)
+            || (!rules && flow.stage == VersusStage::Opponent && *state == AppState::Title)
         {
             Visibility::Visible
         } else {
@@ -281,7 +498,10 @@ fn sync_root_visibility(params: RootVisibilityParams) {
 
 /// Consume the pause chord. Suppressed entirely while rebinding is capturing
 /// (the chord's "when NOT rebinding" contract) and outside Playing/Paused via
-/// [`toggle_pause`].
+/// [`toggle_pause`]. While a versus match has crowned a winner the chord is
+/// blocked entering a *fresh* pause (T26): the match is frozen anyway, and a
+/// pause overlay must never cover the winner overlay.
+#[allow(clippy::too_many_arguments)]
 fn pause_chord_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     wheels: Option<Res<Messages<MouseWheel>>>,
@@ -290,8 +510,15 @@ fn pause_chord_system(
     mut state: ResMut<AppState>,
     mut sim: ResMut<SimPaused>,
     freeze: Res<JuiceFreeze>,
+    versus: Option<NonSend<VersusMatch>>,
+    winner: Option<Res<VersusWinner>>,
 ) {
     if capture.capturing {
+        return;
+    }
+    let finished_match = versus.is_some_and(|versus| versus.active)
+        && winner.is_some_and(|winner| winner.0.is_some());
+    if finished_match && *state == AppState::Playing {
         return;
     }
     let Some(keys) = keys else {
@@ -328,6 +555,7 @@ struct MenuClickParams<'w, 's> {
     sim: ResMut<'w, SimPaused>,
     freeze: Res<'w, JuiceFreeze>,
     quit: ResMut<'w, QuitRequested>,
+    flow: Res<'w, VersusFlow>,
     exits: MessageWriter<'w, AppExit>,
 }
 
@@ -350,6 +578,11 @@ fn menu_button_clicks(mut params: MenuClickParams) {
         };
         match *params.state {
             AppState::Title => {
+                // A 1v1 submenu covers the title while it is open; its own
+                // click system handles those buttons (defence in depth).
+                if params.flow.stage != VersusStage::Title {
+                    continue;
+                }
                 if start {
                     start_new_run(
                         params.core.as_mut(),
@@ -396,6 +629,176 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Buttons of the 1v1 flow and the winner overlay (T26).
+type VersusClickQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Interaction,
+        Has<OneVOneButton>,
+        Has<RuleGarbageButton>,
+        Has<RuleRaceButton>,
+        Has<OpponentHumanButton>,
+        Has<OpponentBotButton>,
+        Has<VersusBackButton>,
+        Has<VersusRematchButton>,
+        Has<VersusMenuButton>,
+    ),
+    (With<Button>, Changed<Interaction>),
+>;
+
+#[derive(SystemParam)]
+struct VersusClickParams<'w, 's> {
+    buttons: VersusClickQuery<'w, 's>,
+    versus: Option<NonSendMut<'w, VersusMatch>>,
+    winner: Option<ResMut<'w, VersusWinner>>,
+    state: ResMut<'w, AppState>,
+    sim: ResMut<'w, SimPaused>,
+    freeze: Res<'w, JuiceFreeze>,
+    flow: ResMut<'w, VersusFlow>,
+}
+
+fn versus_button_clicks(mut params: VersusClickParams) {
+    let versus_active = params.versus.as_deref().is_some_and(|versus| versus.active);
+    let match_over = versus_active
+        && params
+            .winner
+            .as_deref()
+            .is_some_and(|winner| winner.0.is_some());
+    let on_title = *params.state == AppState::Title && !versus_active;
+
+    for (_entity, interaction, one_v_one, garbage, race, human, bot, back, rematch, menu) in
+        params.buttons.iter()
+    {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if on_title {
+            match params.flow.stage {
+                VersusStage::Title => {
+                    if one_v_one {
+                        params.flow.stage = VersusStage::Rules;
+                    }
+                }
+                VersusStage::Rules => {
+                    if garbage {
+                        params.flow.rule = AttackRule::Garbage;
+                        params.flow.stage = VersusStage::Opponent;
+                    } else if race {
+                        params.flow.rule = AttackRule::Race {
+                            target_lines: DEFAULT_RACE_LINES,
+                        };
+                        params.flow.stage = VersusStage::Opponent;
+                    } else if back {
+                        versus_flow_back(&mut params.flow);
+                    }
+                }
+                VersusStage::Opponent => {
+                    if back {
+                        versus_flow_back(&mut params.flow);
+                    } else if human || bot {
+                        let p2 = if bot {
+                            Controller::Bot
+                        } else {
+                            Controller::Human
+                        };
+                        if let (Some(versus), Some(winner)) =
+                            (params.versus.as_deref_mut(), params.winner.as_deref_mut())
+                        {
+                            launch_versus(
+                                versus,
+                                winner,
+                                &mut params.state,
+                                &mut params.sim,
+                                &params.freeze,
+                                &mut params.flow,
+                                p2,
+                            );
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if match_over {
+            if rematch {
+                if let (Some(versus), Some(winner)) =
+                    (params.versus.as_deref_mut(), params.winner.as_deref_mut())
+                {
+                    rematch_versus(
+                        versus,
+                        winner,
+                        &mut params.state,
+                        &mut params.sim,
+                        &params.freeze,
+                    );
+                }
+            } else if menu {
+                if let (Some(versus), Some(winner)) =
+                    (params.versus.as_deref_mut(), params.winner.as_deref_mut())
+                {
+                    versus_to_title(
+                        versus,
+                        winner,
+                        &mut params.state,
+                        &mut params.sim,
+                        &params.freeze,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Escape walks the 1v1 submenu back one step (T26). Only while the Title
+/// screen shows a submenu — elsewhere Escape keeps its pause-chord meaning
+/// ([`toggle_pause`] is inert on Title anyway, so the two never collide).
+fn versus_flow_esc_system(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    capture: Res<RebindingCapture>,
+    state: Res<AppState>,
+    mut flow: ResMut<VersusFlow>,
+) {
+    if capture.capturing {
+        return;
+    }
+    let Some(keys) = keys else {
+        return;
+    };
+    if *state != AppState::Title || flow.stage == VersusStage::Title {
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        versus_flow_back(&mut flow);
+    }
+}
+
+/// Winner-headline label query.
+type VersusWinnerLabels<'w, 's> = Query<'w, 's, &'static mut Text, With<VersusWinnerText>>;
+
+/// Write "PLAYER 1 WINS" / "PLAYER 2 WINS" / "BOT WINS" into the winner
+/// overlay whenever [`VersusWinner`] moves (T26).
+fn sync_versus_winner_text(
+    versus: Option<NonSend<VersusMatch>>,
+    winner: Option<Res<VersusWinner>>,
+    mut labels: VersusWinnerLabels,
+) {
+    let Some(winner_side) = winner.and_then(|winner| winner.0) else {
+        return;
+    };
+    let Some(versus) = versus else {
+        return;
+    };
+    let text = winner_text(winner_side, versus.p1, versus.p2);
+    for mut label in labels.iter_mut() {
+        if label.0 != text {
+            *label = Text::new(text.clone());
         }
     }
 }
@@ -532,8 +935,29 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         root.spawn((BestText, label_node(String::new(), 20.0)));
         root.spawn(label_node(pause_hint, 14.0));
         menu_button(root, "Start", StartButton);
+        menu_button(root, "1 v 1", OneVOneButton);
         menu_button(root, "Settings", OpenSettingsButton);
         menu_button(root, "Quit", QuitButton);
+    });
+
+    add_menu_root(&mut commands, VersusRulesRoot, PANEL_BG, |root| {
+        root.spawn(label_node("1 v 1 — RULE".to_string(), 40.0));
+        menu_button(root, "Garbage", RuleGarbageButton);
+        menu_button(root, "Race", RuleRaceButton);
+        menu_button(root, "Back", VersusBackButton);
+    });
+
+    add_menu_root(&mut commands, VersusOpponentRoot, PANEL_BG, |root| {
+        root.spawn(label_node("1 v 1 — OPPONENT".to_string(), 40.0));
+        menu_button(root, "Human", OpponentHumanButton);
+        menu_button(root, "Bot", OpponentBotButton);
+        menu_button(root, "Back", VersusBackButton);
+    });
+
+    add_menu_root(&mut commands, VersusOverRoot, DIM_BG, |root| {
+        root.spawn((VersusWinnerText, label_node(String::new(), 48.0)));
+        menu_button(root, "Rematch", VersusRematchButton);
+        menu_button(root, "Menu", VersusMenuButton);
     });
 
     add_menu_root(&mut commands, PauseRoot, DIM_BG, |root| {
@@ -565,7 +989,8 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
 // Plugin
 // ---------------------------------------------------------------------------
 
-/// Title / pause / game-over screen logic for the T1 `AppState` machine.
+/// Title / pause / game-over screens (T17) plus the 1v1 entry flow, winner
+/// overlay and versus root visibility (T26).
 pub struct MenuScreensPlugin;
 
 impl Plugin for MenuScreensPlugin {
@@ -579,7 +1004,8 @@ impl Plugin for MenuScreensPlugin {
             .init_resource::<SimPaused>()
             .init_resource::<JuiceFreeze>()
             .init_resource::<PersistedBestScore>()
-            .init_resource::<QuitRequested>();
+            .init_resource::<QuitRequested>()
+            .init_resource::<VersusFlow>();
         if !app.world().contains_resource::<ButtonInput<KeyCode>>() {
             app.init_resource::<ButtonInput<KeyCode>>();
         }
@@ -591,12 +1017,16 @@ impl Plugin for MenuScreensPlugin {
         app.add_systems(Startup, build_menu_ui).add_systems(
             Update,
             // Input first: a chord/button transition shows its overlay in the
-            // same frame, and the label sync then sees the new state.
+            // same frame, and the label/visibility sync then sees the change.
             (
                 pause_chord_system,
+                versus_flow_esc_system,
                 menu_button_clicks,
+                versus_button_clicks,
+                sync_versus_menu_visibility,
                 sync_root_visibility,
                 sync_screen_texts,
+                sync_versus_winner_text,
             )
                 .chain(),
         );
@@ -1086,5 +1516,261 @@ mod tests {
             },
         );
         assert_eq!(app_state(&app), AppState::Title);
+    }
+
+    // ---- T26: 1v1 flow, winner overlay, pause interaction ----
+
+    use crate::core_bridge::{start_versus, Controller, VersusMatch, VersusWinner};
+    use crate::input::VersusActions;
+    use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
+
+    fn flow(app: &App) -> VersusFlow {
+        *app.world().resource::<VersusFlow>()
+    }
+
+    fn versus_state(app: &App) -> (bool, AttackRule, Controller, Controller) {
+        let versus = app.world().non_send::<VersusMatch>();
+        (versus.active, versus.rule, versus.p1, versus.p2)
+    }
+
+    /// Drive the Title → 1v1 → rule → opponent flow to a started match.
+    fn click_1v1_path(app: &mut App, rule: &str, opponent: &str) {
+        set_state(app, AppState::Title);
+        click_button_under(
+            app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<OneVOneButton>(e).is_some(),
+        );
+        assert_eq!(
+            flow(app).stage,
+            VersusStage::Rules,
+            "1v1 opens the rules step"
+        );
+        assert_eq!(vis_of::<VersusRulesRoot>(app), Visibility::Visible);
+        assert_eq!(vis_of::<VersusOpponentRoot>(app), Visibility::Hidden);
+        let rules_root = |world: &World, e: Entity| world.get::<VersusRulesRoot>(e).is_some();
+        if rule == "garbage" {
+            click_button_under(app, rules_root, |world, e| {
+                world.get::<RuleGarbageButton>(e).is_some()
+            });
+        } else {
+            click_button_under(app, rules_root, |world, e| {
+                world.get::<RuleRaceButton>(e).is_some()
+            });
+        }
+        assert_eq!(flow(app).stage, VersusStage::Opponent);
+        assert_eq!(vis_of::<VersusOpponentRoot>(app), Visibility::Visible);
+        let opponent_root = |world: &World, e: Entity| world.get::<VersusOpponentRoot>(e).is_some();
+        if opponent == "human" {
+            click_button_under(app, opponent_root, |world, e| {
+                world.get::<OpponentHumanButton>(e).is_some()
+            });
+        } else {
+            click_button_under(app, opponent_root, |world, e| {
+                world.get::<OpponentBotButton>(e).is_some()
+            });
+        }
+    }
+
+    #[test]
+    fn one_v_one_garbage_human_flow_starts_a_match() {
+        let mut app = menu_test_app();
+        click_1v1_path(&mut app, "garbage", "human");
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active, "match active after the flow");
+        assert_eq!(rule, AttackRule::Garbage);
+        assert_eq!(p1, Controller::Human, "P1 is always the local human");
+        assert_eq!(p2, Controller::Human);
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            flow(&app).stage,
+            VersusStage::Title,
+            "flow closed on launch"
+        );
+        assert_eq!(vis_of::<VersusRulesRoot>(&mut app), Visibility::Hidden);
+        assert_eq!(vis_of::<VersusOpponentRoot>(&mut app), Visibility::Hidden);
+        assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Hidden);
+    }
+
+    #[test]
+    fn one_v_one_race_bot_flow_selects_race_and_bot() {
+        let mut app = menu_test_app();
+        click_1v1_path(&mut app, "race", "bot");
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active);
+        assert_eq!(
+            rule,
+            AttackRule::Race {
+                target_lines: DEFAULT_RACE_LINES
+            }
+        );
+        assert_eq!(p1, Controller::Human);
+        assert_eq!(p2, Controller::Bot);
+    }
+
+    #[test]
+    fn versus_flow_back_button_and_escape_walk_the_submenus() {
+        let mut app = menu_test_app();
+        set_state(&mut app, AppState::Title);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<OneVOneButton>(e).is_some(),
+        );
+        assert_eq!(flow(&app).stage, VersusStage::Rules);
+
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(
+            flow(&app).stage,
+            VersusStage::Title,
+            "Esc closes the rules step"
+        );
+        assert_eq!(vis_of::<VersusRulesRoot>(&mut app), Visibility::Hidden);
+        assert_eq!(
+            app_state(&app),
+            AppState::Title,
+            "no pause leak from Title Esc"
+        );
+
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<OneVOneButton>(e).is_some(),
+        );
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<VersusRulesRoot>(e).is_some(),
+            |world, e| world.get::<RuleGarbageButton>(e).is_some(),
+        );
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(
+            flow(&app).stage,
+            VersusStage::Rules,
+            "Esc walks back one step"
+        );
+
+        let rules_root = |world: &World, e: Entity| world.get::<VersusRulesRoot>(e).is_some();
+        click_button_under(&mut app, rules_root, |world, e| {
+            world.get::<VersusBackButton>(e).is_some()
+        });
+        assert_eq!(flow(&app).stage, VersusStage::Title);
+        assert_eq!(
+            flow(&app).rule,
+            AttackRule::Garbage,
+            "rule choice survives Back"
+        );
+    }
+
+    /// Start a race-to-zero match and crown Left with one hard drop.
+    fn crown_winner(app: &mut App, p2: Controller) {
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        AttackRule::Race { target_lines: 0 },
+                        Controller::Human,
+                        p2,
+                    );
+                });
+            });
+        app.world_mut()
+            .resource_mut::<VersusActions>()
+            .left
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut().run_schedule(FixedUpdate);
+        app.update();
+    }
+
+    #[test]
+    fn winner_overlay_shows_text_and_pause_is_blocked() {
+        let mut app = menu_test_app();
+        crown_winner(&mut app, Controller::Human);
+        assert_eq!(app.world().resource::<VersusWinner>().0, Some(Side::Left));
+        assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Visible);
+        let text = text_of(&mut app, |world, e| {
+            world.get::<VersusWinnerText>(e).is_some()
+        });
+        assert_eq!(text, "PLAYER 1 WINS");
+
+        // Pausing a finished match is blocked: the overlay is never covered.
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(*app.world().resource::<SimPaused>(), SimPaused(false));
+    }
+
+    #[test]
+    fn winner_overlay_rematch_restarts_and_menu_returns_to_title() {
+        let mut app = menu_test_app();
+        crown_winner(&mut app, Controller::Bot);
+        let text = text_of(&mut app, |world, e| {
+            world.get::<VersusWinnerText>(e).is_some()
+        });
+        assert_eq!(text, "PLAYER 1 WINS", "human left beats bot right");
+
+        let over_root = |world: &World, e: Entity| world.get::<VersusOverRoot>(e).is_some();
+        click_button_under(&mut app, over_root, |world, e| {
+            world.get::<VersusRematchButton>(e).is_some()
+        });
+        assert_eq!(*app.world().resource::<VersusWinner>(), VersusWinner(None));
+        let (active, rule, _, p2) = versus_state(&app);
+        assert!(active, "rematch keeps the match up");
+        assert_eq!(rule, AttackRule::Race { target_lines: 0 });
+        assert_eq!(p2, Controller::Bot, "rematch keeps the controllers");
+        assert_eq!(
+            app.world().non_send::<VersusMatch>().steps,
+            0,
+            "fresh match"
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Hidden);
+
+        crown_winner(&mut app, Controller::Bot);
+        click_button_under(&mut app, over_root, |world, e| {
+            world.get::<VersusMenuButton>(e).is_some()
+        });
+        assert_eq!(
+            app_state(&app),
+            AppState::Title,
+            "Menu ends the match to Title"
+        );
+        assert!(!app.world().non_send::<VersusMatch>().active);
+        assert_eq!(*app.world().resource::<VersusWinner>(), VersusWinner(None));
+        assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Hidden);
+
+        // Solo path intact: Title → Start launches a fresh solo run.
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<StartButton>(e).is_some(),
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(core.steps, 0);
+        let snapshot = core.game.snapshot();
+        assert!(snapshot.board.is_empty() && snapshot.score == 0);
+    }
+
+    #[test]
+    fn winner_text_names_the_winning_player_or_bot() {
+        assert_eq!(
+            winner_text(Side::Left, Controller::Human, Controller::Human),
+            "PLAYER 1 WINS"
+        );
+        assert_eq!(
+            winner_text(Side::Right, Controller::Human, Controller::Human),
+            "PLAYER 2 WINS"
+        );
+        assert_eq!(
+            winner_text(Side::Left, Controller::Bot, Controller::Human),
+            "BOT WINS"
+        );
+        assert_eq!(
+            winner_text(Side::Right, Controller::Human, Controller::Bot),
+            "BOT WINS"
+        );
     }
 }

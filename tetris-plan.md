@@ -1046,6 +1046,41 @@ T23: [T22]       WASM build (stretch, M6)
   `crates/tetris-app/src/input.rs` (additive versus input),
   `crates/tetris-core/src/versus.rs` (additive `Match::tick` + shared `settle` + 2 tests)
 
+### T26: 1v1 versus on-screen (dual viewports, versus HUD, menu flow)
+- **depends_on**: [T25, T11, T16]
+- **location**: `crates/tetris-app/src/render.rs`, `crates/tetris-app/src/hud.rs`,
+  `crates/tetris-app/src/screens_menu.rs`
+- **description**: Renders both versus boards side by side and exposes the full menu flow.
+  `render.rs` factors the playfield transform into `FieldLayout` (`fit` = the exact solo
+  letterbox math, `cell_center` sampling) with `versus_layouts(w, h)` returning two layouts
+  at centers `(∓w/4, 0)` sharing one half-width-fitted cell size; while `VersusMatch.active`
+  `render_playfield` draws both boards into a `VersusCellPools` pool (cells tagged
+  `VersusCellSide(Side)`), despawning/keeping the solo `CellPool` clean and vice versa so
+  exit→solo renders like a fresh app. `hud.rs` adds a static versus HUD spawned at Startup
+  (per side: Score/Lines/Level + pending-garbage "+N", 2 mini next previews, small hold
+  box) anchored through `versus_panel_anchors` off the shared layout; `sync_versus_hud`
+  refills it from the live `MatchSnapshot` (or `VersusHudFixture`), and
+  `sync_solo_hud_visibility` hides/restores the solo panels (roots get `Visibility` inserted
+  on demand — preview roots carry no render component). `screens_menu.rs` adds the
+  Title → "1 v 1" → rules (Garbage/Race) → opponent (Human/Bot) flow on a `VersusFlow`
+  stage machine (Esc and Back walk it; P1 is always the local human), a winner overlay
+  ("PLAYER 1/2 WINS"/"BOT WINS", Rematch via `start_versus` with the same rule/controllers,
+  Menu via `end_versus` to Title), and the pause chord is blocked once a match is decided so
+  the overlay is never covered. Versus root visibility is owned by
+  `sync_root_visibility`/`sync_versus_menu_visibility`; solo pixels and solo menu flow are
+  untouched (`FieldLayout::fit` equality pinned by test).
+- **validation**: `cargo test --workspace` green (269 tests: 254 pre-existing untouched +
+  15 new: 4 render layout/lifecycle, 5 versus HUD, 6 menu flow/winner overlay);
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- **status**: Completed
+- **log**: 2026-09-27 — entry written retroactively (absent at task start; PRD §16 does not
+  exist, versus spec is §15). Dual-viewport pools, versus HUD with pending "+N", menu flow,
+  winner overlay, pause guard; one-behavior note: Back keeps the chosen rule; pause is
+  blocked only when entering a fresh pause after a winner. Nothing committed (per task
+  instruction).
+- **files edited/created**: `crates/tetris-app/src/render.rs`,
+  `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/screens_menu.rs`
+
 ## Parallel Execution Groups
 
 | Wave (earliest) | Tasks | Can Start When |

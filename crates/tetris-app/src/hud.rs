@@ -11,12 +11,25 @@
 //! (spawn-rotation mini pieces, `Settings::next_queue_size` clamped to
 //! `1..=6` slots, never more than `snapshot.next.len()`).
 //!
+//! While a [`VersusMatch`] is active (T26) the solo panels are hidden and a
+//! compact per-side panel is rendered under a single [`VersusHudRoot`] from
+//! the match snapshot instead: score / lines / level, a `+N` incoming
+//! garbage indicator, two next previews and a small hold box. The root is
+//! toggled by versus activity rather than [`AppState`](crate::state::AppState)
+//! (versus plays *inside* `Playing`), so it deliberately does **not** join
+//! the screens-menu root visibility filter.
+//!
 //! Public API reusable by later tasks (T17 menus/overlays, T19 juice):
 //! - [`HudAnchor`] / [`hud_anchor`] — window size → playfield + panel anchors.
 //! - [`hud_text_center`] — per-slot text anchor inside the left panel.
 //! - [`hold_center`] / [`next_center`] — preview slot anchors.
+//! - [`versus_panel_anchors`] and the `versus_*_center` helpers — compact
+//!   versus side-panel anchors (T26), derived from
+//!   [`crate::render::versus_layouts`].
 //! - Markers [`NextPreview`], [`HoldPreview`], [`HudText`]/[`HudTextSlot`],
-//!   [`HudMiniCell`] for queries and styling.
+//!   [`HudMiniCell`] for queries and styling, plus [`VersusHudRoot`],
+//!   [`VersusHudText`], [`VersusPreview`], [`VersusMiniCell`] for the
+//!   versus HUD.
 //! - [`HudFixture`] — test/QA hook forcing the HUD to render from a chosen
 //!   snapshot instead of the live core.
 //!
@@ -29,8 +42,9 @@ use bevy::window::Window;
 use tetris_core::board::COLS;
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::{Piece, Rotation};
+use tetris_core::versus::Side;
 
-use crate::core_bridge::GameCore;
+use crate::core_bridge::{GameCore, VersusMatch};
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::render::{self, GHOST_ALPHA, VISIBLE_ROWS};
 use crate::state::Settings;
@@ -623,15 +637,413 @@ fn sync_hud_previews(
     }
 }
 
-/// Snapshot-driven HUD: side panels anchored to the letterboxed playfield.
+// ---------------------------------------------------------------------------
+// T26: versus (1v1) HUD
+// ---------------------------------------------------------------------------
+
+/// Mini cell size of the versus next previews, in versus cell units.
+const VERSUS_NEXT_MINI: f32 = 0.45;
+/// Mini cell size of the (small) versus hold box, in versus cell units.
+const VERSUS_HOLD_MINI: f32 = 0.35;
+/// Next previews rendered per versus side (PRD §6.3 preview, compact form).
+const VERSUS_NEXT_SLOTS: usize = 2;
+/// Incoming-garbage `+N` indicator color.
+const GARBAGE_COLOR: Color = Color::srgb(1.0, 0.45, 0.25);
+
+/// Compact-panel anchors for one side of an active versus match (T26),
+/// derived from [`crate::render::versus_layouts`] so HUD and playfield share
+/// one layout. `panel_x` sits in the outer margin of the side's half-window,
+/// between the field edge and the window edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VersusPanelAnchor {
+    /// Shared versus cell edge length.
+    pub cell: f32,
+    /// World x of the side panel center line.
+    pub panel_x: f32,
+    /// World y of the side's field top edge.
+    pub field_top: f32,
+}
+
+/// `[left, right]` versus panel anchors for a window size.
+pub fn versus_panel_anchors(window_w: f32, window_h: f32) -> [VersusPanelAnchor; 2] {
+    let [left, right] = render::versus_layouts(window_w, window_h);
+    let cell = left.cell;
+    let gap = (PANEL_GAP + PANEL_HALF) * cell;
+    [
+        VersusPanelAnchor {
+            cell,
+            panel_x: left.origin.x - gap,
+            field_top: left.origin.y,
+        },
+        VersusPanelAnchor {
+            cell,
+            panel_x: right.origin.x + cell * COLS as f32 + gap,
+            field_top: right.origin.y,
+        },
+    ]
+}
+
+/// Which versus stat a [`VersusHudText`] renders.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersusHudSlot {
+    /// `SCORE` + value.
+    Score,
+    /// `LINES` + value.
+    Lines,
+    /// `LEVEL` + value.
+    Level,
+    /// `+N` incoming-garbage indicator (empty text when nothing pending).
+    Pending,
+}
+
+/// Marker on a versus stat [`Text2d`], tagged with the side it mirrors.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersusHudText {
+    /// Match side this value belongs to.
+    pub side: Side,
+    /// Which stat this text renders.
+    pub slot: VersusHudSlot,
+}
+
+/// Which preview slot a [`VersusPreview`] occupies.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersusPreviewRole {
+    /// Next-queue slot `index` (`0..VERSUS_NEXT_SLOTS`).
+    Next(usize),
+    /// The (small) hold box.
+    Hold,
+}
+
+/// Root marker of one versus mini preview (2 next slots + hold per side).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersusPreview {
+    /// Match side this preview belongs to.
+    pub side: Side,
+    /// Which slot this preview fills.
+    pub role: VersusPreviewRole,
+}
+
+/// Marker on versus mini-preview cell sprites.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersusMiniCell;
+
+/// Root marker of one side's versus HUD block (all versus entities are its
+/// children, so a single root toggle shows/hides the whole panel). Unlike
+/// the menu roots it is toggled by [`VersusMatch::active`], not by an
+/// [`AppState`](crate::state::AppState) variant — versus plays *inside*
+/// `Playing`. See `screens_menu::sync_root_visibility`.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersusHudRoot {
+    /// Match side this root carries.
+    pub side: Side,
+}
+
+/// Test/QA hook mirroring [`HudFixture`]: when set, the versus HUD renders
+/// from this match snapshot instead of the live [`VersusMatch`]. Still
+/// snapshot-driven — only the source changes.
+#[derive(Resource, Default, Clone)]
+pub struct VersusHudFixture(pub Option<tetris_core::versus::MatchSnapshot>);
+
+/// `+N` incoming-garbage label (empty string when nothing pending, so the
+/// pooled text simply renders nothing).
+fn versus_pending_text(pending: u32) -> String {
+    if pending > 0 {
+        format!("+{pending}")
+    } else {
+        String::new()
+    }
+}
+
+/// World-space center of a versus stat text.
+pub fn versus_text_center(anchor: &VersusPanelAnchor, slot: VersusHudSlot) -> Vec2 {
+    let c = anchor.cell;
+    let y = match slot {
+        VersusHudSlot::Score => anchor.field_top - 1.5 * c,
+        VersusHudSlot::Lines => anchor.field_top - 4.2 * c,
+        VersusHudSlot::Level => anchor.field_top - 6.9 * c,
+        VersusHudSlot::Pending => anchor.field_top - 9.2 * c,
+    };
+    Vec2::new(anchor.panel_x, y)
+}
+
+/// World-space center of the versus hold box.
+pub fn versus_hold_center(anchor: &VersusPanelAnchor) -> Vec2 {
+    Vec2::new(anchor.panel_x, anchor.field_top - 11.5 * anchor.cell)
+}
+
+/// World-space center of versus next-preview slot `index`.
+pub fn versus_next_center(anchor: &VersusPanelAnchor, index: usize) -> Vec2 {
+    Vec2::new(
+        anchor.panel_x,
+        anchor.field_top - (14.0 + 2.8 * index as f32) * anchor.cell,
+    )
+}
+
+/// Spawn the (hidden) versus HUD tree for one side once on `Startup`.
+fn spawn_versus_side(commands: &mut Commands, side: Side) {
+    commands
+        .spawn((
+            VersusHudRoot { side },
+            Visibility::Hidden,
+            Transform::default(),
+        ))
+        .with_children(|root| {
+            for slot in [
+                VersusHudSlot::Score,
+                VersusHudSlot::Lines,
+                VersusHudSlot::Level,
+                VersusHudSlot::Pending,
+            ] {
+                root.spawn((
+                    VersusHudText { side, slot },
+                    Text2d::new(String::new()),
+                    TextFont {
+                        font_size: bevy::text::FontSize::Px(12.0),
+                        ..default()
+                    },
+                    TextColor(if slot == VersusHudSlot::Pending {
+                        GARBAGE_COLOR
+                    } else {
+                        Color::WHITE
+                    }),
+                    Transform::from_xyz(0.0, 0.0, 0.5),
+                ));
+            }
+            let roles = [
+                VersusPreviewRole::Hold,
+                VersusPreviewRole::Next(0),
+                VersusPreviewRole::Next(1),
+            ];
+            for role in roles {
+                root.spawn((
+                    VersusPreview { side, role },
+                    Visibility::Hidden,
+                    Transform::from_xyz(0.0, 0.0, 0.5),
+                ))
+                .with_children(|preview| {
+                    for _ in 0..4 {
+                        preview.spawn((
+                            VersusMiniCell,
+                            Sprite::default(),
+                            Transform::from_translation(Vec3::ZERO),
+                        ));
+                    }
+                });
+            }
+        });
+}
+
+/// Spawn both versus HUD roots.
+fn spawn_versus_hud(mut commands: Commands) {
+    spawn_versus_side(&mut commands, Side::Left);
+    spawn_versus_side(&mut commands, Side::Right);
+}
+
+#[allow(clippy::type_complexity)]
+type VersusTextQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static VersusHudText,
+        &'static mut Text2d,
+        &'static mut TextFont,
+        &'static mut Transform,
+    ),
+    (
+        With<VersusHudText>,
+        Without<VersusPreview>,
+        Without<VersusMiniCell>,
+    ),
+>;
+
+#[allow(clippy::type_complexity)]
+type VersusPreviewQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static VersusPreview,
+        &'static mut Visibility,
+        &'static mut Transform,
+        &'static Children,
+    ),
+    (
+        With<VersusPreview>,
+        Without<VersusHudText>,
+        Without<VersusMiniCell>,
+    ),
+>;
+
+#[allow(clippy::type_complexity)]
+type VersusMiniQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Sprite, &'static mut Transform),
+    (
+        With<VersusMiniCell>,
+        Without<VersusHudText>,
+        Without<VersusPreview>,
+    ),
+>;
+
+/// Reposition and refill the versus HUD from the match snapshot every
+/// `Update` (root visibility itself is owned by the screens-menu sync).
+#[allow(clippy::too_many_arguments)]
+fn sync_versus_hud(
+    versus: Option<NonSend<VersusMatch>>,
+    fixture: Option<Res<VersusHudFixture>>,
+    windows: Query<&Window>,
+    mut texts: VersusTextQuery,
+    mut previews: VersusPreviewQuery,
+    mut minis: VersusMiniQuery,
+) {
+    let snapshot = fixture
+        .and_then(|fixture| fixture.0.clone())
+        .or_else(|| versus.map(|versus| versus.match_.snapshot()));
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let Some(size) = pick_window_size(&windows) else {
+        return;
+    };
+    let [left, right] = versus_panel_anchors(size.x, size.y);
+
+    for (meta, mut text, mut font, mut transform) in texts.iter_mut() {
+        let anchor = if meta.side == Side::Left { left } else { right };
+        let game = if meta.side == Side::Left {
+            &snapshot.left
+        } else {
+            &snapshot.right
+        };
+        let pending = if meta.side == Side::Left {
+            snapshot.pending.0
+        } else {
+            snapshot.pending.1
+        };
+        font.font_size = bevy::text::FontSize::Px((anchor.cell * 0.45).max(8.0));
+        transform.translation = versus_text_center(&anchor, meta.slot).extend(0.5);
+        let content = match meta.slot {
+            VersusHudSlot::Score => format!("SCORE\n{}", game.score),
+            VersusHudSlot::Lines => format!("LINES\n{}", game.lines),
+            VersusHudSlot::Level => format!("LEVEL\n{}", game.level),
+            VersusHudSlot::Pending => versus_pending_text(pending),
+        };
+        if text.0 != content {
+            text.0 = content;
+        }
+    }
+
+    for (preview, mut visibility, mut transform, children) in previews.iter_mut() {
+        let anchor = if preview.side == Side::Left {
+            left
+        } else {
+            right
+        };
+        let game = if preview.side == Side::Left {
+            &snapshot.left
+        } else {
+            &snapshot.right
+        };
+        let (piece, s) = match preview.role {
+            VersusPreviewRole::Next(index) => {
+                transform.translation = versus_next_center(&anchor, index).extend(0.5);
+                (
+                    game.next.get(index).copied(),
+                    VERSUS_NEXT_MINI * anchor.cell,
+                )
+            }
+            VersusPreviewRole::Hold => {
+                transform.translation = versus_hold_center(&anchor).extend(0.5);
+                (game.hold, VERSUS_HOLD_MINI * anchor.cell)
+            }
+        };
+        let wanted = if piece.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+        let Some(piece) = piece else { continue };
+        let color = render::piece_color(piece);
+        let offsets = mini_offsets(piece, s);
+        for (index, child) in children.iter().enumerate() {
+            if let Ok((mut sprite, mut cell_transform)) = minis.get_mut(child) {
+                sprite.color = color;
+                sprite.custom_size = Some(Vec2::splat(s));
+                if let Some(offset) = offsets.get(index) {
+                    cell_transform.translation = offset.extend(0.0);
+                }
+            }
+        }
+    }
+}
+
+/// Hide the solo HUD panels (stat texts, next queue, hold box) for the whole
+/// duration of a versus match; restore them untouched on `end_versus`. The
+/// mini cells hang under the preview roots and inherit their visibility, so
+/// toggling the roots suffices. Preview roots are plain entities (no render
+/// component ⇒ no required `Visibility`), so the flag is inserted on demand
+/// while versus runs and reset to `Inherited` afterwards. The Or-filter
+/// keeps foreign entities (playfield sprites, camera) out of the query —
+/// same discipline as the menu root sync.
+#[allow(clippy::type_complexity)]
+type SoloHudVisibility<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, Option<&'static mut Visibility>),
+    Or<(With<HudText>, With<NextPreview>, With<HoldPreview>)>,
+>;
+
+fn sync_solo_hud_visibility(
+    versus: Option<NonSend<VersusMatch>>,
+    mut commands: Commands,
+    mut solo: SoloHudVisibility,
+) {
+    let hidden = versus.is_some_and(|versus| versus.active);
+    let wanted = if hidden {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for (entity, visibility) in solo.iter_mut() {
+        match visibility {
+            Some(mut current) => {
+                if *current != wanted {
+                    *current = wanted;
+                }
+            }
+            // Roots without any render component carry no `Visibility` at
+            // all; only versus needs one (insert), never solo-off.
+            None => {
+                if hidden {
+                    commands.entity(entity).insert(wanted);
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot-driven HUD: side panels anchored to the letterboxed playfield
+/// (solo) plus the compact per-side versus panels (T26).
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudFixture>()
+            .init_resource::<VersusHudFixture>()
             .init_resource::<HudTextEntities>()
             .init_resource::<HudPreviewEntities>()
-            .add_systems(Update, (sync_hud_texts, sync_hud_previews));
+            .add_systems(Startup, spawn_versus_hud)
+            .add_systems(
+                Update,
+                (
+                    (sync_hud_texts, sync_hud_previews).chain(),
+                    sync_versus_hud,
+                    sync_solo_hud_visibility,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -983,5 +1395,232 @@ mod tests {
         let mut mini_query = app.world_mut().query::<&HudMiniCell>();
         assert_eq!(mini_query.iter(app.world()).count(), mini_before);
         assert_eq!(app.world().entities().len(), entities_before, "no leaks");
+    }
+
+    // ------------------------------------------------------------------
+    // T26: versus HUD
+    // ------------------------------------------------------------------
+
+    use crate::core_bridge::{end_versus, start_versus, Controller, VersusMatch, VersusWinner};
+    use tetris_core::versus::{AttackRule, Match, MatchSnapshot, Side};
+
+    /// App whose `Startup` ran once (spawns the versus HUD roots) plus a
+    /// scripted solo frame.
+    fn versus_hud_app(seed: u64) -> App {
+        let mut app = hud_app(seed);
+        app.update();
+        app
+    }
+
+    fn fixture_match(rule: AttackRule) -> MatchSnapshot {
+        let mut snapshot = Match::new(0xBEEF, rule).snapshot();
+        snapshot.left.score = 1234;
+        snapshot.left.lines = 12;
+        snapshot.left.level = 3;
+        snapshot.right.score = 5678;
+        snapshot.right.lines = 24;
+        snapshot.right.level = 5;
+        snapshot.pending = (0, 3);
+        snapshot
+    }
+
+    fn versus_text_of(app: &mut App, side: Side, slot: VersusHudSlot) -> String {
+        let mut query = app.world_mut().query::<(&VersusHudText, &Text2d)>();
+        query
+            .iter(app.world())
+            .find(|(meta, _)| meta.side == side && meta.slot == slot)
+            .map(|(_, text)| text.0.clone())
+            .expect("versus stat text exists")
+    }
+
+    fn versus_previews(app: &mut App, side: Side) -> Vec<(VersusPreviewRole, Visibility)> {
+        let mut query = app.world_mut().query::<(&VersusPreview, &Visibility)>();
+        query
+            .iter(app.world())
+            .filter(|(preview, _)| preview.side == side)
+            .map(|(preview, visibility)| (preview.role, *visibility))
+            .collect()
+    }
+
+    fn vis_of_solo_score(app: &mut App) -> Visibility {
+        let mut query = app.world_mut().query::<(&HudText, &Visibility)>();
+        *query
+            .iter(app.world())
+            .find(|(text, _)| text.slot == HudTextSlot::Score)
+            .map(|(_, visibility)| visibility)
+            .expect("solo score text exists")
+    }
+
+    #[test]
+    fn versus_panel_anchors_track_shared_versus_layout() {
+        for (w, h) in [(1280.0f32, 720.0f32), (1920.0, 1080.0), (900.0, 600.0)] {
+            let [left, right] = versus_panel_anchors(w, h);
+            let [field_left, field_right] = render::versus_layouts(w, h);
+            assert_eq!(left.cell, field_left.cell, "one shared versus cell size");
+            assert_eq!(left.field_top, field_left.origin.y);
+            let field_w = left.cell * COLS as f32;
+            // Panels sit in the outer margins of their halves, inside the
+            // window at these (representative) sizes.
+            assert!(left.panel_x < field_left.origin.x && left.panel_x > -w * 0.5);
+            assert!(right.panel_x > field_right.origin.x + field_w && right.panel_x < w * 0.5);
+        }
+    }
+
+    #[test]
+    fn versus_hud_mirrors_match_snapshot_and_pending_garbage() {
+        let mut app = versus_hud_app(1);
+        let snapshot = fixture_match(AttackRule::Garbage);
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot.clone());
+        let _ = app.world_mut().try_run_schedule(Update);
+
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Score),
+            format!("SCORE\n{}", snapshot.left.score)
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Lines),
+            format!("LINES\n{}", snapshot.left.lines)
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Level),
+            format!("LEVEL\n{}", snapshot.left.level)
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Score),
+            format!("SCORE\n{}", snapshot.right.score)
+        );
+        // `+N` pending-garbage indicator on the side with queued garbage,
+        // silent on the other.
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Pending),
+            "+3"
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Pending),
+            ""
+        );
+
+        // Two next previews per side mirror `next[..2]`; the hold box is
+        // hidden while empty.
+        let left_previews = versus_previews(&mut app, Side::Left);
+        let mut next_visible = 0;
+        for (role, visibility) in &left_previews {
+            match role {
+                VersusPreviewRole::Next(_) => {
+                    assert_eq!(*visibility, Visibility::Inherited, "next slots filled");
+                    next_visible += 1;
+                }
+                VersusPreviewRole::Hold => {
+                    assert_eq!(*visibility, Visibility::Hidden, "empty hold hidden");
+                }
+            }
+        }
+        assert_eq!(next_visible, 2, "exactly two next previews per side");
+    }
+
+    #[test]
+    fn versus_hud_renders_live_match_cells() {
+        let mut app = versus_hud_app(2);
+        app.world_mut()
+            .resource_scope::<crate::state::AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        AttackRule::Race {
+                            target_lines: 1_000_000,
+                        },
+                        Controller::Human,
+                        Controller::Bot,
+                    );
+                });
+            });
+        let snapshot = app.world().non_send::<VersusMatch>().match_.snapshot();
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Score),
+            format!("SCORE\n{}", snapshot.left.score)
+        );
+        // No fixture needed: the live match drives the panels; race rule
+        // never queues garbage.
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Pending),
+            ""
+        );
+    }
+
+    #[test]
+    fn solo_panels_hide_for_versus_and_restore_after() {
+        let mut app = versus_hud_app(3);
+        frame(&mut app, &[Action::Hold]);
+        assert_ne!(
+            vis_of_solo_score(&mut app),
+            Visibility::Hidden,
+            "solo HUD visible pre-versus"
+        );
+
+        app.world_mut()
+            .resource_scope::<crate::state::AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        AttackRule::Garbage,
+                        Controller::Human,
+                        Controller::Human,
+                    );
+                });
+            });
+        let _ = app.world_mut().try_run_schedule(Update);
+        let mut hud_roots = app.world_mut().query::<(&Visibility, &HudText)>();
+        for (visibility, _) in hud_roots.iter(app.world()) {
+            assert_eq!(*visibility, Visibility::Hidden, "solo HUD hidden in versus");
+        }
+        let mut previews = app.world_mut().query::<(&Visibility, &NextPreview)>();
+        assert!(previews.iter(app.world()).count() > 0);
+        for (visibility, _) in previews.iter(app.world()) {
+            assert_eq!(
+                *visibility,
+                Visibility::Hidden,
+                "next queue hidden in versus"
+            );
+        }
+
+        app.world_mut()
+            .resource_scope::<crate::state::AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    end_versus(versus.into_inner(), winner.into_inner(), state.into_inner());
+                });
+            });
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            vis_of_solo_score(&mut app),
+            Visibility::Inherited,
+            "restored"
+        );
+        let mut previews = app.world_mut().query::<(&Visibility, &NextPreview)>();
+        for (visibility, _) in previews.iter(app.world()) {
+            assert_eq!(*visibility, Visibility::Inherited, "restored");
+        }
+    }
+
+    #[test]
+    fn versus_hud_tree_is_stable_across_frames() {
+        let mut app = versus_hud_app(4);
+        let snapshot = fixture_match(AttackRule::Garbage);
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot);
+        for _ in 0..5 {
+            let _ = app.world_mut().try_run_schedule(Update);
+        }
+        let before = app.world().entities().len();
+        for _ in 0..20 {
+            let _ = app.world_mut().try_run_schedule(Update);
+        }
+        assert_eq!(app.world().entities().len(), before, "no versus HUD leaks");
     }
 }
