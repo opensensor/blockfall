@@ -720,8 +720,19 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: All PRD §7 screens reachable by input (incl. title/pause → settings — this
   closes T16's deferred check); sim frozen while paused (zero core ticks, inputs buffered);
   best updates only on game over and displays score+level+lines.
-- **status**: Partially Completed — automated part GREEN, awaiting AUTHOR sign-off
-- **log**: `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
+- **status**: Partially Completed — automated part GREEN; **M3 gate round 1 REJECTED** by author (flat gray window; mid-air locks), both fixed — awaiting author retest (round 2)
+- **log**: **Round-1 defects (2026-09-27)**: (1) flat gray window —
+  `sync_root_visibility`'s query used bare `Has<>` markers over `Visibility`
+  (a default component on every entity), so it hid camera/sprites/HUD/menu
+  children and rendered only the root panel background; fixed with an
+  `Or`-filter + regression test `root_visibility_sync_never_touches_foreign_entities`
+  (`d1cd482`). T21's capture-panel finding was this same bug, not a GPU
+  quirk. (2) Blocks stuck in the air / inter-block gaps — move-lockout reset
+  budget consumed while airborne, force-locking falling pieces after 16 air
+  manipulations; fixed grounded-only per PRD §6.5 (`61ad177`, core+game
+  regression tests). Soft-drop release defect was fixed earlier under T14.
+  Round-2 capture check: title wordmark now BLOCKFALL; bot presses Start from
+  Title (marathon runs unaffected). `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
   `AppState` machine (three `Startup`-spawned UI roots toggled by state, T16
   Button/`Interaction` pattern). **Startup state**: PRD §7.1 wants Title, but
   `AppState::default()` is `Playing` and T1's permanent `state.rs` smoke tests run this
