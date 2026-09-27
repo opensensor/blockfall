@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: ["**"]   # tags are Release workflow's job
   pull_request:
   schedule:
     # Nightly core soak (job-level `if` keeps push/PR runs lint+test only).
