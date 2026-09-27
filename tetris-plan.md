@@ -725,7 +725,7 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: All PRD §7 screens reachable by input (incl. title/pause → settings — this
   closes T16's deferred check); sim frozen while paused (zero core ticks, inputs buffered);
   best updates only on game over and displays score+level+lines.
-- **status**: Partially Completed — automated part GREEN; **M3 rounds 1–3 REJECTED** (gray window; mid-air locks; L-piece clipped at top) — all fixed, awaiting author retest (round 4)
+- **status**: Completed — M3 gate **AUTHOR-APPROVED** round 4 (2026-09-27); rounds 1–3 defects fixed (d1cd482 gray window, 61ad177 mid-air locks, 685091d headroom clipping)
 - **log**: **Round-1 defects (2026-09-27)**: (1) flat gray window —
   `sync_root_visibility`'s query used bare `Has<>` markers over `Visibility`
   (a default component on every entity), so it hid camera/sprites/HUD/menu
