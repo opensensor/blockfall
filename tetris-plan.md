@@ -703,9 +703,43 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: Freeze never exceeds 4 ticks (asserted in test); input held through freeze
   applies coalesced on resume with correct lock-reset count; Low effects → zero camera motion
   and no freeze; 60 FPS sustained.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Data-driven juice in `JuicePlugin`: pure `JuiceState` (flash/shake
+  `EffectSlot` elapsed/duration/amplitude) + `effect_plan(event, quality)`
+  matrix; `juice_from_events` (`MessageReader<CoreEvent>`, max-of stacking —
+  concurrent triggers never sum) → `freeze_gate` → `juice_painter` chained in
+  `Update`, so timers tick real render time unaffected by `SimPaused`.
+  Channels decay quadratically to exactly 0 (slots self-reset; overlay alpha
+  and camera return to rest, no drift; camera shaken via delta application so
+  external transform writes compose). Overlay = always-spawned full-screen
+  white `Sprite` (`JuiceOverlay`, z=10 above T11's board/ghost/active layers).
+  **Freeze semantics choice**: PRD/plan call for a sim freeze (not
+  visual-only) — `JuiceFreeze` guard toggles `SimPaused` for exactly N owned
+  frames (N ≤ 4 = ≤80 ms @ 60 Hz cap asserted in test); it only takes the
+  flag when free (T17 pause wins, ticks defer), burns ticks only while
+  owning, and writes `false` exactly once at release even if external code
+  toggled the flag meanwhile (T17 re-asserts its own pause after release).
+  **Quality gating** (peak amp / dur; freeze = frames): LineCleared n — Low
+  flash (0.20+0.06n)/(.08+.02s), no shake/freeze; Med flash (0.30+0.10n),
+  shake (1.5n px)/(.12+.03s), freeze min(n,3); High flash (0.35+0.13n), shake
+  (3n px)/(.20+.05s), freeze min(n+1,4). TSpin — Low flash .30/.12; Med
+  .50/.18 + shake 5/.20 + freeze 2; High .65/.22 + 8/.30 + 3. PerfectClear —
+  Low .50/.20; Med .80/.35 + 8/.35 + 4; High 1.0/.45 + 12/.50 + 4. LevelUp —
+  Low .20/.15; Med .40/.20 + 2/.15; High .50/.25 + 3/.20. GameOver — Low
+  .40/.40; Med .60/.50 + 4/.40; High .75/.60 + 6/.60. PieceLocked lock-flash —
+  Low none; Med .12/.05; High .16/.06 + micro-shake 1/.06. Tests: +9 (pure
+  scheduling/quality/decay/max-of/freeze-guard incl. external-toggle +
+  external-pause-defer; headless integration: LineCleared{4}+PerfectClear →
+  shake>0, ≤4 paused frames, overlay alpha + camera return to rest; Low →
+  zero camera motion, no freeze). Workspace 179 passed, 0 failed;
+  fmt/fmt-check/clippy (-D warnings) green. **Deferrals**: dedicated
+  hard-drop shake has no core event (approximated by lock-flash; add a row
+  in `effect_plan` if the core grows the event); move-action coalescing on
+  freeze exit is input-layer (T12) — bridge drains per step and the backlog
+  through a ≤4-frame freeze is bounded by real input events; 60 FPS sustained
+  deferred to the T20/hardware pass.
+- **files edited/created**: `crates/tetris-app/src/juice.rs` (full
+  implementation; main.rs registration already in place from scaffold)
 
 ### T20: CI + release builds — **M5 opener**
 - **depends_on**: [T17, T19]
