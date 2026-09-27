@@ -5,7 +5,7 @@ members = ["crates/tetris-core", "crates/tetris-app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 bevy = { version = "0.19.1", default-features = false, features = ["2d", "ui"] }
