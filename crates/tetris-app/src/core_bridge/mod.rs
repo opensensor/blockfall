@@ -19,6 +19,13 @@
 //! - [`restart_run`] (T14) — shared R-restart path honoring the `TETRIS_SEED`
 //!   env seed; the plugin also hosts the `TETRIS_BOT=1` greedy solver +
 //!   marathon logger (`MARATHON fps_avg=…`, `BOT game_done …`).
+//! - **T25 versus submodule** (`versus.rs`, re-exported here): `VersusMatch`
+//!   (NonSend — it owns two `Game`s), `VersusWinner`, `VersusEvent`
+//!   (`Messages`), `VersusHarness`, `Controller`, `start_versus`/`end_versus`
+//!   and the `TETRIS_1V1=garbage|race` bot-vs-bot harness. While
+//!   `VersusMatch.active` is set, the solo step/bot systems above freeze and
+//!   no `CoreEvent`s fire; the versus side of the input contract is
+//!   `VersusActions` (produced in `input.rs`, drained by the versus step).
 //!
 //! Schedule placement: `core_bridge_system` runs in `FixedUpdate`, a
 //! sub-schedule of `FixedMain` (`bevy::app::FixedMain`), which the Main
@@ -39,6 +46,9 @@ use tetris_core::game::{Game, GameSnapshot};
 use tetris_core::piece::{PieceState, Rotation};
 
 use crate::state::AppState;
+
+mod versus;
+pub use versus::*;
 
 /// Env var overriding the run seed with a fixed `u64` (T14: reproducible
 /// marathons; applies at startup and on every restart).
@@ -227,8 +237,10 @@ struct BotPlan {
 /// Steps a committed piece toward its plan (one action per tick): rotate →
 /// shift → hard drop. A stall counter forces the drop if rotation/moves stop
 /// making progress (blocked kicks, wall pinning), so the bot can never hang.
+/// Actions go through `push`, so solo (`PendingActions`) and versus (per-side
+/// `VersusActions`, see [`versus`]) share one executor.
 fn step_bot_plan(
-    pending: &mut PendingActions,
+    push: &mut dyn FnMut(Action),
     state: &mut BotState,
     active: PieceState,
     mv: BotPlan,
@@ -238,7 +250,7 @@ fn step_bot_plan(
     state.last_rot = Some(active.rot);
     state.last_col = Some(active.col);
     if state.wedge > 8 {
-        pending.push(Action::HardDrop);
+        push(Action::HardDrop);
         state.plan = None;
         return;
     }
@@ -250,49 +262,37 @@ fn step_bot_plan(
     }
     if active.rot != mv.rot {
         let diff = (mv.rot as u32 + 4 - active.rot as u32) % 4;
-        pending.push(match diff {
+        push(match diff {
             1 => Action::RotateCw,
             3 => Action::RotateCcw,
             _ => Action::Rotate180,
         });
     } else if active.col != mv.target_col {
-        pending.push(if active.col < mv.target_col {
+        push(if active.col < mv.target_col {
             Action::MoveRight
         } else {
             Action::MoveLeft
         });
     } else {
-        pending.push(Action::HardDrop);
+        push(Action::HardDrop);
         state.plan = None;
     }
 }
 
-/// Bot brain: every fixed step (before the bridge drains) execute the
-/// committed plan or commit a fresh greedy one for a new piece. Runs in
-/// `FixedUpdate` *before* `core_bridge_system`, so actions apply same-tick.
-fn bot_drive_system(
-    bot: Res<BotMode>,
-    pending: ResMut<PendingActions>,
-    mut state: ResMut<BotState>,
-    core: NonSend<GameCore>,
-    app_state: Res<AppState>,
-    paused: Res<SimPaused>,
-) {
-    if !bot.0 || *app_state != AppState::Playing || paused.0 {
-        return;
-    }
-    let snapshot = core.game.snapshot();
+/// One bot brain tick for a snapshot: execute the committed plan or commit a
+/// fresh greedy one for a new piece. Shared by the solo marathon driver and
+/// the versus per-side bot driver (T25).
+fn bot_side_drive(snapshot: &GameSnapshot, state: &mut BotState, push: &mut dyn FnMut(Action)) {
     let Some(active) = snapshot.active else {
         state.plan = None;
         return;
     };
     match state.plan {
         Some(mv) if mv.piece == active.piece => {
-            let state = state.into_inner();
-            step_bot_plan(pending.into_inner(), state, active, mv);
+            step_bot_plan(push, state, active, mv);
         }
         _ => {
-            state.plan = bot_move(&snapshot).map(|mv| BotPlan {
+            state.plan = bot_move(snapshot).map(|mv| BotPlan {
                 piece: active.piece,
                 rot: mv.rot,
                 target_col: mv.target_col,
@@ -302,6 +302,26 @@ fn bot_drive_system(
             state.last_col = Some(active.col);
         }
     }
+}
+
+/// Bot brain: every fixed step (before the bridge drains) execute the
+/// committed plan or commit a fresh greedy one for a new piece. Runs in
+/// `FixedUpdate` *before* `core_bridge_system`, so actions apply same-tick.
+/// Asleep while a versus match is active.
+fn bot_drive_system(
+    bot: Res<BotMode>,
+    mut pending: ResMut<PendingActions>,
+    state: ResMut<BotState>,
+    core: NonSend<GameCore>,
+    app_state: Res<AppState>,
+    paused: Res<SimPaused>,
+    versus: NonSend<VersusMatch>,
+) {
+    if !bot.0 || *app_state != AppState::Playing || paused.0 || versus.active {
+        return;
+    }
+    let snapshot = core.game.snapshot();
+    bot_side_drive(&snapshot, state.into_inner(), &mut |a| pending.push(a));
 }
 
 /// Frame-time accumulator for `MARATHON fps_avg=...` logs (bot mode only).
@@ -430,9 +450,10 @@ fn bot_marathon_system(
     mut core: NonSendMut<GameCore>,
     mut app_state: ResMut<AppState>,
     time: Res<Time>,
+    versus: NonSend<VersusMatch>,
     mut exits: MessageWriter<AppExit>,
 ) {
-    if !bot.0 {
+    if !bot.0 || versus.active {
         return;
     }
     if *app_state == AppState::Title && !bot_state.awaiting_restart {
@@ -486,16 +507,19 @@ fn marathon_fps_system(bot: Res<BotMode>, mut stats: ResMut<MarathonStats>, time
 
 /// Steps the core on the fixed schedule. Registered in `FixedUpdate` (a
 /// `FixedMain` sub-schedule run ahead of `Update`/render — never in a render
-/// or `Update` schedule).
+/// or `Update` schedule). Fully frozen while a versus match is active, so
+/// the solo `CoreEvent` stream and `AppState` can never react to versus
+/// play (T25).
 fn core_bridge_system(
     core: NonSendMut<GameCore>,
     mut pending: ResMut<PendingActions>,
     mut messages: MessageWriter<CoreEvent>,
     mut app_state: ResMut<AppState>,
     paused: Res<SimPaused>,
+    versus: NonSend<VersusMatch>,
 ) {
     let core = core.into_inner();
-    if !paused.0 && *app_state == AppState::Playing {
+    if !paused.0 && *app_state == AppState::Playing && !versus.active {
         for action in pending.queue.drain(..) {
             core.pending_events.extend(core.game.apply(action));
         }
@@ -524,7 +548,9 @@ fn spawn_primary_camera(mut commands: Commands, cameras: Query<&Camera2d>) {
 }
 
 /// Steps the deterministic core on the fixed-step schedule and drains its
-/// events into Bevy `Messages<CoreEvent>`.
+/// events into Bevy `Messages<CoreEvent>`. Also mounts the T25 versus
+/// bridge (`VersusBridgePlugin` — see the `versus` submodule); main.rs stays
+/// frozen, so versus reaches the app exclusively through here.
 pub struct CoreBridgePlugin;
 
 impl Plugin for CoreBridgePlugin {
@@ -543,6 +569,8 @@ impl Plugin for CoreBridgePlugin {
             .insert_resource(BotMode(bot))
             .init_resource::<BotState>()
             .init_resource::<MarathonStats>()
+            // T25: 1v1 versus bridge (inactive until a match starts).
+            .add_plugins(VersusBridgePlugin)
             .add_systems(Startup, seed_from_env_at_startup)
             .add_systems(
                 Update,

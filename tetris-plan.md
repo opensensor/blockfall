@@ -1011,6 +1011,41 @@ T23: [T22]       WASM build (stretch, M6)
 - **files edited/created**: `crates/tetris-core/src/versus.rs` (new),
   `crates/tetris-core/src/lib.rs`, `crates/tetris-core/src/game.rs` (contract exception)
 
+### T25: 1v1 versus app bridge (two cores, dual input, bot sides)
+- **depends_on**: [T24, T10, T12, T14]
+- **location**: `crates/tetris-app/src/core_bridge/` (`core_bridge.rs` → `core_bridge/mod.rs`
+  via `git mv`, new submodule `versus.rs`), `crates/tetris-app/src/input.rs` (additive),
+  contract extension in `crates/tetris-core/src/versus.rs`
+- **description**: Local 1v1 running in the app. `VersusMatch` (NonSend — owns two `Game`s)
+  plus `VersusWinner`/`VersusEvent` (`Messages`)/`VersusHarness` resources and
+  `VersusBridgePlugin` (mounted from `CoreBridgePlugin::build()`; `main.rs` frozen).
+  Two cores step at 60 Hz in `FixedUpdate` while active: per-side `VersusActions` queues
+  drained + `Match::tick` per side; the solo step/bot/input systems gate on
+  `VersusMatch.active` (no `CoreEvent` fires during versus, solo core frozen). Fixed P1/P2
+  keyboard presets in `input.rs` (`VersusBindings`: P1 A/D, W CW, E CCW, S+Shift soft,
+  Space hard, Q hold; P2 arrows, Period CCW, Slash+Numpad0 hard, Comma hold), DAS/ARR via
+  reused `ShiftRepeat`/`RepeatTimer`; no versus rebinding UI (settings edits solo only).
+  Bot sides reuse the T14 greedy solver through a factored `bot_side_drive`/push-closure
+  executor. Shared pause (`SimPaused`/`AppState::Paused`) freezes both cores and holds the
+  queues; R restarts; `start_versus`/`end_versus` free functions (restart_run pattern);
+  `Match::tick(side)` core addition routes lock-delay locks/top-outs through the same
+  versus rules. Headless harness `TETRIS_1V1=garbage|race`: bot-vs-bot at startup, logs
+  `VERSUS match_done ...` / `VERSUS winner=... fps_avg=...`, exits after 2 matches.
+- **validation**: `cargo test --workspace` green (254 tests: 240 pre-existing untouched +
+  12 app versus tests + 2 core tick tests); `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings` clean; live run `TETRIS_1V1=garbage`
+  crowned two bot matches at fps_avg≈59.9 and exited 0.
+- **status**: Completed
+- **log**: 2026-09-27 — module split via `git mv` (history preserved); versus submodule +
+  additive input half + core `Match::tick`/`settle` refactor; gates green (254 tests,
+  1 soak ignored as before); live env-harness run verified (2 matches, winner=Right both,
+  fps_avg 59.8/59.9). Nothing committed (per task instruction).
+- **files edited/created**: `crates/tetris-app/src/core_bridge.rs` → 
+  `crates/tetris-app/src/core_bridge/mod.rs` (moved; versus guards + bot refactor + plugin
+  hookup), `crates/tetris-app/src/core_bridge/versus.rs` (new),
+  `crates/tetris-app/src/input.rs` (additive versus input),
+  `crates/tetris-core/src/versus.rs` (additive `Match::tick` + shared `settle` + 2 tests)
+
 ## Parallel Execution Groups
 
 | Wave (earliest) | Tasks | Can Start When |

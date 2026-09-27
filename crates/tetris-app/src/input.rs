@@ -6,6 +6,16 @@
 //! `tetris_core::actions::Action` values into
 //! [`PendingActions`](crate::core_bridge::PendingActions).
 //!
+//! T25 adds the versus half: [`VersusBindings`] (fixed two-player presets,
+//! not rebindable in v0.2 — the settings screen keeps editing solo bindings
+//! only) and [`VersusActions`], two per-side action queues produced by
+//! [`versus_input_system`] while a versus match is active. The two halves
+//! are mutually exclusive: `gameplay_input_system` skips while
+//! [`VersusMatch`](crate::core_bridge::VersusMatch) is active, and
+//! `versus_input_system` skips (and never emits for bot-controlled sides)
+//! otherwise. Both repeat machines reuse [`ShiftRepeat`]/[`RepeatTimer`]
+//! with the same [`Settings`] DAS/ARR/soft-drop values.
+//!
 //! Scheduling: [`gameplay_input_system`] runs on `FixedPreUpdate`, the
 //! `FixedMain` sub-schedule that precedes the core bridge's `FixedUpdate`
 //! drain (PRD §10.3 order `input → apply actions → core step`). Repeat
@@ -33,7 +43,7 @@ use bevy::prelude::*;
 
 use tetris_core::actions::Action;
 
-use crate::core_bridge::{PendingActions, SIM_HZ};
+use crate::core_bridge::{Controller, PendingActions, VersusMatch, SIM_HZ};
 use crate::state::{AppState, RebindingCapture, Settings};
 
 /// Fixed-step rate as an integer, for [`ticks_for`] conversions.
@@ -394,6 +404,7 @@ struct InputParams<'w, 's> {
     settings: Res<'w, Settings>,
     app_state: Res<'w, AppState>,
     capture: Res<'w, RebindingCapture>,
+    versus: NonSend<'w, VersusMatch>,
     machine: ResMut<'w, InputMachine>,
     pending: ResMut<'w, PendingActions>,
 }
@@ -436,7 +447,8 @@ fn gameplay_input_system(mut params: InputParams) {
         }
     }
 
-    let gated = *params.app_state != AppState::Playing || params.capture.capturing;
+    let gated =
+        *params.app_state != AppState::Playing || params.capture.capturing || params.versus.active;
     if gated {
         return;
     }
@@ -513,8 +525,236 @@ impl Plugin for InputPlugin {
         }
         app.init_resource::<KeyBindings>()
             .init_resource::<InputMachine>()
-            .add_systems(FixedPreUpdate, gameplay_input_system);
+            // T25 versus half: fixed presets + the two per-side queues.
+            .init_resource::<VersusBindings>()
+            .init_resource::<VersusActions>()
+            .init_resource::<VersusInputMachines>()
+            .add_systems(FixedPreUpdate, gameplay_input_system)
+            .add_systems(FixedPreUpdate, versus_input_system);
     }
+}
+
+// ---------------------------------------------------------------------------
+// T25 versus input: fixed two-player presets and per-side action queues
+// ---------------------------------------------------------------------------
+
+/// One versus player's fixed preset. Not rebindable in v0.2 — the settings
+/// screen keeps editing [`KeyBindings`] (solo) only. `Vec` slots exist for
+/// alternate keys (P1 soft-drop alt, P2 hard-drop alt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerPreset {
+    /// `Action::MoveLeft` (DAS/ARR repeat).
+    pub move_left: Vec<KeyCode>,
+    /// `Action::MoveRight` (DAS/ARR repeat).
+    pub move_right: Vec<KeyCode>,
+    /// `Action::RotateCw` (single trigger per press).
+    pub rotate_cw: Vec<KeyCode>,
+    /// `Action::RotateCcw` (single trigger per press).
+    pub rotate_ccw: Vec<KeyCode>,
+    /// `Action::SoftDrop` (held cadence from the soft-drop multiplier).
+    pub soft_drop: Vec<KeyCode>,
+    /// `Action::HardDrop` (single trigger per press).
+    pub hard_drop: Vec<KeyCode>,
+    /// `Action::Hold` (single trigger per press).
+    pub hold: Vec<KeyCode>,
+}
+
+/// The versus binding table (both sides in one resource).
+#[derive(Debug, Clone, PartialEq, Eq, Resource)]
+pub struct VersusBindings {
+    /// Left player (P1) preset.
+    pub p1: PlayerPreset,
+    /// Right player (P2) preset.
+    pub p2: PlayerPreset,
+}
+
+impl Default for VersusBindings {
+    fn default() -> Self {
+        let k = |key| vec![key];
+        Self {
+            p1: PlayerPreset {
+                move_left: k(KeyCode::KeyA),
+                move_right: k(KeyCode::KeyD),
+                rotate_cw: k(KeyCode::KeyW),
+                rotate_ccw: k(KeyCode::KeyE),
+                soft_drop: vec![KeyCode::KeyS, KeyCode::ShiftLeft],
+                hard_drop: k(KeyCode::Space),
+                hold: k(KeyCode::KeyQ),
+            },
+            p2: PlayerPreset {
+                move_left: k(KeyCode::ArrowLeft),
+                move_right: k(KeyCode::ArrowRight),
+                rotate_cw: k(KeyCode::ArrowUp),
+                rotate_ccw: k(KeyCode::Period),
+                soft_drop: k(KeyCode::ArrowDown),
+                hard_drop: vec![KeyCode::Slash, KeyCode::Numpad0],
+                hold: k(KeyCode::Comma),
+            },
+        }
+    }
+}
+
+/// Per-side action queues for a versus match: produced by
+/// [`versus_input_system`] (human sides) and by
+/// [`versus_bot_system`](crate::core_bridge), drained by the versus fixed
+/// step. Held, never dropped, while stepping is gated (shared pause).
+#[derive(Debug, Default, Resource)]
+pub struct VersusActions {
+    /// Left player's FIFO queue.
+    pub left: Vec<Action>,
+    /// Right player's FIFO queue.
+    pub right: Vec<Action>,
+}
+
+/// Per-side edge bookkeeping plus the two repeat machines — the versus
+/// analogue of [`InputMachine`] with plain bools instead of a
+/// `HashMap<BindSlot, _>` (fixed seven slots, no rebinding).
+#[derive(Debug, Default, Clone, Copy)]
+struct SideMachines {
+    prev_left: bool,
+    prev_right: bool,
+    prev_soft: bool,
+    prev_hard: bool,
+    prev_cw: bool,
+    prev_ccw: bool,
+    prev_hold: bool,
+    shift: ShiftRepeat,
+    soft: RepeatTimer,
+}
+
+/// Both sides' repeat machines (one resource keeps the system parameters
+/// small, mirroring [`InputMachine`]).
+#[derive(Debug, Default, Resource)]
+pub struct VersusInputMachines {
+    p1: SideMachines,
+    p2: SideMachines,
+}
+
+/// Drive one versus side for a fixed-step tick: edge bookkeeping always
+/// advances (so reopening a gate never replays stale presses — same rule as
+/// the solo system), while actions only go to `out` (`None` = this side is
+/// gated: versus inactive, paused, or bot-controlled).
+fn drive_versus_side(
+    preset: &PlayerPreset,
+    keys: &ButtonInput<KeyCode>,
+    das_ticks: u32,
+    arr_ticks: u32,
+    soft_period_ticks: u32,
+    machine: &mut SideMachines,
+    out: Option<&mut Vec<Action>>,
+) {
+    let any = |list: &[KeyCode]| list.iter().any(|key| keys.pressed(*key));
+    let held_left = any(&preset.move_left);
+    let held_right = any(&preset.move_right);
+    let held_soft = any(&preset.soft_drop);
+    let held_hard = any(&preset.hard_drop);
+    let held_cw = any(&preset.rotate_cw);
+    let held_ccw = any(&preset.rotate_ccw);
+    let held_hold = any(&preset.hold);
+
+    let move_left = held_left && !std::mem::replace(&mut machine.prev_left, held_left);
+    let move_right = held_right && !std::mem::replace(&mut machine.prev_right, held_right);
+    let soft = held_soft && !std::mem::replace(&mut machine.prev_soft, held_soft);
+    let hard = held_hard && !std::mem::replace(&mut machine.prev_hard, held_hard);
+    let rotate_cw = held_cw && !std::mem::replace(&mut machine.prev_cw, held_cw);
+    let rotate_ccw = held_ccw && !std::mem::replace(&mut machine.prev_ccw, held_ccw);
+    let hold = held_hold && !std::mem::replace(&mut machine.prev_hold, held_hold);
+
+    let Some(out) = out else { return };
+
+    if let Some(dir) = machine.shift.step(
+        held_left, held_right, move_left, move_right, das_ticks, arr_ticks,
+    ) {
+        out.push(match dir {
+            ShiftDir::Left => Action::MoveLeft,
+            ShiftDir::Right => Action::MoveRight,
+        });
+    }
+
+    if soft {
+        machine.soft = RepeatTimer::with_ticks(0, soft_period_ticks);
+        machine.soft.press();
+        out.push(Action::SoftDrop);
+    } else if held_soft {
+        if machine.soft.advance() {
+            out.push(Action::SoftDrop);
+        }
+    } else {
+        machine.soft.release();
+    }
+
+    if hard {
+        out.push(Action::HardDrop);
+    }
+    if rotate_cw {
+        out.push(Action::RotateCw);
+    }
+    if rotate_ccw {
+        out.push(Action::RotateCcw);
+    }
+    if hold {
+        out.push(Action::Hold);
+    }
+}
+
+/// All fixed-step parameters for [`versus_input_system`] in one struct.
+#[derive(SystemParam)]
+struct VersusInputParams<'w> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    bindings: Res<'w, VersusBindings>,
+    settings: Res<'w, Settings>,
+    app_state: Res<'w, AppState>,
+    capture: Res<'w, RebindingCapture>,
+    versus: NonSend<'w, VersusMatch>,
+    machines: ResMut<'w, VersusInputMachines>,
+    actions: ResMut<'w, VersusActions>,
+}
+
+/// Samples the two versus presets once per fixed step and pushes each human
+/// side's `Action`s into its [`VersusActions`] queue. Runs on
+/// `FixedPreUpdate`, ahead of the versus bridge's `FixedUpdate` drain —
+/// exactly like the solo system, and mutually exclusive with it.
+fn versus_input_system(mut params: VersusInputParams) {
+    let playing = *params.app_state == AppState::Playing;
+    let active = params.versus.active && playing && !params.capture.capturing;
+    let das_ticks = ticks_for(params.settings.das_ms, SIM_HZ_U32);
+    let arr_ticks = ticks_for(params.settings.arr_ms, SIM_HZ_U32).max(1);
+    let soft_period = soft_drop_period_ticks(params.settings.soft_drop_multiplier, SIM_HZ_U32);
+
+    let bindings = &params.bindings;
+    let keys = &params.keys;
+    let machines = &mut params.machines;
+    let actions = &mut params.actions;
+
+    let p1_human = matches!(params.versus.p1, Controller::Human);
+    let p2_human = matches!(params.versus.p2, Controller::Human);
+
+    drive_versus_side(
+        &bindings.p1,
+        keys,
+        das_ticks,
+        arr_ticks,
+        soft_period,
+        &mut machines.p1,
+        if active && p1_human {
+            Some(&mut actions.left)
+        } else {
+            None
+        },
+    );
+    drive_versus_side(
+        &bindings.p2,
+        keys,
+        das_ticks,
+        arr_ticks,
+        soft_period,
+        &mut machines.p2,
+        if active && p2_human {
+            Some(&mut actions.right)
+        } else {
+            None
+        },
+    );
 }
 
 #[cfg(test)]

@@ -212,6 +212,29 @@ impl Match {
             Side::Left => self.left.apply(action),
             Side::Right => self.right.apply(action),
         };
+        self.settle(side, events)
+    }
+
+    /// Advance one logical frame (gravity + lock-delay bookkeeping) for
+    /// `side` and run the same versus rules [`Match::apply`] runs after any
+    /// lock: a lock that happens on the lock-delay timer clears lines,
+    /// queues garbage and can top out exactly like an action-driven lock.
+    /// No-op once a winner is set.
+    pub fn tick(&mut self, side: Side) -> Vec<MatchEvent> {
+        if self.winner.is_some() {
+            return Vec::new();
+        }
+        let events = match side {
+            Side::Left => self.left.tick(),
+            Side::Right => self.right.tick(),
+        };
+        self.settle(side, events)
+    }
+
+    /// Shared versus bookkeeping after one game transition (action or tick):
+    /// map the [`GameEvent`]s to [`MatchEvent`]s, land queued garbage, crown
+    /// winners. Same emission order as documented at the module level.
+    fn settle(&mut self, side: Side, events: Vec<GameEvent>) -> Vec<MatchEvent> {
         let mut out = Vec::new();
         let mut locked = false;
         let mut cleared = 0u32;
@@ -827,5 +850,79 @@ mod tests {
         assert!(g.install_board(Board::new(), false));
         assert!(!g.snapshot().game_over);
         assert_eq!(g.snapshot().board, Board::new());
+    }
+
+    #[test]
+    fn tick_locks_a_grounded_piece_and_its_clear_sends_garbage() {
+        let seed = find_match_seed(Some(&[Piece::O]), None);
+        let mut m = Match::new(seed, AttackRule::Garbage);
+        // Spawn O (cells rows 0-1, cols 4-5) grounded on (2, 4), with rows
+        // 0-1 otherwise full: the lock-delay lock completes both rows.
+        let mut board = Board::new();
+        for r in 0..2 {
+            for c in 0..COLS {
+                if c != 4 && c != 5 {
+                    board.set(r, c, Some(Piece::Z));
+                }
+            }
+        }
+        board.set(2, 4, Some(Piece::Z));
+        assert!(m.game_mut(Side::Left).install_board(board, false));
+
+        let mut log = Vec::new();
+        for _ in 0..31 {
+            log.extend(m.tick(Side::Left));
+        }
+        let locked = log
+            .iter()
+            .find(|e| matches!(e, MatchEvent::PieceLocked { side, .. } if *side == Side::Left));
+        assert_eq!(
+            locked,
+            Some(&MatchEvent::PieceLocked {
+                side: Side::Left,
+                lines: 2
+            }),
+            "lock-delay lock must clear the two completed rows: {log:?}"
+        );
+        assert!(log.contains(&MatchEvent::GarbageSent {
+            side: Side::Left,
+            lines: 2
+        }));
+        assert_eq!(m.pending_attack(Side::Right), 2);
+        assert_eq!(m.winner(), None);
+    }
+
+    #[test]
+    fn tick_top_out_crowns_the_opponent_and_freezes_the_match() {
+        let seed = find_match_seed(Some(&[Piece::O]), None);
+        let mut m = Match::new(seed, AttackRule::Garbage);
+        // Columns 4-5 filled from row 2 down: the spawn O lock-delays onto
+        // them, and every next piece block-outs at spawn — all via tick().
+        let mut board = Board::new();
+        for r in 2..ROWS {
+            board.set(r, 4, Some(Piece::Z));
+            board.set(r, 5, Some(Piece::Z));
+        }
+        assert!(m.game_mut(Side::Left).install_board(board, false));
+
+        let mut log = Vec::new();
+        for _ in 0..40 {
+            log.extend(m.tick(Side::Left));
+        }
+        assert!(
+            log.contains(&MatchEvent::PieceLocked {
+                side: Side::Left,
+                lines: 0
+            }),
+            "the grounded O must lock on the delay: {log:?}"
+        );
+        assert!(log.contains(&MatchEvent::PlayerTopOut { side: Side::Left }));
+        assert!(log.contains(&MatchEvent::WinnerCrowned { side: Side::Right }));
+        assert_eq!(m.winner(), Some(Side::Right));
+
+        let before = m.snapshot();
+        assert!(m.tick(Side::Right).is_empty(), "frozen after crowning");
+        assert!(m.apply(Side::Right, Action::HardDrop).is_empty());
+        assert_eq!(m.snapshot(), before);
     }
 }
