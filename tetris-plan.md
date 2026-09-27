@@ -572,8 +572,12 @@ T23: [T22]       WASM build (stretch, M6)
   `cargo test/clippy/fmt` green. Human part — agent runs the manual checklist (full game,
   hard/soft drop, hold, 180, ghost, restart feel) in a real window, posts results, and
   **stops for author sign-off**; the gate passes only on author approval.
-- **status**: Partially Completed — automated part GREEN, awaiting AUTHOR sign-off
-- **log**: Automated part complete, commit `ad87aae`. All glue lives in
+- **status**: Completed — automated part GREEN; **M2 gate AUTHOR-APPROVED 2026-09-27** (author playtested the slice, signed off)
+- **log**: **Post-approval playtest defect (2026-09-27)**: down-arrow caused permanent soft-drop
+  speed-up — `gameplay_input_system` never called `RepeatTimer::release()` on soft-drop key-up,
+  so one tap kept emitting `SoftDrop` every cadence tick forever. Fixed in `input.rs`
+  (release on not-held) + regression test `soft_drop_release_stops_repeat_forever`.
+  Automated part complete, commit `ad87aae`. All glue lives in
   `core_bridge.rs` (main.rs/state.rs untouched). **Restart**: `restart_run()` shared
   path (`GameCore::restart()`/`restart_with` + `AppState::Playing`); `restart_on_r_system`
   in `Update` fires on `KeyCode::KeyR` while `AppState::GameOver` — `KeyBindings` (T12)

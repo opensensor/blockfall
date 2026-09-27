@@ -462,8 +462,12 @@ fn gameplay_input_system(mut params: InputParams) {
         machine.soft = RepeatTimer::with_ticks(0, period);
         machine.soft.press();
         pending.push(Action::SoftDrop);
-    } else if machine.soft.advance() {
-        pending.push(Action::SoftDrop);
+    } else if held_soft {
+        if machine.soft.advance() {
+            pending.push(Action::SoftDrop);
+        }
+    } else {
+        machine.soft.release();
     }
 
     if hard {
@@ -714,6 +718,36 @@ mod tests {
             }
         }
         assert_eq!(emitted, vec![1, 10, 12, 14, 16]);
+    }
+
+    #[test]
+    fn soft_drop_release_stops_repeat_forever() {
+        // Regression: the soft RepeatTimer was never released on key-up,
+        // so one tap kept emitting SoftDrop at the held cadence forever
+        // (permanent speed-up). Press → cadence → release → total silence.
+        let mut app = test_app();
+        press(&mut app, KeyCode::ArrowDown);
+        let mut emitted = Vec::new();
+        for step in 1..=10 {
+            if fixed_step(&mut app).contains(&Action::SoftDrop) {
+                emitted.push(step);
+            }
+        }
+        assert_eq!(
+            emitted,
+            vec![1, 4, 7, 10],
+            "held soft drop repeats every 3rd tick (×20 at 60 Hz)"
+        );
+        release(&mut app, KeyCode::ArrowDown);
+        for step in 11..=40 {
+            assert!(
+                !fixed_step(&mut app).contains(&Action::SoftDrop),
+                "soft drop emitted at step {step} after release"
+            );
+        }
+        // A fresh tap starts a fresh cadence (not a resumed one).
+        press(&mut app, KeyCode::ArrowDown);
+        assert!(fixed_step(&mut app).contains(&Action::SoftDrop));
     }
 
     #[test]
