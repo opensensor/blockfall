@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly core soak (job-level `if` keeps push/PR runs lint+test only).
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
