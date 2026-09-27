@@ -720,9 +720,46 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: All PRD §7 screens reachable by input (incl. title/pause → settings — this
   closes T16's deferred check); sim frozen while paused (zero core ticks, inputs buffered);
   best updates only on game over and displays score+level+lines.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Partially Completed — automated part GREEN, awaiting AUTHOR sign-off
+- **log**: `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
+  `AppState` machine (three `Startup`-spawned UI roots toggled by state, T16
+  Button/`Interaction` pattern). **Startup state**: PRD §7.1 wants Title, but
+  `AppState::default()` is `Playing` and T1's permanent `state.rs` smoke tests run this
+  exact plugin tree and assert `Playing` — resolved by registering the Title flip
+  (`startup_goto_title`) as a `Startup` system under `#[cfg(not(test))]`: the shipped
+  binary opens on Title, the test binary starts as before and drives state explicitly
+  (pure handler is directly tested). **Pause chord**: `KeyBindings::slot(BindSlot::Pause)`
+  (default Esc/P, wheel binds honored) read directly in this plugin — never a core
+  `Action`, suppressed while `RebindingCapture.capturing`; toggles Playing↔Paused and
+  sets/clears `SimPaused`. **Pause vs SimPaused vs juice**: user pause owns the flag;
+  `resume_game`/`goto_title`/`start_new_run` never write it while `JuiceFreeze.owns_pause`
+  (juice re-asserts and releases only what it set, per juice.rs contract); the bridge's
+  `AppState != Playing` gate double-protects stepping. Pause → Settings leaves `SimPaused`
+  set (frozen through T16 round trip, verified). **Restart**: all restart paths go
+  through `core_bridge::restart_run` (T14 R-key stays the only R binding — not doubled).
+  **Best score**: display-only read of `PersistedBestScore` (T15's `best_score_system`
+  remains the sole writer on `GameEvent::GameOver` — no double write); NEW RECORD shown
+  when `final == best && best > 0`; game-over shows final score/level/lines from the
+  `GameCore` snapshot. **Quit**: `AppExit::Success` + `QuitRequested` latch (headless
+  observable; App consumes the message). Pause overlay offers Resume/Restart/Settings/
+  **Quit to title** (PRD §7.3)/Quit; GameOver offers Play again/Menu/Quit; Title shows
+  `v{CARGO_PKG_VERSION}` + best + pause-key hint. Settings round trips verified from both
+  Title and Pause via T16 `track_settings_entry`/`handle_back`. Test-harness note:
+  `ButtonInput::clear()` keeps held state — re-press tests must `reset(key)` to produce
+  fresh `just_pressed` edges. Bevy 0.19 gotchas handled: `MouseWheel` fields `x`/`y`,
+  `Messages::iter_current_update_messages`, query aliases only valid inside `SystemParam`
+  structs (bare alias fn args break the HRTB).
+  Tests: 15 new (6 pure handler + 9 headless integration w/ MinimalPlugins + WindowPlugin
+  + CoreBridge + Input + Menu + Settings): starts-at-title (default Playing + Title flip),
+  Start → fresh Playing, chord → Paused + `SimPaused(true)` + `GameCore.steps` unchanged
+  across 5 fixed steps + resume restores, capture suppresses chord, pause→Settings→Back
+  round trip (frozen throughout), Resume/Restart/Quit-to-title buttons, GameOver shows
+  final score/level/lines + best + NEW RECORD (and blank when best ≠ final), Play again →
+  fresh Playing, GameOver Menu → Title, Quit → `QuitRequested`.
+  `cargo test --workspace`: 218 passed, 0 failed (203 prior + 15 new).
+  `cargo fmt --check`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+  Manual/device pass (mouse picking, overlay look, audio duck interplay) pending author.
+- **files edited/created**: `crates/tetris-app/src/screens_menu.rs` (impl), `tetris-plan.md`
 
 ### T18: Audio — SFX, BGM, ducking
 - **depends_on**: [T10]
