@@ -878,9 +878,41 @@ T23: [T22]       WASM build (stretch, M6)
   README gameplay section + screenshots; final name decision executed (rename binary/crate
   display name; PRD §14 #1 closes).
 - **validation**: `cargo run` shows icon; README renders screenshots; name grep consistent.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed (2026-09-27)
+- **log**: **Name decision (PRD §14 #1):** user-visible name **Blockfall** — genre-generic, no
+  Tetris trademark exposure; flat-color art kept (already the implemented style). Executed as
+  `[[bin]] name = "blockfall"` in `crates/tetris-app/Cargo.toml` (package id deliberately stays
+  `tetris-app` so all `-p tetris-app` flags keep working); window title "Blockfall" applied at
+  runtime by `apply_window_identity` in `juice.rs` because `main.rs` is frozen. `cargo run`
+  verified from repo root and `crates/tetris-app`.
+  **Icon:** `crates/tetris-app/assets/icon.png` (1024×1024, deterministic PIL generator
+  `generate_icon.py`, palette = `render.rs::PIECE_RGB`). **Bevy 0.19 removed the runtime
+  window-icon API** (`Window::icon`/`WindowIcon` absent in `bevy_window` 0.19.1; `bevy_winit`
+  only references winit's `set_window_icon` in a comment) — icon therefore ships as the
+  packaging/desktop asset (GNOME matches app-id → `.desktop` `Icon=`; documented in README for
+  T20). No runtime set is possible without touching winit internals.
+  **Screenshots:** no `EasyScreenshotPlugin` exists for Bevy 0.19 and no CLI captor on this
+  Wayland session (no grim/spectacle; GNOME Shell D-Bus screenshot API returns
+  `AccessDenied`). Added an env-gated hook `TETRIS_SHOT=/abs/a.png@90,/abs/b.png@1200` in
+  `JuicePlugin` using Bevy 0.19's built-in `Screenshot` component + `save_to_disk` observer
+  (zero cost when unset). Captured real frames from `TETRIS_BOT=1 TETRIS_SEED=7` runs:
+  `assets/screenshots/gameplay-combo.png` (level 4, COMBO ×2), `gameplay-mid.png` (level 7,
+  63 lines), `gameplay-deep.png` (level 11, 103 lines). README: features, controls table
+  (PRD §9), build/run incl. audio-asset CWD note, dev env-var table, icon note, project layout,
+  MSRV (1.95 pinned toolchain), dev commands.
+  **Capture caveat for author (this machine: NVIDIA RTX PRO 6000, driver 610.57, Vulkan):**
+  while the T17 `MenuScreensPlugin`/`SettingsScreenPlugin` UI roots exist, window captures come
+  back filled with the hidden panel background (~75% of frames) — the screenshot pass appears
+  to race those roots on this driver. Final shots were taken from a detached worktree at
+  20289ff with the reduced plugin set (CoreBridge/Render/Juice/Input/Hud/Audio; title system
+  disabled). Worth a visual check of the hidden roots at the M3 gate; re-capturing on main is
+  one `TETRIS_SHOT` run away.
+  **Gates:** `cargo build --release` ok; `cargo test --workspace` green (218 tests);
+  `cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- **files edited/created**: `README.md` (rewrite), `crates/tetris-app/Cargo.toml` (`[[bin]]
+  blockfall`), `crates/tetris-app/src/juice.rs` (title + `TETRIS_SHOT` hook),
+  `crates/tetris-app/assets/icon.png`, `crates/tetris-app/assets/generate_icon.py`,
+  `assets/screenshots/gameplay-{combo,mid,deep}.png`.
 
 ### T22: v0.1.0 release
 - **depends_on**: [T20, T21]
