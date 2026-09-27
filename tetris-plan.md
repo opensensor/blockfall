@@ -544,9 +544,22 @@ T23: [T22]       WASM build (stretch, M6)
   pause chord), from `Game::snapshot()` + events.
 - **validation**: HUD matches core state during scripted game incl. hold-dim and queue refill;
   survives window resize with letterbox.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Snapshot-driven HUD (Text2d/Sprite, no UI layout): reads only `GameSnapshot` via
+  `NonSend<GameCore>` (test hook `HudFixture` overrides the source). Panels anchored to the
+  letterboxed playfield through `render::letterbox` — `hud_anchor`/`hud_text_center`/
+  `hold_center`/`next_center` pub for T17 reuse. `HudTextSlot` score/level/lines + conditional
+  combo (`COMBO xN`, hidden at 0) / `B2B` indicators + pause hint rebuilt from
+  `KeyBindings::slot(BindSlot::Pause)` on rebinding. Next queue: 1–6 root pool (clamps
+  `Settings.next_queue_size`, caps at `next.len()`), 4 mini cells each via `render::piece_color`
+  + `Piece::cells(Rotation::Spawn)` footprint; hold box 0/4 cells, `GHOST_ALPHA` dim while
+  `hold_used`. All update-in-place; despawn/rebuild only on count or piece change
+  (`no_entity_growth_across_frames` asserts zero leaks). Tests: +8 (headless `MinimalPlugins` +
+  window + `CoreBridgePlugin` + `HudPlugin`); workspace 170 passed, 0 failed; fmt/clippy
+  (-D warnings) green. Added `bevy_text`+`default_font` features to tetris-app for Text2d.
+- **files edited/created**: `crates/tetris-app/src/hud.rs` (full implementation;
+  main.rs registration already in place from scaffold), `crates/tetris-app/Cargo.toml`
+  (bevy features).
 
 ### T14: M2 vertical slice integration & playtest — **M2 GATE**
 - **depends_on**: [T10, T11, T12, T13]
