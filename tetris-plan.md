@@ -725,7 +725,7 @@ T23: [T22]       WASM build (stretch, M6)
 - **validation**: All PRD §7 screens reachable by input (incl. title/pause → settings — this
   closes T16's deferred check); sim frozen while paused (zero core ticks, inputs buffered);
   best updates only on game over and displays score+level+lines.
-- **status**: Partially Completed — automated part GREEN; **M3 gate round 1 REJECTED** by author (flat gray window; mid-air locks), both fixed — awaiting author retest (round 2)
+- **status**: Partially Completed — automated part GREEN; **M3 rounds 1–3 REJECTED** (gray window; mid-air locks; L-piece clipped at top) — all fixed, awaiting author retest (round 4)
 - **log**: **Round-1 defects (2026-09-27)**: (1) flat gray window —
   `sync_root_visibility`'s query used bare `Has<>` markers over `Visibility`
   (a default component on every entity), so it hid camera/sprites/HUD/menu
@@ -737,7 +737,16 @@ T23: [T22]       WASM build (stretch, M6)
   manipulations; fixed grounded-only per PRD §6.5 (`61ad177`, core+game
   regression tests). Soft-drop release defect was fixed earlier under T14.
   Round-2 capture check: title wordmark now BLOCKFALL; bot presses Start from
-  Title (marathon runs unaffected). `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
+  Title (marathon runs unaffected). **Round-3 defect**: L piece 'turned into
+  3 squares' — SRS up-kicks (y=+2 offsets) can lift cells above row 0, and
+  `push_visible` dropped negative rows, losing the nub. Fix in two parts
+  (`685091d`): renderer now draws a 10x24 field (22 board rows + 2 headroom
+  rows, `SnapshotCell.row` is `i32`, letterbox/HUD follow via `VISIBLE_ROWS`
+  + `DRAWN_TOP`), and `srs::try_rotate` rejects kick trials whose cells would
+  sit above `MIN_ROT_ROW` (= -HIDDEN_ROWS), bounding the ratchet the same
+  way spawn bounds it. Tests: `headroom_rows_render_kick_lifted_cells`,
+  `rotation_kicks_never_lift_cells_above_headroom` (223 workspace tests
+  green, fmt/clippy clean). `MenuScreensPlugin` implements Title / Pause / GameOver on the frozen T1
   `AppState` machine (three `Startup`-spawned UI roots toggled by state, T16
   Button/`Interaction` pattern). **Startup state**: PRD §7.1 wants Title, but
   `AppState::default()` is `Playing` and T1's permanent `state.rs` smoke tests run this
