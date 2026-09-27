@@ -586,4 +586,37 @@ mod tests {
         assert_eq!(delta, Some(37));
         assert_eq!(g.score.total, 37);
     }
+
+    #[test]
+    fn mid_air_manipulation_spam_never_locks_falling_piece() {
+        // Regression (playtest): 16+ moves/rotations before ever touching
+        // the stack exhausted the 15-reset move-lockout and force-locked the
+        // piece mid-air, leaving blocks stuck above empty columns.
+        let mut g = Game::new(0xC0FFEE);
+        let first = g.snapshot().active.expect("fresh spawn").piece;
+        for round in 0..24 {
+            for action in [
+                Action::MoveLeft,
+                Action::RotateCw,
+                Action::MoveRight,
+                Action::RotateCcw,
+                Action::Rotate180,
+                Action::MoveRight,
+                Action::Rotate180,
+            ] {
+                assert!(
+                    g.apply(action).is_empty(),
+                    "round {round} action {action:?} must not lock an airborne piece"
+                );
+            }
+        }
+        let snap = g.snapshot();
+        assert!(!snap.game_over);
+        assert_eq!(snap.active.expect("piece still falling").piece, first);
+        // Grounded locking still works: hard drop locks normally.
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::PieceLocked { .. })));
+    }
 }

@@ -74,21 +74,25 @@ impl LockTimer {
         self.resting = false;
     }
 
-    /// Notify a *successful* move or rotation. If the piece is resting, the
-    /// countdown is re-armed to a full window and one reset is consumed.
+    /// Notify a *successful* move or rotation. While the piece is resting,
+    /// the countdown is re-armed to a full window and one reset is consumed.
     /// Returns `false` once [`MAX_RESETS`] are exhausted — the timer then
     /// force-locks on the next [`LockTimer::tick`] — and after locking.
     /// A failed move/rotate must not call this at all.
+    ///
+    /// Airborne manipulations neither consume the reset budget nor force a
+    /// lock (PRD §6.5 scopes the delay to "500 ms grounded"): sliding or
+    /// spinning a falling piece can never lock it in mid-air.
     pub fn reset_on_success(&mut self) -> bool {
         if self.locked || self.forced {
             return false;
         }
-        if self.resets >= MAX_RESETS {
-            self.forced = true;
-            return false;
-        }
-        self.resets += 1;
         if self.resting {
+            if self.resets >= MAX_RESETS {
+                self.forced = true;
+                return false;
+            }
+            self.resets += 1;
             self.ticks_left = LOCK_DELAY_TICKS;
         }
         true
@@ -193,6 +197,30 @@ mod tests {
         assert!(t.tick());
         assert!(t.is_locked());
         assert_eq!(t.resets(), MAX_RESETS);
+    }
+
+    #[test]
+    fn airborne_manipulations_never_consume_or_force() {
+        // Regression (playtest): 16 airborne moves/rotations used to
+        // force-lock a falling piece in mid-air ("stuck in the air").
+        let mut t = LockTimer::new();
+        for _ in 0..64 {
+            assert!(t.reset_on_success(), "airborne reset must always succeed");
+            assert!(!t.tick());
+        }
+        assert_eq!(t.resets(), 0);
+        assert!(!t.is_locked());
+        // Full budget still available once grounded.
+        t.on_grounded();
+        for _ in 0..MAX_RESETS {
+            assert!(t.reset_on_success());
+            assert!(!t.tick());
+        }
+        assert_eq!(t.resets(), MAX_RESETS);
+        t.on_ungrounded();
+        assert!(t.reset_on_success());
+        assert_eq!(t.resets(), MAX_RESETS);
+        assert!(!t.tick());
     }
 
     #[test]
