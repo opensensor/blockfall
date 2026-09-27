@@ -16,6 +16,9 @@
 //!   collection to `Messages<M>` / `add_event()` to `add_message()`, and `M:
 //!   Message` must be a crate-local type (`tetris-core` stays Bevy-free, so a
 //!   newtype is the only orphan-rule-clean way to carry `GameEvent`).
+//! - [`restart_run`] (T14) — shared R-restart path honoring the `TETRIS_SEED`
+//!   env seed; the plugin also hosts the `TETRIS_BOT=1` greedy solver +
+//!   marathon logger (`MARATHON fps_avg=…`, `BOT game_done …`).
 //!
 //! Schedule placement: `core_bridge_system` runs in `FixedUpdate`, a
 //! sub-schedule of `FixedMain` (`bevy::app::FixedMain`), which the Main
@@ -30,10 +33,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bevy::prelude::*;
 
 use tetris_core::actions::Action;
+use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
-use tetris_core::game::Game;
+use tetris_core::game::{Game, GameSnapshot};
+use tetris_core::piece::{PieceState, Rotation};
 
 use crate::state::AppState;
+
+/// Env var overriding the run seed with a fixed `u64` (T14: reproducible
+/// marathons; applies at startup and on every restart).
+pub const SEED_ENV: &str = "TETRIS_SEED";
+
+/// Env var enabling the greedy snapshot bot + marathon logging (`"1"`).
+pub const BOT_ENV: &str = "TETRIS_BOT";
+
+/// Games the bot plays before exiting the app (M2 gate marathon).
+const BOT_GAMES: u32 = 2;
+
+/// Seconds the bot waits after a game over before restarting.
+const BOT_RESTART_DELAY_SECS: f32 = 0.5;
+
+/// Parsed [`SEED_ENV`] value, if set and a valid `u64`.
+fn env_seed() -> Option<u64> {
+    std::env::var(SEED_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// [`BOT_ENV`] set to exactly `"1"`.
+fn bot_enabled() -> bool {
+    std::env::var(BOT_ENV).is_ok_and(|v| v.trim() == "1")
+}
 
 /// Simulation rate of the fixed-step schedule, Hz (PRD: core ticks at 60 Hz).
 pub const SIM_HZ: f64 = 60.0;
@@ -123,6 +153,331 @@ pub struct SimPaused(pub bool);
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub struct CoreEvent(pub GameEvent);
 
+/// Shared restart path for the human R key and the bot (T14). Honors
+/// [`SEED_ENV`]: a fixed env seed makes marathons reproducible; otherwise a
+/// wall-clock seed is used, as before.
+pub fn restart_run(core: &mut GameCore, app_state: &mut AppState) {
+    match env_seed() {
+        Some(seed) => {
+            info!("restart: seed {seed} (from {SEED_ENV})");
+            core.restart_with(seed);
+        }
+        None => {
+            core.restart();
+            info!("restart: seed {} (wall clock)", core.seed);
+        }
+    }
+    *app_state = AppState::Playing;
+}
+
+/// Startup: override the wall-clock seed of the plugin-inserted `GameCore`
+/// when [`SEED_ENV`] is set, so even game #1 of a marathon is reproducible.
+fn seed_from_env_at_startup(mut core: NonSendMut<GameCore>) {
+    match env_seed() {
+        Some(seed) => {
+            info!("startup: seed {seed} (from {SEED_ENV})");
+            core.restart_with(seed);
+        }
+        None => info!("startup: seed {} (wall clock)", core.seed),
+    }
+}
+
+/// R (hardcoded — `KeyBindings` in `input.rs` owns only the eight action
+/// slots plus pause and has no restart slot) restarts from Game Over (T14).
+fn restart_on_r_system(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    core: NonSendMut<GameCore>,
+    app_state: ResMut<AppState>,
+) {
+    // `Option<Res<...>>`: MinimalPlugins headless worlds have no
+    // `InputPlugin`, mirroring T12's resource guard.
+    let Some(keys) = keys else { return };
+    if *app_state == AppState::GameOver && keys.just_pressed(KeyCode::KeyR) {
+        restart_run(core.into_inner(), app_state.into_inner());
+    }
+}
+
+/// Bot toggle resource, from [`BOT_ENV`] at plugin build (T14).
+#[derive(Resource)]
+struct BotMode(bool);
+
+/// Marathon bookkeeping for the bot: completed games, the post-game-over
+/// restart countdown (plain f32 seconds; no `Timer` resource dance needed),
+/// and the committed placement the step-wise executor is realizing.
+#[derive(Resource, Default)]
+struct BotState {
+    games_done: u32,
+    awaiting_restart: bool,
+    restart_in: f32,
+    plan: Option<BotPlan>,
+    last_rot: Option<Rotation>,
+    last_col: Option<i32>,
+    wedge: u32,
+}
+
+/// A committed target for the currently active piece; re-planned whenever a
+/// new piece spawns, so kicks/mispositions self-correct next step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BotPlan {
+    piece: tetris_core::piece::Piece,
+    rot: Rotation,
+    target_col: i32,
+}
+
+/// Steps a committed piece toward its plan (one action per tick): rotate →
+/// shift → hard drop. A stall counter forces the drop if rotation/moves stop
+/// making progress (blocked kicks, wall pinning), so the bot can never hang.
+fn step_bot_plan(
+    pending: &mut PendingActions,
+    state: &mut BotState,
+    active: PieceState,
+    mv: BotPlan,
+) {
+    let progressed = state.last_rot != Some(active.rot) || state.last_col != Some(active.col);
+    state.wedge = if progressed { 0 } else { state.wedge + 1 };
+    state.last_rot = Some(active.rot);
+    state.last_col = Some(active.col);
+    if state.wedge > 8 {
+        pending.push(Action::HardDrop);
+        state.plan = None;
+        return;
+    }
+    if state.wedge >= 2 {
+        // Plan went stale under the piece (blocked slide / gravity): re-solve
+        // from the current position next tick instead of grinding into it.
+        state.plan = None;
+        return;
+    }
+    if active.rot != mv.rot {
+        let diff = (mv.rot as u32 + 4 - active.rot as u32) % 4;
+        pending.push(match diff {
+            1 => Action::RotateCw,
+            3 => Action::RotateCcw,
+            _ => Action::Rotate180,
+        });
+    } else if active.col != mv.target_col {
+        pending.push(if active.col < mv.target_col {
+            Action::MoveRight
+        } else {
+            Action::MoveLeft
+        });
+    } else {
+        pending.push(Action::HardDrop);
+        state.plan = None;
+    }
+}
+
+/// Bot brain: every fixed step (before the bridge drains) execute the
+/// committed plan or commit a fresh greedy one for a new piece. Runs in
+/// `FixedUpdate` *before* `core_bridge_system`, so actions apply same-tick.
+fn bot_drive_system(
+    bot: Res<BotMode>,
+    pending: ResMut<PendingActions>,
+    mut state: ResMut<BotState>,
+    core: NonSend<GameCore>,
+    app_state: Res<AppState>,
+    paused: Res<SimPaused>,
+) {
+    if !bot.0 || *app_state != AppState::Playing || paused.0 {
+        return;
+    }
+    let snapshot = core.game.snapshot();
+    let Some(active) = snapshot.active else {
+        state.plan = None;
+        return;
+    };
+    match state.plan {
+        Some(mv) if mv.piece == active.piece => {
+            let state = state.into_inner();
+            step_bot_plan(pending.into_inner(), state, active, mv);
+        }
+        _ => {
+            state.plan = bot_move(&snapshot).map(|mv| BotPlan {
+                piece: active.piece,
+                rot: mv.rot,
+                target_col: mv.target_col,
+            });
+            state.wedge = 0;
+            state.last_rot = Some(active.rot);
+            state.last_col = Some(active.col);
+        }
+    }
+}
+
+/// Frame-time accumulator for `MARATHON fps_avg=...` logs (bot mode only).
+#[derive(Resource, Default)]
+struct MarathonStats {
+    frames: u64,
+    frame_secs: f64,
+}
+
+/// Placement metrics for the greedy solver over a board of settled cells
+/// (row 0 = top, hidden rows included): `(aggregate column height, holes,
+/// bumpiness)`. Call on the post-clear board.
+fn stack_metrics(board: &Board) -> (i32, i32, i32) {
+    let mut agg = 0;
+    let mut holes = 0;
+    let mut heights = [0i32; COLS];
+    for (col, height) in heights.iter_mut().enumerate() {
+        let mut filled_seen = false;
+        for row in 0..ROWS {
+            if board.get(row, col).is_some() {
+                if !filled_seen {
+                    filled_seen = true;
+                    *height = (ROWS - row) as i32;
+                }
+            } else if filled_seen {
+                holes += 1;
+            }
+        }
+        agg += *height;
+    }
+    let bump = heights.windows(2).map(|w| (w[0] - w[1]).abs()).sum();
+    (agg, holes, bump)
+}
+
+/// A chosen placement: rotate `active` to `rot`, shift to `target_col`, hard
+/// drop. SRS kicks are ignored (deliberately greedy; not a perfect solver).
+#[derive(Clone, Copy, Debug)]
+struct BotMove {
+    rot: Rotation,
+    target_col: i32,
+}
+
+/// All resting placements `(row, col)` of `base` (one fixed rotation) that
+/// the piece can actually reach by sliding and falling — BFS over the
+/// non-colliding `(row, col)` states from the spawn position, collecting the
+/// states where the piece rests (ghost == self). Ignores in-flight rotation
+/// and kicks; a superset of free-fall, exact for slide+drop.
+fn reachable_placements(board: &Board, base: PieceState) -> Vec<(i32, i32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    seen.insert((base.row, base.col));
+    queue.push_back(base);
+    let mut out = Vec::new();
+    while let Some(s) = queue.pop_front() {
+        if board::ghost_row(board, &s) == s.row {
+            out.push((s.row, s.col));
+        }
+        for next in [
+            PieceState {
+                row: s.row + 1,
+                ..s
+            },
+            PieceState {
+                col: s.col - 1,
+                ..s
+            },
+            PieceState {
+                col: s.col + 1,
+                ..s
+            },
+        ] {
+            if !board.collides(&next) && seen.insert((next.row, next.col)) {
+                queue.push_back(next);
+            }
+        }
+    }
+    out
+}
+
+/// Greedy snapshot solver: every rotation × every *reachable* resting slot
+/// (slide+drop BFS), simulated via `merge` + clear. Dellacherie-flavoured
+/// weights: clears dominate, then holes, aggregate height, bumpiness. `None`
+/// when no placement fits (block-out imminent).
+fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
+    let active = snapshot.active?;
+    let mut best: Option<((i32, i32), BotMove)> = None;
+    for rot in [Rotation::Spawn, Rotation::Cw, Rotation::R180, Rotation::Ccw] {
+        let base = PieceState {
+            piece: active.piece,
+            rot,
+            row: active.row,
+            col: active.col,
+        };
+        if snapshot.board.collides(&base) {
+            continue;
+        }
+        for (row, col) in reachable_placements(&snapshot.board, base) {
+            let placed = PieceState { row, col, ..base };
+            let mut sim = snapshot.board.clone();
+            sim.merge(&placed);
+            let cleared = sim.full_rows().len() as i32;
+            sim.clear_full_rows();
+            let (agg, holes, bump) = stack_metrics(&sim);
+            let score = cleared * 4500 - holes * 500 - agg * 25 - bump * 12;
+            let key = (score, -(col - active.col).abs());
+            if best.is_none_or(|(best_key, _)| key > best_key) {
+                best = Some((
+                    key,
+                    BotMove {
+                        rot,
+                        target_col: col,
+                    },
+                ));
+            }
+        }
+    }
+    best.map(|(_, mv)| mv)
+}
+
+/// Bot lifecycle (real frames): on Game Over log per-game stats and
+/// `MARATHON game_done`, restart via the shared R path after a short delay,
+/// and exit with `AppExit::Success` once [`BOT_GAMES`] games completed.
+fn bot_marathon_system(
+    bot: Res<BotMode>,
+    mut bot_state: ResMut<BotState>,
+    core: NonSendMut<GameCore>,
+    app_state: ResMut<AppState>,
+    time: Res<Time>,
+    mut exits: MessageWriter<AppExit>,
+) {
+    if !bot.0 {
+        return;
+    }
+    if *app_state == AppState::GameOver && !bot_state.awaiting_restart {
+        bot_state.games_done += 1;
+        let snapshot = core.game.snapshot();
+        info!(
+            "BOT game_done seed={} score={} level={} lines={}",
+            core.seed, snapshot.score, snapshot.level, snapshot.lines
+        );
+        info!("MARATHON game_done games_done={}", bot_state.games_done);
+        if bot_state.games_done >= BOT_GAMES {
+            exits.write(AppExit::Success);
+            return;
+        }
+        bot_state.awaiting_restart = true;
+        bot_state.restart_in = BOT_RESTART_DELAY_SECS;
+    }
+    if bot_state.awaiting_restart {
+        bot_state.restart_in -= time.delta_secs();
+        if bot_state.restart_in <= 0.0 {
+            info!("BOT restart (R-equivalent)");
+            restart_run(core.into_inner(), app_state.into_inner());
+            bot_state.awaiting_restart = false;
+        }
+    }
+}
+
+/// Real-window frame-time reporter: every ~2 s logs
+/// `MARATHON fps_avg=<x> frame_ms=<y>` from actual frame deltas (bot mode
+/// only, to keep normal runs quiet).
+fn marathon_fps_system(bot: Res<BotMode>, mut stats: ResMut<MarathonStats>, time: Res<Time>) {
+    if !bot.0 {
+        return;
+    }
+    stats.frames += 1;
+    stats.frame_secs += time.delta_secs() as f64;
+    if stats.frame_secs >= 2.0 {
+        let fps = stats.frames as f64 / stats.frame_secs;
+        let frame_ms = stats.frame_secs * 1000.0 / stats.frames as f64;
+        info!("MARATHON fps_avg={fps:.1} frame_ms={frame_ms:.2}");
+        stats.frames = 0;
+        stats.frame_secs = 0.0;
+    }
+}
+
 /// Steps the core on the fixed schedule. Registered in `FixedUpdate` (a
 /// `FixedMain` sub-schedule run ahead of `Update`/render — never in a render
 /// or `Update` schedule).
@@ -168,6 +523,8 @@ pub struct CoreBridgePlugin;
 
 impl Plugin for CoreBridgePlugin {
     fn build(&self, app: &mut App) {
+        let bot = bot_enabled();
+        info!("core bridge: bot mode {}", if bot { "ON" } else { "off" });
         app.insert_non_send(GameCore::default())
             .init_resource::<PendingActions>()
             .init_resource::<SimPaused>()
@@ -176,8 +533,22 @@ impl Plugin for CoreBridgePlugin {
             // is 60 Hz (gravity, lock delay, DAS/ARR tick conversions all
             // assume it).
             .insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
+            // T14: env seed override, human R-restart, bot marathon.
+            .insert_resource(BotMode(bot))
+            .init_resource::<BotState>()
+            .init_resource::<MarathonStats>()
+            .add_systems(Startup, seed_from_env_at_startup)
+            .add_systems(
+                Update,
+                (
+                    restart_on_r_system,
+                    bot_marathon_system,
+                    marathon_fps_system,
+                ),
+            )
             .add_systems(Startup, spawn_primary_camera)
-            .add_systems(FixedUpdate, core_bridge_system);
+            .add_systems(FixedUpdate, core_bridge_system)
+            .add_systems(FixedUpdate, bot_drive_system.before(core_bridge_system));
     }
 }
 
@@ -404,5 +775,117 @@ mod tests {
         assert!(app.world().contains_non_send::<GameCore>());
         assert!(app.world().contains_resource::<PendingActions>());
         assert!(app.world().contains_resource::<SimPaused>());
+    }
+
+    /// T14 M2-gate integration test: the *wired* bridge (CoreBridge only, no
+    /// window) driven by the greedy solver from a fixed seed must complete
+    /// the full loop — spawn → ≥1 LineCleared → LevelUp → GameOver — with
+    /// zero panics, and the shared restart path (what the R key calls) must
+    /// yield a fresh snapshot.
+    #[test]
+    fn wired_bot_bridge_full_loop_then_fresh_restart() {
+        let mut app = test_app(42);
+        *app.world_mut().resource_mut::<BotMode>() = BotMode(true);
+
+        // Phase 1: solver plays through the real FixedUpdate wiring until it
+        // has spawned, cleared lines and leveled up.
+        let (mut saw_spawn, mut saw_clear, mut saw_levelup) = (false, false, false);
+        for step in 0..3000 {
+            fixed_step(&mut app);
+            for event in drained(&mut app) {
+                match event.0 {
+                    GameEvent::PieceSpawned { .. } => saw_spawn = true,
+                    GameEvent::LineCleared { .. } => saw_clear = true,
+                    GameEvent::LevelUp { .. } => saw_levelup = true,
+                    _ => {}
+                }
+            }
+            if saw_spawn && saw_clear && saw_levelup {
+                break;
+            }
+            assert_ne!(
+                *app.world().resource::<AppState>(),
+                AppState::GameOver,
+                "solver died before level-up at fixed step {step}"
+            );
+        }
+        assert!(
+            saw_spawn && saw_clear && saw_levelup,
+            "spawn={saw_spawn} line_clear={saw_clear} level_up={saw_levelup}"
+        );
+
+        // Phase 2: dumb hard drops (bot off) pile pieces at spawn until the
+        // deterministic block-out, exercising the GameOver wiring.
+        *app.world_mut().resource_mut::<BotMode>() = BotMode(false);
+        let mut saw_game_over = false;
+        for _ in 0..1000 {
+            app.world_mut()
+                .resource_mut::<PendingActions>()
+                .push(Action::HardDrop);
+            fixed_step(&mut app);
+            let events = drained(&mut app);
+            if events.iter().any(|e| e.0 == GameEvent::GameOver) {
+                saw_game_over = true;
+                break;
+            }
+        }
+        assert!(saw_game_over, "hard-drop pile-up must block out");
+        assert_eq!(*app.world().resource::<AppState>(), AppState::GameOver);
+        assert!(snapshot(&app).game_over);
+
+        // "R" restart through the shared glue (`restart_on_r_system` calls
+        // exactly this once `AppState::GameOver` and KeyR are seen).
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, mut state| {
+                let mut core = world.non_send_mut::<GameCore>();
+                restart_run(core.as_mut(), state.as_mut());
+            });
+
+        assert_eq!(*app.world().resource::<AppState>(), AppState::Playing);
+        let after = snapshot(&app);
+        // No `TETRIS_SEED` in the test process, so the shared path restarts
+        // from wall clock: assert structural freshness, not seed 42.
+        assert!(after.active.is_some() && after.ghost_row.is_some());
+        assert!(after.board.is_empty());
+        assert_eq!(after.score, 0);
+        assert_eq!(after.lines, 0);
+        assert!(!after.game_over);
+        assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+    }
+
+    #[test]
+    fn bot_solver_prefers_line_clear_over_flat_stack() {
+        // Four-cell gap in the settled bottom row, I piece active: the solver
+        // must slide the horizontal I into the gap to clear the row rather
+        // than rest it flat on top of the stack.
+        let mut board = Board::new();
+        for col in 0..COLS {
+            board.set(ROWS - 1, col, Some(tetris_core::piece::Piece::O));
+        }
+        for col in 3..7 {
+            board.set(ROWS - 1, col, None);
+        }
+        let snapshot = GameSnapshot {
+            board,
+            active: Some(PieceState {
+                piece: tetris_core::piece::Piece::I,
+                rot: Rotation::Spawn,
+                row: 0,
+                col: 4,
+            }),
+            ghost_row: None,
+            hold: None,
+            hold_used: false,
+            next: Vec::new(),
+            score: 0,
+            level: 1,
+            lines: 0,
+            combo: 0,
+            b2b: false,
+            game_over: false,
+        };
+        let mv = bot_move(&snapshot).expect("I always fits somewhere");
+        assert_eq!(mv.rot, Rotation::Spawn, "flat I fills the four-gap");
+        assert_eq!(mv.target_col, 3, "{mv:?} fills cols 3..=6");
     }
 }
