@@ -51,7 +51,8 @@ Bevy has no polished, idiomatic reference game of this genre. Building one produ
 
 ### 6.1 Playfield
 
-- 10 columns × 20 visible rows; 2 hidden buffer rows above for spawn.
+- 10 columns × 22 rows: 20 playable rows + 2 spawn-buffer rows above; all 22
+  are drawn so spawning/kicked pieces never clip at the top edge.
 - Line clear: full rows removed, stack shifts down. Multi-line clears score more (1–4 lines).
 - Game over: a piece spawns overlapping existing cells (block-out) — top-out rule only.
 

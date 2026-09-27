@@ -487,6 +487,11 @@ T23: [T22]       WASM build (stretch, M6)
   actions → entity counts vs independently recomputed expectation + palette/ghost-alpha/
   position/z checks; resize reflow): 131 workspace total green. fmt/clippy clean.
   Deferred to T14 human gate: ≥58 FPS frame-time log run + visual resize sanity.
+  **M3 playtest addendum (2026-09-27)**: clipping the 2-row spawn buffer made
+  piece cells vanish outside the top boundary when kicks/spawn touched rows 0-1
+  (author-confirmed glitch). Renderer now draws all 22 rows: `VISIBLE_ROWS = ROWS`,
+  `frame_cells` clips only to the full board, letterbox/HUD anchors follow; PRD §4
+  amended. Tests updated (`spawn_buffer_cells_are_drawn` replaces the clipping test).
 - **files edited/created**: `crates/tetris-app/src/render.rs`
 
 ### T12: Input map, DAS/ARR

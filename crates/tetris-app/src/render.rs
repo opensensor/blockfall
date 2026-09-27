@@ -1,11 +1,12 @@
 //! Snapshot-driven playfield renderer (T11).
 //!
 //! Draws flat colored cells **exclusively** from [`Game::snapshot`]: settled
-//! board cells, the active piece, and the ghost (positioned at the core's
-//! `ghost_row`). No rules are recomputed here. The visible field is the
-//! 10x20 grid of board rows below `HIDDEN_ROWS`, letterboxed inside the
-//! window with equal cell size on both axes. `GameCore` is a non-send
-//! resource (T10), read via the `Option<NonSend<GameCore>>` parameter.
+//! board cells, the active piece and the ghost (at the core's `ghost_row`) —
+//! no rules recomputed here. The drawn field is the full 22-row board
+//! (20 playable + 2 spawn-buffer, per the M3 playtest fix), letterboxed
+//! inside the window with equal cell size on both axes.
+//! `GameCore` is a non-send resource (T10), read via the
+//! `Option<NonSend<GameCore>>` parameter.
 //!
 //! Rendering model: one [`Sprite`] component (the Bevy 0.19 sprite entity;
 //! its built-in quad mesh is supplied by the sprite pipeline) per cell,
@@ -20,8 +21,8 @@
 //! - [`GHOST_ALPHA`] — ghost dimming factor (T13 preview dimming parity, T19).
 //! - [`letterbox`] — window size -> `(cell, offset_x, offset_y)` centering
 //!   math for any playfield-anchored UI (T13, T17 overlays, T19 juice).
-//! - [`frame_cells`] — snapshot -> flat list of visible [`SnapshotCell`]s
-//!   (board + active + ghost, already clipped to visible rows).
+//! - [`frame_cells`] — snapshot -> flat list of drawable [`SnapshotCell`]s
+//!   (board + active + ghost, clipped only to the full 10x22 board).
 //!
 //! [`Game::snapshot`]: tetris_core::game::Game::snapshot
 
@@ -29,14 +30,17 @@ use bevy::color::Alpha;
 use bevy::prelude::*;
 use bevy::window::Window;
 
-use tetris_core::board::{COLS, HIDDEN_ROWS, ROWS};
+use tetris_core::board::{COLS, ROWS};
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::Piece;
 
 use crate::core_bridge::GameCore;
 
-/// Rows of the visible field (board rows `HIDDEN_ROWS..ROWS`).
-pub const VISIBLE_ROWS: usize = ROWS - HIDDEN_ROWS;
+/// Rows of the drawn field. The 2 spawn-buffer rows are rendered (M3
+/// playtest fix): clipping them made piece cells "vanish outside the
+/// boundary" whenever a kick or spawn touched rows 0..1, so the whole
+/// board (10x22) is now visible.
+pub const VISIBLE_ROWS: usize = ROWS;
 
 /// Srgba channels (red, green, blue) per piece, in [`Piece::ALL`] order,
 /// following the Tetris Guideline palette (PRD: flat colored cells, one
@@ -150,7 +154,7 @@ impl SnapshotCell {
     }
 }
 
-/// Letterbox fit of the 10x20 visible field inside a `window_w` x `window_h`
+/// Letterbox fit of the 10x22 field inside a `window_w` x `window_h`
 /// window: returns `(cell, offset_x, offset_y)` with a single square cell
 /// size on both axes and the field centered in the remaining margin.
 pub fn letterbox(window_w: f32, window_h: f32) -> (f32, f32, f32) {
@@ -160,12 +164,13 @@ pub fn letterbox(window_w: f32, window_h: f32) -> (f32, f32, f32) {
     (cell, offset_x, offset_y)
 }
 
-/// Flatten a snapshot into the visible cells to draw this frame: settled
-/// board rows, active piece cells and ghost cells, each clipped to the
-/// visible rows (spawn-buffer cells above row `HIDDEN_ROWS` are not drawn).
+/// Flatten a snapshot into the cells to draw this frame: all board rows
+/// (including the 2-row spawn buffer, so kicked/spawning pieces never
+/// disappear at the top edge), active piece cells and ghost cells, clipped
+/// only to the full 10x22 board.
 pub fn frame_cells(snapshot: &GameSnapshot) -> Vec<SnapshotCell> {
     let mut cells = Vec::with_capacity(ROWS * COLS + 8);
-    for row in HIDDEN_ROWS..ROWS {
+    for row in 0..ROWS {
         for col in 0..COLS {
             if let Some(piece) = snapshot.board.get(row, col) {
                 cells.push(SnapshotCell {
@@ -195,7 +200,7 @@ fn push_visible(cells: &mut Vec<SnapshotCell>, row: i32, col: i32, piece: Piece,
     let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
         return;
     };
-    if !(HIDDEN_ROWS..ROWS).contains(&row) || col >= COLS {
+    if row >= ROWS || col >= COLS {
         return;
     }
     cells.push(SnapshotCell {
@@ -252,8 +257,7 @@ fn render_playfield(
 
     for (index, frame_cell) in cells.iter().enumerate() {
         let x = left + (frame_cell.col as f32 + 0.5) * cell;
-        let vis_row = frame_cell.row - HIDDEN_ROWS;
-        let y = top - (vis_row as f32 + 0.5) * cell;
+        let y = top - (frame_cell.row as f32 + 0.5) * cell;
         let sprite = Sprite {
             color: frame_cell.color(),
             custom_size: Some(Vec2::splat(cell)),
@@ -299,6 +303,7 @@ mod tests {
     use super::*;
     use crate::core_bridge::{CoreBridgePlugin, PendingActions};
     use crate::state::AppState;
+    use tetris_core::board::HIDDEN_ROWS;
 
     use bevy::app::FixedUpdate;
     use bevy::window::WindowPlugin;
@@ -311,8 +316,9 @@ mod tests {
     /// preserved, cell as large as possible at several window shapes.
     #[test]
     fn letterbox_fits_and_centers_square_cells() {
-        let check = |w: f32, h: f32, expect_cell: f32| {
+        let check = |w: f32, h: f32| {
             let (cell, ox, oy) = letterbox(w, h);
+            let expect_cell = (w / COLS as f32).min(h / VISIBLE_ROWS as f32);
             assert!(
                 (cell - expect_cell).abs() < EPS,
                 "window {w}x{h}: cell {cell} != expected {expect_cell}"
@@ -331,11 +337,11 @@ mod tests {
             let bigger = cell + EPS;
             assert!(bigger * COLS as f32 > w || bigger * VISIBLE_ROWS as f32 > h);
         };
-        check(1280.0, 720.0, 36.0); // height-limited, side pillar boxes
-        check(320.0, 240.0, 12.0); // tiny window
-        check(3440.0, 1440.0, 72.0); // ultrawide
-        check(800.0, 800.0, 40.0); // square: height-limited
-        check(100.0, 200.0, 10.0); // exact 10:20 fit, zero margin
+        check(1280.0, 720.0); // height-limited, side pillar boxes
+        check(320.0, 240.0); // tiny window
+        check(3440.0, 1440.0); // ultrawide
+        check(800.0, 800.0); // square: height-limited
+        check(100.0, 220.0); // exact 10:22 fit, zero margin
     }
 
     fn render_app(seed: u64) -> App {
@@ -404,13 +410,9 @@ mod tests {
     /// Snapshot cell counts recomputed independently of `frame_cells` using
     /// only core APIs, for cross-checking the drawn entity count.
     fn expected_count(snapshot: &GameSnapshot) -> usize {
-        let visible = |row: i32, col: i32| {
-            (row as usize) >= HIDDEN_ROWS
-                && (row as usize) < ROWS
-                && col >= 0
-                && (col as usize) < COLS
-        };
-        let board = (HIDDEN_ROWS..ROWS)
+        let visible =
+            |row: i32, col: i32| (row as usize) < ROWS && col >= 0 && (col as usize) < COLS;
+        let board = (0..ROWS)
             .flat_map(|r| (0..COLS).map(move |c| (r, c)))
             .filter(|&(r, c)| snapshot.board.get(r, c).is_some())
             .count();
@@ -433,18 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn hidden_spawn_cells_are_not_drawn() {
-        // Seed 1 spawns T (cells on rows 0..=1 => fully hidden).
+    fn spawn_buffer_cells_are_drawn() {
+        // M3 playtest fix: the 2 spawn-buffer rows are rendered so pieces
+        // entering (or kicked into) rows 0..=1 never clip at the top edge.
         let fresh = Game::new(1).snapshot();
         let ps = fresh.active.expect("fresh game has an active piece");
         assert!(ps.cells().iter().all(|(r, _)| (*r as usize) < HIDDEN_ROWS));
         let mut app = render_app(1);
         frame(&mut app, &[]);
         let fresh = app.world().non_send::<GameCore>().game.snapshot();
-        // Hidden active piece draws no Active cells, but its ghost lands
-        // inside the visible field and is drawn.
         assert_eq!(count(&mut app), expected_count(&fresh));
-        assert!(cells_of(&mut app, CellKind::Active).is_empty());
+        assert_eq!(cells_of(&mut app, CellKind::Active).len(), 4);
         assert_eq!(cells_of(&mut app, CellKind::Ghost).len(), 4);
 
         frame(&mut app, &[Action::SoftDrop]);
@@ -469,9 +470,9 @@ mod tests {
         assert_eq!(
             count(&mut app),
             expected_count(&snapshot),
-            "settled + ghost only; second piece spawns fully hidden"
+            "settled + spawned-piece buffer cells + ghost"
         );
-        assert_eq!(board.len() + ghost.len(), count(&mut app));
+        assert_eq!(cells_of(&mut app, CellKind::Active).len(), 4);
         assert!(
             !board.is_empty(),
             "hard drop must leave visible settled cells"
