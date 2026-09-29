@@ -324,9 +324,97 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   tick progress while paused); **proptest**: two `Match`es fed the same
   `TickBatch` stream are snapshot-identical at every tick. All existing tests
   green; clippy/fmt clean.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `NetLockstep` resource + pure state machine in `lockstep.rs`
+  (`reset_for_match`, `schedule_local`, `ingest`, `step_host`, `step_guest`),
+  every step method taking `&mut Match` + a `&mut dyn NetOut` so production
+  logic runs verbatim in-process over the fake transport. `NetOut` trait seam
+  (send-only) with `RenetServerOut`/`RenetClientOut` renet adapters; receive
+  via `server_inbox`/`client_inbox` (poll both channels, decode, never panic
+  on hostile bytes) → `ingest`. `wire_channel()`: Hello/MatchStart/TickInput/
+  TickBatch on ReliableOrdered, SnapshotHash/Bye on ReliableUnordered. Two
+  `FixedUpdate` systems (`net_lockstep_host_system`,
+  `net_lockstep_guest_system`) mounted by `NetLockstepPlugin` from
+  `NetPlugin::build()`; all params but `NetLockstep` optional → inert in
+  non-netplay apps (`add_message::<VersusEvent>` re-registration is
+  idempotent, Bevy 0.19 `contains_resource` guard). **Stepping order**
+  (`apply_batch`, the single path host and mirror share — proptest-pinned):
+  apply left actions → `tick(Left)` → apply right → `tick(Right)`, mirroring
+  `versus_bridge_system` (`versus.rs:255-264`); systems write `VersusEvent`
+  per `MatchEvent`, bump `VersusMatch::steps`, and crown `VersusWinner`
+  once (`winner.0.is_none()` guard — `start_versus` clears it). **N4 gating
+  contract**: while `InMatch`, `versus_bridge_system` must skip its *entire*
+  drain-then-tick block incl. its own steps/crowning (double-stepping
+  corrupts the mirror) and pin `.after(versus_bot_system)` (private to
+  `versus.rs`) so Bot-seat pushes schedule with delay like human actions.
+  **Delay**: local actions schedule for `tick + D` AND emit `TickInput`
+  immediately; both peers emit; the guest discards the host's `TickInput`
+  echo and the host discards stray `TickBatch` via a `role` field the
+  systems mirror from `NetSession` — a late `TickInput` whose target already
+  executed is dropped and counted in `dropped_late_inputs`; the guest mirror
+  applies only batch contents (guest's own ring is bookkeeping), so late
+  input can never fork the boards. **Stall policy**: host sends a batch
+  every tick (empty lists included — clock pacing); guest executes strict
+  in-order from a sorted `batch_buffer`, counting `stall_steps`. **Desync
+  check**: every `HASH_CHECK_PERIOD` (60) executed ticks (labels 59, 119, …)
+  both sides send `SnapshotHash { side, tick, left: h, right: h }` — both
+  fields carry the full-match `snapshot_hash` (N1 codec exposes only the
+  whole-`MatchSnapshot` hash; per-side granularity deferred — worth a plan
+  amendment if N6 wants per-side localization); rolling 8-entry windows per
+  direction, mismatch on a common label → `LockstepSignal::Desync{tick}` +
+  windows cleared (no repeat-fire). **Gates** (freeze mechanism): skip while
+  `SimPaused.0` / `AppState != Playing` / no transport (host also needs
+  `session.peer`) / `!VersusMatch::active`; paused skip holds the
+  `VersusActions` queues, inactive-match skip clears them. **Teardown
+  contract shipped**: Desync/Bye signals set `SimPaused` and write
+  `NetEvent::Desync`/`ByeReceived` (Bye also drives `NetTrigger::Bye` →
+  `Lost(PeerDisconnected)`; `NetSession::apply` opened to `pub(crate)`);
+  the match stays `active` so frozen boards keep rendering; `net_freeze` +
+  `net_leave_to_title` (graceful `net_stop` + reset + un-pause +
+  `end_versus`) and `NET_OVERLAY_ZINDEX` (`ZIndex(100)`, strictly above HUD
+  0 / submenu 1 per the recorded click-swallow regressions) are N5's hooks.
+  A mid-match `MatchStart` parks in `pending_start` for N4's rematch.
+  `net_stop` fixed to remove `RenetServer`/`NetcodeServerTransport`
+  independently (previously a transport-less server survived → not `Idle`).
+  **Validation** — 26 tests (app suite 163 → 189): 13 pure fake-transport
+  (`NetSim`: latency-controlled in-memory links, real encoded `NetMsg`s)
+  covering delay math, empty ticks, stall-and-recover, late-input accounting,
+  batch merge, 60-tick hash exchange, forked-mirror desync detection on both
+  peers, `Bye` signal, `pending_start` parking, stale-batch ignore; a
+  256-case proptest pinning the mirror invariant (same batch stream ⇒
+  snapshot- and hash-identical) and cross-checking
+  `snapshot_hash` ⇔ `snapshot` equality; 9 Bevy-system tests over renet's
+  `new_local_client` seam (no UDP) covering inert-while-not-InMatch, host
+  pacing + `TickInput(t+D)` + no early application, `SimPaused` hold/
+  resume, non-`Playing` freeze, inactive-match guard, desync freeze +
+  `net_leave_to_title` full teardown, wire `Bye`, winner crowning through
+  the lockstep, guest drain/stall/recovery; plus a thin real-UDP loopback
+  smoke (port 0 — no fixed-port lock needed) round-tripping a guest drop
+  `TickInput` → host batch → guest mirror with hash-equal boards.
+  RED→GREEN note: tests and impl were authored in one pass against the
+  planned API; the first wired `cargo check --all-targets` and test run
+  failed (transport accumulator bug in the fake seam, guest-role echo
+  handling, dial-vs-bind address mismatch in the loopback test), all fixed
+  to GREEN — the fake seam demonstrably catches real wiring faults.
+  **API surprises**: (1) `SnapshotHash` carries `side` (N1 notes underplay
+  it) but the hash is whole-match; (2) guest must NOT reset after the
+  session flips `InMatch` — `FixedUpdate` runs after the `Update` bridge in
+  the same frame, so `MatchStart` + first batches can already have executed
+  (loopback test resets before the host starts the clock — N4: reset the
+  guest's lockstep when handling `MatchStart`, i.e. *before* the next fixed
+  step); (3) `AppState::Playing` is the default state, so netplay gating is
+  live from the first frame; (4) 1.95 clippy: `is_multiple_of` over `%`,
+  `too_many_arguments` allow on the step systems (repo convention).
+  `TETRIS_NET_DELAY` desire flows through N2's negotiation; `reset_for_match`
+  re-clamps defensively. Gates: fmt, clippy `-D`, `cargo test --workspace`
+  (189 app + 136 core + 6 integration).
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/lockstep.rs`
+  (new — state machine, `NetOut` seam, systems, teardown contract, tests),
+  `crates/tetris-app/src/core_bridge/net/mod.rs` (`mod lockstep;`),
+  `crates/tetris-app/src/core_bridge/net/session.rs` (`apply` → `pub(crate)`,
+  `NetLockstepPlugin` mount, `net_stop` independent-removal fix),
+  `crates/tetris-app/Cargo.toml` (+`Cargo.lock`) (proptest dev-dep),
+  `netplay-plan.md` (this entry)
 
 ### N4: Versus bridge + input integration (`Controller::Net`)
 - **depends_on**: [N3]
