@@ -334,7 +334,7 @@ pub fn end_net_match(world: &mut World) {
 /// the host drives its own starts through [`start_net_match`], never a parked
 /// `pending_start` (which also shields the host from a hostile mid-match
 /// `MatchStart`).
-fn guest_pending_start_system(world: &mut World) {
+pub(crate) fn guest_pending_start_system(world: &mut World) {
     let Some(session) = world.get_resource::<NetSession>() else {
         return;
     };
@@ -346,8 +346,19 @@ fn guest_pending_start_system(world: &mut World) {
     let Some((seed, rule, delay)) = parked else {
         return;
     };
+    // Reliable delivery put this start ahead of the new match's batches;
+    // any that were already drained into `staged_batches` belong to the
+    // mirror about to be built. `setup_net_mirror` resets the lockstep
+    // (which clears the staging area), so capture them first and re-queue
+    // them behind the rebuild — dropping them would stall the fresh mirror
+    // at tick 0 (the N7 soak finding; the drain itself is regression-tested
+    // in `harness.rs`).
+    let staged = std::mem::take(&mut world.resource_mut::<NetLockstep>().staged_batches);
     let local_side = lockstep::local_side(role);
     setup_net_mirror(world, seed, rule, delay, local_side);
+    if !staged.is_empty() {
+        world.resource_mut::<NetLockstep>().batch_buffer = staged;
+    }
     info!("net: guest mirror (re)built from MatchStart seed {seed} rule {rule:?} delay {delay}");
 }
 

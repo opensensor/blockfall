@@ -55,18 +55,26 @@ jobs:
         run: cargo build --workspace
 
   nightly-soak:
-    name: Nightly soak (tetris-core, --ignored)
+    name: Nightly soak (--ignored)
     runs-on: ubuntu-latest
     # Only fires on the nightly schedule or manual dispatch, never on push/PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    # T9's wall-clock soak test (1 h crash-free run) plus headroom.
-    timeout-minutes: 75
+    # T9's wall-clock soak test (1 h crash-free run) plus N7's 20-match
+    # netplay soak, plus headroom.
+    timeout-minutes: 95
     steps:
       - uses: actions/checkout@v4
+
+      # Needed to compile the tetris-app soak (Bevy headlessly).
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Release soak
+      - name: Release soak (core)
         run: cargo test --release -p tetris-core -- --ignored
+
+      - name: Release soak (app netplay: 20 matches over loopback UDP)
+        run: cargo test --release -p tetris-app -- --ignored

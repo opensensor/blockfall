@@ -73,8 +73,12 @@
 //! `Bye` becomes `NetEvent::ByeReceived` + the FSM `Bye` trigger (`Lost`) +
 //! the freeze below. A `MatchStart` arriving mid-match (N4's rematch) is
 //! parked in [`NetLockstep::pending_start`] for N4 to consume — N3 never
-//! rebuilds a mirror. Connection loss itself stays N2's job (its Update
-//! systems keep running and flip `Lost`).
+//! rebuilds a mirror — and any `TickBatch`es already queued behind it
+//! belong to the NEW match: while a start is pending they are staged in
+//! [`NetLockstep::staged_batches`] (not dropped, not applied to the dying
+//! mirror) and adopted by N4's `guest_pending_start_system` together with
+//! the rebuild. Connection loss itself stays N2's job (its Update systems
+//! keep running and flip `Lost`).
 //!
 //! # Gates (the freeze mechanism)
 //!
@@ -294,6 +298,18 @@ pub struct NetLockstep {
     /// state stays within ~`D`; a network stall parks the reliable backlog
     /// here until the guest catches up one tick per step.
     pub batch_buffer: VecDeque<(u64, Vec<Action>, Vec<Action>)>,
+    /// Guest only: `TickBatch`es the reliable stream delivered **behind** a
+    /// parked [`Self::pending_start`] (a rematch `MatchStart` rides the same
+    /// ReliableOrdered channel as the new match's batches, and the mirror
+    /// rebuild that resets `tick` to 0 is deferred to
+    /// `guest_pending_start_system` on `Update`). Ordered delivery makes
+    /// every one of them a batch of the **new** mirror; running the
+    /// old-tick staleness check on them would discard batch 0 — renet
+    /// consumes reliable messages *on read*, and the fresh mirror would
+    /// stall at tick 0 forever (the N7 soak finding; regression test
+    /// `rematch_matchstart_does_not_swallow_the_new_match_tickbatches`).
+    /// Adopted into [`Self::batch_buffer`] by the rebuild.
+    pub staged_batches: VecDeque<(u64, Vec<Action>, Vec<Action>)>,
     /// A `MatchStart` received while a match was live (N4's rematch
     /// request): parked for N4 to tear the mirror down and `reset_for_match`
     /// with the new seed/rule/delay. Consumed by taking it.
@@ -318,6 +334,7 @@ impl Default for NetLockstep {
             pending_inputs: Default::default(),
             remote_inputs: VecDeque::new(),
             batch_buffer: VecDeque::new(),
+            staged_batches: VecDeque::new(),
             pending_start: None,
             dropped_late_inputs: 0,
             stall_steps: 0,
@@ -338,6 +355,7 @@ impl NetLockstep {
         self.pending_inputs = Default::default();
         self.remote_inputs.clear();
         self.batch_buffer.clear();
+        self.staged_batches.clear();
         self.pending_start = None;
         self.dropped_late_inputs = 0;
         self.stall_steps = 0;
@@ -390,6 +408,21 @@ impl NetLockstep {
                     // meaningful to a mirror.
                     return None;
                 }
+                if self.pending_start.is_some() {
+                    // A rematch `MatchStart` is parked from this same
+                    // reliable stream and the mirror rebuild has not run
+                    // yet: this batch belongs to the NEW mirror, whose
+                    // clock restarts at 0 — the current `tick` is the old
+                    // mirror's high-water mark, so the staleness check
+                    // below would silently discard batch 0 (renet consumes
+                    // reliable messages on read → the fresh mirror stalls
+                    // at tick 0 forever; the N7 soak finding). Stage it for
+                    // the rebuild ([`Self::staged_batches`]).
+                    if !self.staged_batches.iter().any(|(b, _, _)| *b == tick) {
+                        self.staged_batches.push_back((tick, left, right));
+                    }
+                    return None;
+                }
                 if tick < self.tick {
                     debug!("net lockstep: ignoring stale batch for tick {tick}");
                 } else {
@@ -419,6 +452,11 @@ impl NetLockstep {
                 rule,
                 match_delay,
             } => {
+                // A fresh start supersedes anything staged for a previously
+                // parked one (batches arriving from here on belong to the
+                // mirror this `MatchStart` describes — see the staged arm in
+                // the `TickBatch` branch).
+                self.staged_batches.clear();
                 self.pending_start = Some((seed, rule, match_delay));
                 None
             }
@@ -1787,7 +1825,17 @@ mod tests {
     // ---- thin real-transport smoke (loopback UDP, N6 owns E2E) ----------
 
     fn transport_app(seed: u64, rule: AttackRule) -> App {
-        coreless_app(seed, rule)
+        let mut app = coreless_app(seed, rule);
+        // The thin mirror must carry the production pending-`MatchStart`
+        // consumer: since N7 a parked start stages the NEW match's
+        // `TickBatch`es until `guest_pending_start_system` adopts them with
+        // the mirror rebuild (the full harness wires it via the versus
+        // bridge; without it these staged batches would never run).
+        app.add_systems(
+            bevy::app::Update,
+            crate::core_bridge::versus::guest_pending_start_system,
+        );
+        app
     }
 
     #[test]

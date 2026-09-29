@@ -311,4 +311,218 @@ mod tests {
             }
         }
     }
+
+    // ---- N7: byte-fuzz over `decode` (netplay-plan.md robustness audit) ---
+    //
+    // Host robustness on hostile bytes: v1 netcode auth is `Unsecure`, so
+    // anyone reaching the UDP port with the right `PROTOCOL_ID` completes the
+    // transport handshake and lands arbitrary payloads on the reliable
+    // channels — every one of them flows through `decode`. The contract:
+    //   * `decode` never panics, on any input (nor does `encode` of whatever
+    //     it accepts),
+    //   * every outcome is `Ok(msg)` **or** `Err(ProtocolError)` — nothing
+    //     else exists in the signature, so a panic is the only way to fall
+    //     over,
+    //   * anything accepted round-trips byte-identically: the fixint +
+    //     strict codec has exactly one encoding per value, so there are no
+    //     non-canonical shapes to mis-read (malleability would survive even
+    //     a panic-free decode, and this catches it).
+    //
+    // Generation is structured, not just noise: valid encodings of *every*
+    // `NetMsg` variant (arbitrary field values) are truncated at arbitrary
+    // points, byte-flipped 1..3 times, and extended with random tails —
+    // plus pure random buffers. All hostile shapes target exactly the
+    // places bincode can go wrong: variant discriminants, fixint sequence
+    // lengths (`Vec<Action>`/`String`), UTF-8 boundaries, trailing bytes.
+    //
+    // 10k cases with a low shrink budget keeps this inside the normal
+    // `cargo test` run (the whole suite runs it every push).
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    const ALL_ACTIONS: [Action; 8] = [
+        Action::MoveLeft,
+        Action::MoveRight,
+        Action::SoftDrop,
+        Action::HardDrop,
+        Action::RotateCw,
+        Action::RotateCcw,
+        Action::Rotate180,
+        Action::Hold,
+    ];
+
+    fn fuzz_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 10_000,
+            max_shrink_iters: 32,
+            ..Default::default()
+        }
+    }
+
+    /// A [`NetMsg`] of any variant with arbitrary field values — the base
+    /// for both the round-trip property and the mutation arms below.
+    fn net_msg_strategy() -> impl Strategy<Value = NetMsg> {
+        let version = ".{0,24}";
+        let actions = prop::collection::vec(select(&ALL_ACTIONS), 0..24);
+        let sides = select(vec![Side::Left, Side::Right]);
+        prop_oneof![
+            (version, any::<u8>()).prop_map(|(version, delay)| NetMsg::Hello { version, delay }),
+            (any::<u64>(), any::<u8>(), 0u32..2).prop_map(|(seed, match_delay, rule_idx)| {
+                let rule = if rule_idx == 0 {
+                    AttackRule::Garbage
+                } else {
+                    AttackRule::Race {
+                        target_lines: u32::MAX >> (rule_idx * 4),
+                    }
+                };
+                NetMsg::MatchStart {
+                    seed,
+                    rule,
+                    match_delay,
+                }
+            }),
+            (any::<u64>(), actions.clone())
+                .prop_map(|(tick, actions)| NetMsg::TickInput { tick, actions }),
+            (any::<u64>(), actions.clone(), actions.clone())
+                .prop_map(|(tick, left, right)| NetMsg::TickBatch { tick, left, right }),
+            (sides, any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(side, tick, left, right)| NetMsg::SnapshotHash {
+                    side,
+                    tick,
+                    left,
+                    right,
+                }
+            ),
+            Just(NetMsg::Bye),
+        ]
+    }
+
+    /// Deterministic hostile-shape bases: encodings of every variant (the
+    /// shared round-trip fixtures plus minimal shapes) for the exhaustive
+    /// truncation walk and the fixed-base mutation arm.
+    fn variant_table_bases() -> Vec<Vec<u8>> {
+        let mut v = roundtrip_cases();
+        v.extend([
+            NetMsg::MatchStart {
+                seed: 0,
+                rule: AttackRule::Garbage,
+                match_delay: 0,
+            },
+            NetMsg::TickInput {
+                tick: 0,
+                actions: vec![Action::HardDrop],
+            },
+        ]);
+        v.iter().map(encode).collect()
+    }
+
+    /// One mutation sequence over a valid base: truncate, flip 0..=3 bytes,
+    /// append 0..=16 random bytes.
+    fn mutate(base: Vec<u8>, cut: usize, flips: Vec<(usize, u8)>, tail: Vec<u8>) -> Vec<u8> {
+        let mut bytes = base[..cut.min(base.len())].to_vec();
+        for (index, value) in flips {
+            if !bytes.is_empty() {
+                let at = index % bytes.len();
+                bytes[at] = value;
+            }
+        }
+        bytes.extend_from_slice(&tail);
+        bytes
+    }
+
+    /// The hostile-byte strategy: pure random buffers, plus structured
+    /// mutations (truncate / flip / append-garbage) of valid encodings —
+    /// bases sampled either from the fixed variant table or freshly
+    /// generated messages.
+    fn hostile_bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
+        let bases = std::sync::Arc::new(variant_table_bases());
+        let fixed_base = {
+            let bases = std::sync::Arc::clone(&bases);
+            (0usize..bases.len()).prop_map(move |i| bases[i].clone())
+        };
+        let valid_base = net_msg_strategy().prop_map(|msg| encode(&msg));
+        let mutated = (
+            prop_oneof![fixed_base, valid_base],
+            any::<usize>(),
+            prop::collection::vec((any::<usize>(), any::<u8>()), 0..3),
+            prop::collection::vec(any::<u8>(), 0..16),
+        )
+            .prop_map(|(base, cut, flips, tail)| mutate(base, cut, flips, tail));
+        prop_oneof![
+            // Pure noise: empty buffers up to a plausible MTU+.
+            prop::collection::vec(any::<u8>(), 0..140),
+            // Structured: mutations of valid encodings.
+            mutated,
+        ]
+    }
+
+    /// Compact hex rendering for failure messages.
+    fn hex(bytes: &[u8]) -> String {
+        let mut s = String::new();
+        for b in bytes.iter().take(64) {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Oracle shared by the fuzz properties: `decode` never panics, and
+    /// every accepted buffer re-encodes byte-identically (the strict codec
+    /// has exactly one canonical encoding per value, so anything else is a
+    /// malleability bug). `Err(ProtocolError)` needs no further check —
+    /// it is the only non-Ok outcome the signature can even express.
+    fn assert_decode_is_robust(bytes: &[u8]) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(bytes)));
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => panic!("decode PANICKED on {}", hex(bytes)),
+        };
+        if let Ok(msg) = &outcome {
+            let re = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode(msg)))
+                .unwrap_or_else(|_| panic!("encode panicked for {msg:?}"));
+            assert_eq!(
+                re,
+                bytes,
+                "{msg:?} accepted from non-canonical bytes {}",
+                hex(bytes)
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(fuzz_config())]
+
+        /// 10k hostile-byte cases: `decode` returns (`Ok` or
+        /// `Err(ProtocolError)`) and never falls over; accepted buffers are
+        /// exactly the canonical encodings.
+        #[test]
+        fn fuzz_decode_never_panics(ref bytes in hostile_bytes_strategy()) {
+            assert_decode_is_robust(bytes);
+        }
+
+        /// 10k generated messages: the valid space round-trips exactly, so
+        /// the fuzz's rejection behaviour can never hide a codec that just
+        /// rejects everything.
+        #[test]
+        fn fuzz_roundtrip_any_msg(msg in net_msg_strategy()) {
+            let bytes = encode(&msg);
+            let decoded =
+                decode(&bytes).unwrap_or_else(|e| panic!("roundtrip failed for {msg:?}: {e}"));
+            assert_eq!(decoded, msg);
+            assert_eq!(encode(&decoded), bytes);
+        }
+    }
+
+    /// Deterministic backstop for the truncation arm (proptest only samples
+    /// bases per case; this walks *every* prefix of *every* variant
+    /// encoding — bare and with a garbage tail — under the same oracle).
+    #[test]
+    fn fuzz_variant_truncations_exhaustive() {
+        for base in variant_table_bases() {
+            for cut in 0..=base.len() {
+                assert_decode_is_robust(&base[..cut]);
+                assert_decode_is_robust(&[base[..cut].to_vec(), vec![0xAA, 0xFF]].concat());
+            }
+        }
+    }
 }

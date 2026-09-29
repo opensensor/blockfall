@@ -489,11 +489,12 @@ mod tests {
         net_lockstep_guest_system, net_lockstep_host_system, NetLockstep, HASH_CHECK_PERIOD,
     };
     use crate::core_bridge::net::protocol;
-    use crate::core_bridge::CoreBridgePlugin;
+    use crate::core_bridge::{CoreBridgePlugin, VersusEvent};
+    use crate::input::VersusActions;
     use crate::state::{RebindingCapture, Settings};
     use bevy::time::Virtual;
     use std::net::{Ipv4Addr, UdpSocket};
-    use tetris_core::versus::MatchSnapshot;
+    use tetris_core::versus::{MatchEvent, MatchSnapshot, MAX_GARBAGE_PER_LAND};
 
     // ---- pure parsing (never touches the environment) ---------------------
 
@@ -622,12 +623,24 @@ mod tests {
         lockstep: Option<Res<NetLockstep>>,
         mut stream: ResMut<HashStream>,
         mut last: Local<u64>,
+        mut last_seed: Local<Option<u64>>,
     ) {
         let (Some(session), Some(versus), Some(lockstep)) = (session, versus, lockstep) else {
             return;
         };
         if session.status != NetStatus::InMatch || !versus.active {
             return;
+        }
+        if *last_seed != Some(versus.seed) {
+            // A mirror (re)build — start the per-match stream fresh. In the
+            // multi-match soak this also drops the one boundary a lagging
+            // peer can still record from the OLD mirror (it ticks once more
+            // before its rebuild lands), so the stream is per-match and
+            // strictly increasing on both sides. The single-match E2Es
+            // never change seed, so this never fires for them.
+            *last_seed = Some(versus.seed);
+            stream.0.clear();
+            *last = 0;
         }
         let tick = lockstep.tick;
         if tick > 0 && tick != *last && tick.is_multiple_of(HASH_CHECK_PERIOD) {
@@ -1042,5 +1055,545 @@ mod tests {
 
         net_stop(host.world_mut());
         net_stop(guest.world_mut());
+    }
+
+    /// Regression (N7 soak finding — production rematch stall): a rematch
+    /// `MatchStart` is parked by the lockstep's own InMatch drain, and the
+    /// reliable channel delivers the NEW match's `TickBatch`es behind it in
+    /// the same window. Pre-fix, those batches hit the old mirror's
+    /// staleness check (`tick < self.tick`, renet consumes reliable
+    /// messages on read) and batch 0 was gone forever — the freshly rebuilt
+    /// mirror stalled at tick 0 forever (the 20-match soak reproduced it
+    /// at match 2: guest tick 0, stalls 214 922, host tick 214 909). The
+    /// fix stages batches that arrive behind a parked `pending_start` and
+    /// `guest_pending_start_system` adopts them with the rebuild.
+    ///
+    /// Deterministic window, same trick as the N6 transition-frame test:
+    /// start the rematch while the guest is never `update()`d, so
+    /// `MatchStart` and a pile of new-match batches sit in its socket and
+    /// land in one poll.
+    #[test]
+    fn rematch_matchstart_does_not_swallow_the_new_match_tickbatches() {
+        let (mut host, mut guest) = connect_pair(12.0);
+        let seed1 = 0xE2E5_E2E0_0000_0004;
+        host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
+        start_net_match_live(&mut host, AttackRule::Garbage, seed1, 4);
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "guest mirror active (match 1)",
+            |_, g| {
+                session_status(g) == NetStatus::InMatch
+                    && g.world().non_send::<VersusMatch>().active
+            },
+        );
+        // Tick the first match a bit so the guest mirror's lockstep tick is
+        // far above the rematch's batch 0 (that gap is what pre-fix made
+        // the new batches look "stale").
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "match 1 ticks past 20",
+            |h, g| lockstep_tick(h) > 20 && lockstep_tick(g) > 20,
+        );
+
+        // Rematch while the guest is frozen: `MatchStart` plus the host's
+        // first new-match batches pile up unread.
+        let seed2 = 0xE2E5_E2E0_0000_0005;
+        start_net_match(
+            host.world_mut(),
+            AttackRule::Race {
+                target_lines: DEFAULT_RACE_LINES,
+            },
+            Side::Left,
+            seed2,
+            4,
+        );
+        for _ in 0..40 {
+            host.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let queued = lockstep_tick(&host);
+        assert!(
+            queued >= 3,
+            "host must have produced new-match batches 0..{queued} while the guest was frozen"
+        );
+
+        // One poll delivers the whole backlog; the rebuild then adopts the
+        // parked start *and* the staged batches. Pre-fix: batch 0 lost,
+        // guest stuck at tick 0 with `stall_steps` climbing.
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "rematch guest ticks past 0",
+            |_, g| {
+                let versus = g.world().non_send::<VersusMatch>();
+                versus.active && versus.seed == seed2 && lockstep_tick(g) > 0
+            },
+        );
+
+        // And it executed *every* queued batch in order: freeze the host,
+        // let the guest replay, the rebuilt mirrors must be
+        // snapshot-identical at the host's tick.
+        let host_tick = lockstep_tick(&host);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while lockstep_tick(&guest) < host_tick {
+            guest.update();
+            assert!(
+                Instant::now() < deadline,
+                "guest never replayed the rematch backlog: tick {}/{}",
+                lockstep_tick(&guest),
+                host_tick,
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            versus_snapshot(&host),
+            versus_snapshot(&guest),
+            "guest must have applied every rematch batch identically"
+        );
+
+        net_stop(host.world_mut());
+        net_stop(guest.world_mut());
+    }
+
+    // =========================================================================
+    // N7 — 20-match netplay soak (netplay-plan.md N7a).
+    //
+    // Chains [`SOAK_MATCHES`] matches over **one** connected pair on real
+    // UDP loopback: alternating Garbage / Race-to-40, a wide seed sweep,
+    // and rematches flowing through the wire `MatchStart` (N4's production
+    // rematch path — no CI test exercised it before this; the desktop
+    // harness's single rematch was the only live coverage). Per match the
+    // independently recorded per-60-tick hash streams are compared on
+    // every shared tick label (the same quantities the wire desync check
+    // exchanges), the final snapshots are compared, every drained
+    // `NetEvent` must be benign, and the host mirror's `GarbageSent`/
+    // `GarbageReceived` stream is tallied as load evidence for the
+    // `MAX_GARBAGE_PER_LAND` churn dimension.
+    //
+    // The Garbage matches carry the garbage-storm churn; the Race matches
+    // run to 40 lines — many thousands of lockstep ticks — which is the
+    // very-long / sustained-load dimension. (The Race rule is garbage-free
+    // by construction: versus.rs `settle` only lands garbage when
+    // `rule == AttackRule::Garbage`, so "churn" and "Race-to-40" are
+    // deliberately separate match shapes, both inside the 20.)
+    //
+    // `#[ignore]`d for the nightly job like `crates/tetris-core/tests/soak.rs`:
+    // `cargo test -p tetris-app --release -- net::harness --ignored`.
+    // =========================================================================
+
+    /// Matches the soak chains through one connection.
+    const SOAK_MATCHES: usize = 20;
+
+    /// Input delay for every soak match (mid of the negotiated range).
+    const SOAK_DELAY: u8 = 4;
+
+    /// Virtual fixed-step speed: stepping runs 24× wall clock while
+    /// `Time<Real>` (netcode timing, watchdogs) stays real — see
+    /// [`peer_app`].
+    const SOAK_SPEED: f64 = 24.0;
+
+    /// Host: a live match without crowning for this long fails the soak
+    /// (generous: the 40-line Races run many thousands of ticks).
+    const SOAK_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Match `i`'s rule: even = Garbage (garbage-storm churn), odd = Race
+    /// to 40 (the very long run).
+    fn soak_rule(i: usize) -> AttackRule {
+        if i.is_multiple_of(2) {
+            AttackRule::Garbage
+        } else {
+            AttackRule::Race {
+                target_lines: DEFAULT_RACE_LINES,
+            }
+        }
+    }
+
+    /// Match `i`'s seed: a rotated-and-mixed sweep, deliberately far from
+    /// the CI E2E seeds.
+    fn soak_seed(i: usize) -> u64 {
+        0x9E37_79B9_7F4A_7C15u64
+            .rotate_left((((i as u64) * 7) % 64) as u32)
+            .wrapping_mul(0x5851_F35C_F137_2235 ^ (i as u64))
+    }
+
+    /// Per-match garbage load tallies (host mirror's event stream): rows
+    /// sent, rows landed, land events, and how many landings hit the
+    /// [`MAX_GARBAGE_PER_LAND`] cap. `locks`/`clears` sanity-check the
+    /// event pipeline itself (locks always > 0 in a played match).
+    #[derive(Default, Clone, Copy, Debug)]
+    struct SoakChurn {
+        locks: u64,
+        clears: u64,
+        sent_rows: u64,
+        landed_rows: u64,
+        landed_events: u64,
+        cap_hits: u64,
+    }
+
+    struct SoakMatchResult {
+        rule: AttackRule,
+        seed: u64,
+        /// Lockstep ticks at crowning (the host clock; the guest mirrors it).
+        ticks: u64,
+        winner: Option<Side>,
+        /// Shared per-60-tick hash labels compared for this match.
+        shared_boundaries: usize,
+        churn: SoakChurn,
+        wall: Duration,
+    }
+
+    /// Drain both apps' `NetEvent`s (mid-soak every event except a
+    /// spurious `PeerConnected` is fatal) and tally garbage churn from the
+    /// host mirror's `VersusEvent` stream (both mirrors emit the same
+    /// stream — counting one avoids doubling).
+    fn soak_collect(h: &mut App, g: &mut App, failures: &mut Vec<NetEvent>, churn: &mut SoakChurn) {
+        for event in drain_events(h).into_iter().chain(drain_events(g)) {
+            match event {
+                NetEvent::PeerConnected => {}
+                other => failures.push(other),
+            }
+        }
+        let drained: Vec<MatchEvent> = h
+            .world_mut()
+            .resource_mut::<Messages<VersusEvent>>()
+            .drain()
+            .map(|event| event.0)
+            .collect();
+        for event in drained {
+            match event {
+                MatchEvent::PieceLocked { lines, .. } => {
+                    churn.locks += 1;
+                    if lines > 0 {
+                        churn.clears += u64::from(lines);
+                    }
+                }
+                MatchEvent::GarbageSent { lines, .. } => churn.sent_rows += u64::from(lines),
+                MatchEvent::GarbageReceived { lines, .. } => {
+                    churn.landed_rows += u64::from(lines);
+                    churn.landed_events += 1;
+                    if lines >= MAX_GARBAGE_PER_LAND {
+                        churn.cap_hits += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// One soak match end to end, asserted per the header comment. Crowning
+    /// detection keys on the **wire seed landing on the guest mirror** so a
+    /// stale winner from the previous match can never satisfy the wait.
+    fn soak_one_match(host: &mut App, guest: &mut App, index: usize) -> SoakMatchResult {
+        let rule = soak_rule(index);
+        let seed = soak_seed(index);
+        let started = Instant::now();
+        let mut failures: Vec<NetEvent> = Vec::new();
+        let mut churn = SoakChurn::default();
+
+        let require_clean = |failures: &Vec<NetEvent>, label: &str| {
+            assert!(
+                failures.is_empty(),
+                "soak match {index} ({rule:?} seed {seed:#016x}) {label} saw fatal NetEvents: {failures:?}"
+            );
+        };
+
+        // Start live — the guest mirrors purely from the wire `MatchStart`
+        // (the production rematch path from match 2 on). Seats stay `Human`
+        // (the production net shape); the [`soak_player_system`] registered
+        // by the soak drives them through the real queued-action path.
+        start_net_match_live(host, rule, seed, SOAK_DELAY);
+
+        drive_until(
+            host,
+            guest,
+            Duration::from_secs(60),
+            "guest mirror (re)built from the wire MatchStart",
+            |h, g| {
+                soak_collect(h, g, &mut failures, &mut churn);
+                let versus = g.world().non_send::<VersusMatch>();
+                session_status(g) == NetStatus::InMatch && versus.active && versus.seed == seed
+            },
+        );
+        require_clean(&failures, "mirror build");
+
+        drive_until(
+            host,
+            guest,
+            SOAK_STALL_TIMEOUT,
+            "soak crowned winner",
+            |h, g| {
+                soak_collect(h, g, &mut failures, &mut churn);
+                crowned(h).is_some() && crowned(g).is_some()
+            },
+        );
+        require_clean(&failures, "play");
+        let ticks = lockstep_tick(host);
+        assert!(
+            ticks > 60,
+            "soak match {index} ({rule:?} seed {seed:#016x}) crowned before a full hash period (tick {ticks})"
+        );
+        let winner = crowned(host);
+        assert_eq!(
+            winner,
+            crowned(guest),
+            "soak match {index}: peers crowned different winners"
+        );
+        let snapshot = versus_snapshot(guest);
+        match rule {
+            AttackRule::Garbage => {
+                let dead = match winner {
+                    Some(Side::Left) => snapshot.right.game_over,
+                    _ => snapshot.left.game_over,
+                };
+                assert!(
+                    dead,
+                    "soak match {index}: Garbage winner without a topped-out loser"
+                );
+            }
+            AttackRule::Race { .. } => {
+                // Legal Race endings: both sides reach the target (score
+                // decides), or one side tops out before that (core `settle`
+                // crowns on top-out under any rule).
+                let dead = match winner {
+                    Some(Side::Left) => snapshot.right.game_over,
+                    _ => snapshot.left.game_over,
+                };
+                assert!(
+                    (snapshot.finished.0 && snapshot.finished.1) || dead,
+                    "soak match {index}: Race crowned with no finish and no top-out: {:?}",
+                    snapshot.finished
+                );
+            }
+        }
+        // The scripted players actually played (event pipeline sanity).
+        assert!(
+            churn.locks >= 10,
+            "soak match {index} ({rule:?} seed {seed:#016x}) crowned after only {} locks — scripted play degenerate",
+            churn.locks
+        );
+
+        // Let at least one per-60-tick boundary land, compare every shared
+        // label, then reset the streams for the next match.
+        drive_until(
+            host,
+            guest,
+            Duration::from_secs(30),
+            "soak hash boundaries recorded",
+            |h, g| {
+                soak_collect(h, g, &mut failures, &mut churn);
+                !stream(h).is_empty() && !stream(g).is_empty()
+            },
+        );
+        require_clean(&failures, "hash tail");
+        let (hs, gs) = (stream(host), stream(guest));
+        assert!(
+            hs.windows(2).all(|w| w[0].0 < w[1].0),
+            "soak match {index}: host stream tick labels not strictly increasing: {hs:?}"
+        );
+        assert!(
+            gs.windows(2).all(|w| w[0].0 < w[1].0),
+            "soak match {index}: guest stream tick labels not strictly increasing: {gs:?}"
+        );
+        let mut shared_boundaries = 0usize;
+        for (tick, ours) in &hs {
+            if let Some((_, theirs)) = gs.iter().find(|(t, _)| t == tick) {
+                assert_eq!(
+                    ours, theirs,
+                    "soak match {index} ({rule:?} seed {seed:#016x}): per-{HASH_CHECK_PERIOD}-tick SnapshotHash streams diverge at tick {tick}"
+                );
+                shared_boundaries += 1;
+            }
+        }
+        assert!(
+            shared_boundaries >= 1,
+            "soak match {index}: no shared hash boundary between host {hs:?} and guest {gs:?}"
+        );
+        assert_eq!(
+            versus_snapshot(host),
+            versus_snapshot(guest),
+            "soak match {index} ({rule:?} seed {seed:#016x}): final snapshots diverged"
+        );
+        // Per-match stream reset is owned by `record_boundary_hashes`
+        // (seed-keyed), so a lagging peer's last old-match boundary can
+        // never leak into the next match's stream.
+
+        SoakMatchResult {
+            rule,
+            seed,
+            ticks,
+            winner,
+            shared_boundaries,
+            churn,
+            wall: started.elapsed(),
+        }
+    }
+
+    /// Soak lock pacing: one scripted piece per side per this many ticks
+    /// (mirrors `BOT_LOCK_COOLDOWN_STEPS`, which the harness cannot use
+    /// with its own seats — see [`soak_player_system`]).
+    const SOAK_LOCK_COOLDOWN: u32 = 60;
+
+    /// The soak's player (test-only): drives the **local** seat of each
+    /// peer through the production queued-action path — actions land in
+    /// the seat's [`VersusActions`] and flow via `schedule_local` →
+    /// `TickInput`/`TickBatch` with the negotiated input delay, exactly
+    /// like a human's. Each piece is one queued burst (rotate → slide →
+    /// hard-drop) aiming at the production greedy solver
+    /// ([`bot_move`](crate::core_bridge::bot_move)), which clears lines —
+    /// so Garbage matches exchange real `MAX_GARBAGE_PER_LAND`-capped
+    /// garbage and Race matches reach 40 lines.
+    ///
+    /// Why not the `Controller::Bot` seats the N6 E2E uses: the bot plan
+    /// stepper assumes same-tick action application (the local bridge's
+    /// contract) and wedge-aborts into spawn hard-drops when actions land
+    /// `D` ticks late — in a net match its boards never clear and never
+    /// race. Production net matches never have Bot seats, so this is a
+    /// harness play-quality gap, not a netplay bug (audit-logged; the N6
+    /// E2E keeps Bot seats, which pin the wiring just fine).
+    #[derive(Resource, Default)]
+    struct SoakPlayer {
+        cooldown: u32,
+    }
+
+    fn soak_player_system(
+        mut player: ResMut<SoakPlayer>,
+        versus: Option<NonSend<VersusMatch>>,
+        session: Option<Res<NetSession>>,
+        mut actions: ResMut<VersusActions>,
+    ) {
+        if player.cooldown > 0 {
+            player.cooldown -= 1;
+            return;
+        }
+        let (Some(versus), Some(session)) = (versus, session) else {
+            return;
+        };
+        if !versus.active || session.status != NetStatus::InMatch {
+            return;
+        }
+        let side = local_side(session.role);
+        let snapshot = match side {
+            Side::Left => versus.match_.left.snapshot(),
+            Side::Right => versus.match_.right.snapshot(),
+        };
+        let Some(active) = snapshot.active else {
+            return;
+        };
+        let Some(mv) = crate::core_bridge::bot_move(&snapshot) else {
+            return;
+        };
+        let mut queued: Vec<Action> = Vec::new();
+        match (mv.rot as u32 + 4 - active.rot as u32) % 4 {
+            1 => queued.push(Action::RotateCw),
+            2 => queued.push(Action::Rotate180),
+            3 => queued.push(Action::RotateCcw),
+            _ => {}
+        }
+        for _ in 0..(mv.target_col - active.col).abs() {
+            queued.push(if mv.target_col > active.col {
+                Action::MoveRight
+            } else {
+                Action::MoveLeft
+            });
+        }
+        queued.push(Action::HardDrop);
+        if side == Side::Left {
+            actions.left.extend(queued);
+        } else {
+            actions.right.extend(queued);
+        }
+        player.cooldown = SOAK_LOCK_COOLDOWN;
+    }
+
+    /// Register the soak player on both peers (after the session is
+    /// connected; runs before the lockstep step systems so its actions are
+    /// drained by them in the same fixed step).
+    fn arm_soak_player(app: &mut App) {
+        app.init_resource::<SoakPlayer>();
+        app.add_systems(
+            FixedUpdate,
+            soak_player_system
+                .before(net_lockstep_host_system)
+                .before(net_lockstep_guest_system),
+        );
+    }
+
+    #[test]
+    #[ignore = "20-match netplay soak (netplay-plan.md N7); run: cargo test -p tetris-app --release -- net::harness --ignored"]
+    fn netplay_soak_20_matches() {
+        let (mut host, mut guest) = connect_pair(SOAK_SPEED);
+        arm_soak_player(&mut host);
+        arm_soak_player(&mut guest);
+        let mut results = Vec::with_capacity(SOAK_MATCHES);
+        for i in 0..SOAK_MATCHES {
+            let result = soak_one_match(&mut host, &mut guest, i);
+            println!(
+                "SOAK {i:02} {rule:?} seed={seed:#016x} ticks={ticks} winner={winner:?} \
+                 locks={locks} clears={clears} hashes={boundaries} sent={sent} \
+                 landed={landed}x{landed_events} cap_hits={cap_hits} wall={wall:?}",
+                rule = result.rule,
+                seed = result.seed,
+                ticks = result.ticks,
+                winner = result.winner,
+                locks = result.churn.locks,
+                clears = result.churn.clears,
+                boundaries = result.shared_boundaries,
+                sent = result.churn.sent_rows,
+                landed = result.churn.landed_rows,
+                landed_events = result.churn.landed_events,
+                cap_hits = result.churn.cap_hits,
+                wall = result.wall,
+            );
+            results.push(result);
+        }
+
+        let total_boundaries: usize = results.iter().map(|r| r.shared_boundaries).sum();
+        let total_ticks: u64 = results.iter().map(|r| r.ticks).sum();
+        let churn = results.iter().fold(SoakChurn::default(), |mut a, r| {
+            a.sent_rows += r.churn.sent_rows;
+            a.landed_rows += r.churn.landed_rows;
+            a.landed_events += r.churn.landed_events;
+            a.cap_hits += r.churn.cap_hits;
+            a.locks += r.churn.locks;
+            a.clears += r.churn.clears;
+            a
+        });
+        let race = results
+            .iter()
+            .filter(|r| matches!(r.rule, AttackRule::Race { .. }));
+        let longest_race = race.map(|r| r.ticks).max().unwrap_or(0);
+        println!(
+            "SOAK summary: {} matches, ticks={total_ticks}, hash boundaries compared={total_boundaries}, \
+             garbage sent={sent} landed={landed} in {landed_events} landings, MAX_GARBAGE_PER_LAND cap hits={cap_hits}, \
+             longest Race={longest_race} ticks",
+            results.len(),
+            sent = churn.sent_rows,
+            landed = churn.landed_rows,
+            landed_events = churn.landed_events,
+            cap_hits = churn.cap_hits,
+        );
+        assert!(
+            total_boundaries >= 40,
+            "soak compared too few hash boundaries to count: {total_boundaries}"
+        );
+        assert!(
+            longest_race >= 1000,
+            "Race matches were not the very long runs the soak exists for: {longest_race}"
+        );
+        // Garbage matches must be an actual garbage storm, not a stall.
+        assert!(
+            churn.sent_rows >= 100 && churn.landed_rows >= 100,
+            "soak exchanged too little garbage to count: {churn:?}"
+        );
+
+        net_stop(host.world_mut());
+        net_stop(guest.world_mut());
+        assert_eq!(session_status(&host), NetStatus::Idle);
+        assert_eq!(session_status(&guest), NetStatus::Idle);
     }
 }
