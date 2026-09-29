@@ -15,6 +15,8 @@ path = "src/main.rs"
 tetris-core = { workspace = true }
 bevy = { workspace = true, features = ["serialize", "bevy_text", "default_font"] }
 bevy_kira_audio = { workspace = true }
+bevy_renet = { workspace = true }
+bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }

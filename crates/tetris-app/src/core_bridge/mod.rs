@@ -50,6 +50,8 @@ use crate::state::AppState;
 mod versus;
 pub use versus::*;
 
+mod net;
+
 /// Env var overriding the run seed with a fixed `u64` (T14: reproducible
 /// marathons; applies at startup and on every restart).
 pub const SEED_ENV: &str = "TETRIS_SEED";
