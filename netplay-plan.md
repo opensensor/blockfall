@@ -736,9 +736,101 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
 - **validation**: 20-match soak green locally and on CI nightly
   (`--ignored`), zero hash divergence over all matches; 10k-case decode fuzz
   with no panic; audit conclusion written here.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  **(b) Decode fuzz — green, normal `cargo test`** (`protocol.rs` tests,
+  `cases = 10_000`): `fuzz_decode_never_panics` (pure-random ≤140 B blobs +
+  truncate/byte-flip/append mutations of valid encodings incl. fixed
+  variant-table bases), `fuzz_roundtrip_any_msg` (10k generated msgs, exact
+  roundtrip), `fuzz_variant_truncations_exhaustive` (deterministic every-
+  prefix × garbage-tail walk). Oracles: decode never panics, failure modes
+  are `ProtocolError` only, and every accepted buffer re-encodes
+  canonically (`encode(decode(b)) == b`) — the wire can never carry
+  non-canonical forms of what the host then trusts. Separate bincode-1.3
+  probe: huge `Vec`/`String` length prefixes `Err` element-wise (no
+  pre-alloc, no OOM abort). ~0.05 s per 10k-case suite; config proven live
+  (env override to 100k → 0.47 s).
+
+  **(a) Soak** — `netplay_soak_20_matches` (`#[ignore]`,
+  `core_bridge/net/harness.rs`): 20 matches over **one** connected pair on
+  real UDP loopback at 24× virtual speed, alternating Garbage / Race-to-40
+  (`DEFAULT_RACE_LINES`), rotated-mix seed sweep, rematches through the wire
+  `MatchStart` (production path, first-ever automated coverage), per-60-tick
+  `SnapshotHash` streams recorded independently of the wire check and
+  compared on every shared tick label + final snapshot equality + all drained
+  `NetEvent`s benign. Results (this session): debug 57.7 s —
+  `ticks=83014, hash boundaries compared=1371, garbage sent=248 landed=239 in
+  136 landings, MAX_GARBAGE_PER_LAND cap hits=12, longest Race=10608`; debug
+  rerun after final tweaks 74.7 s — `ticks=107455, boundaries=1779,
+  sent=239 landed=233, cap hits=6, longest Race=13002`; **release**
+  `cargo test --release -p tetris-app -- --ignored` 51.2 s — 20/20, **zero
+  hash divergences**. Nightly rides CI (`nightly-soak` job got system-deps
+  install + `cargo test --release -p tetris-app -- --ignored` step; timeout
+  75→95 min). Manual one-liner:
+  `cargo test -p tetris-app --release -- core_bridge::net::harness::tests::netplay_soak_20_matches -- --ignored --exact --nocapture`.
+
+  *Soak driver decision*: pure `Controller::Bot` seats cannot supply the
+  churn/long-Race dimensions in a net match — the bot plan-stepper assumes
+  same-tick action application (local-bridge contract) and wedge-aborts into
+  spawn hard-drops when actions land `D` ticks late (measured: 0 line clears,
+  ~15 locks/match, garbage never sent; probe since removed). Production net
+  matches never have Bot seats → harness play-quality gap, NOT a netplay
+  bug; production untouched. The soak instead drives both seats with
+  `soak_player_system`: scripted `bot_move` bursts (rotate→slide→hard-drop)
+  pushed through the real `VersusActions` → `schedule_local` →
+  `TickInput`/`TickBatch` path with the negotiated delay — i.e. exactly the
+  human input path. The N6 E2Es keep Bot seats (wiring pins, untouched).
+  Legal-Race-ending assertion relaxed (core `settle` crowns on top-out under
+  any rule, not only 40-line finishes). Per-match hash streams are reset
+  seed-keyed inside the recorder so a one-frame-lagging peer's last
+  old-mirror boundary can't leak into the next match's stream.
+
+  *Production bug found + fixed (soak-proven)*: a mid-match `MatchStart`
+  (rematch) parked by the lockstep's InMatch drain **swallowed the new
+  match's already-queued `TickBatch`es** — the guest's old-mirror stale check
+  (`tick < self.tick`) discarded them while renet had already consumed them
+  from the reliable stream → guest stalled at tick 0 forever (soak run-1:
+  `host InMatch tick 214909, guest InMatch tick 0 stalls 214922`; only
+  reachable via a fast rematch — the desktop harness's single rematch raced
+  by luck). Fix: `NetLockstep::staged_batches` — batches arriving while a
+  start is pending are staged (deduped) and adopted into `batch_buffer` by
+  `guest_pending_start_system` together with the mirror rebuild
+  (`lockstep.rs`, `versus.rs`); regression test
+  `rematch_matchstart_does_not_swallow_the_new_match_tickbatches` (harness,
+  non-ignored; RED pre-fix: guest tick-0 stall; GREEN post-fix). The thin
+  real-transport lockstep test now registers the same production consumer
+  (it mirrors production's contract: a pending start always has one).
+
+  **(c) Unsecure-auth posture** (host never falls over; what v1 accepts):
+  fuzz guarantees hostile bytes can only yield `ProtocolError`/canonical
+  accepts — no panic, no OOM, no non-canonical state. Pre-handshake ignore
+  VERIFIED in code: while `Handshaking` the host drains the reliable
+  channel and processes `Hello` only — `session.rs:654`
+  (`debug!("net: ignoring {other:?} before handshake")`) — and the lockstep
+  host system is `InMatch`-gated, so pre-auth `MatchStart`/`TickInput`/
+  `SnapshotHash` cannot reach game state. Residual accepted risks (v1,
+  documented): (i) a connecting peer that stops at `Hello` can occupy the
+  host's single slot indefinitely (no host-side handshake timeout) —
+  self-DoS of the host's own lobby; (ii) post-handshake the peer is trusted:
+  false `SnapshotHash`es freeze the match via the desync path (both peers
+  freeze symmetrically — an announcement the honest side cannot ignore, but
+  no state fork), stale/queued `TickInput`s after a rematch simply fire
+  later in the new match, and host-authoritative input application means the
+  guest can only ever degrade its OWN mirror's consistency (host is the
+  clock; wrong guest inputs arrive as empty or shifted, never fork the host);
+  (iii) `Bye` + netcode-level disconnects remain available to an
+  authenticated peer — matches are explicitly short-lived open sessions
+  (README warning). No auth tokens in v1 by design (N2); these risks are the
+  documented price. Two-machine desktop `TETRIS_NET` soak: not run this
+  session — the N5 author sign-off checklist (LAN/internet feel) stays open.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/
+  harness.rs` (soak + soak player + regression test),
+  `crates/tetris-app/src/core_bridge/net/protocol.rs` (fuzz),
+  `crates/tetris-app/src/core_bridge/net/lockstep.rs` (production fix:
+  `staged_batches` + docs + thin-test wiring),
+  `crates/tetris-app/src/core_bridge/versus.rs` (production fix: staged
+  adoption in `guest_pending_start_system`), `.github/workflows/ci.yml`
+  (nightly app-soak step), this file.
 
 ### N8: Docs, PRD/README/CHANGELOG
 - **depends_on**: [N5, N6]
