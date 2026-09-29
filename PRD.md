@@ -9,8 +9,9 @@
 
 ## 1. Summary
 
-A fast, responsive, single-player falling-block puzzle game in the spirit of Tetris, built in
-Rust on the Bevy ECS game engine. The game targets desktop first (Linux/Windows/macOS), with a
+A fast, responsive falling-block puzzle game in the spirit of Tetris, built in
+Rust on the Bevy ECS game engine — single-player marathon plus 1v1 versus (local
+and online, netplay v0.1, §15). The game targets desktop first (Linux/Windows/macOS), with a
 Web (WASM) build as a stretch goal. Gameplay follows modern community-standard mechanics:
 SRS rotation, 7-bag randomizer, hold, ghost piece, lock delay, and soft/hard drop.
 
@@ -34,7 +35,11 @@ Bevy has no polished, idiomatic reference game of this genre. Building one produ
 
 ## 4. Non-Goals (v1)
 
-- Multiplayer (local or online).
+- ~~Multiplayer (local or online).~~ Superseded 2026-09-29: local versus
+  (T24–T26) and online 1v1 lockstep netplay (netplay-plan.md N1–N8) shipped as
+  netplay v0.1 — see §15. The multiplayer items that remain out of scope:
+  lobbies, relay/signaling and LAN discovery, rollback netcode, and session
+  tokens/invites.
 - Guideline "Adventure"/mission modes, 40-lines sprint, ultra mode timers.
 - Mobile/touch controls.
 - User accounts, leaderboards, telemetry, monetization.
@@ -193,7 +198,7 @@ Suggested ordering is strict: no milestone starts its polish before its acceptan
 | Bevy API churn across minors | Rework | Pin version; upgrade only at milestones; core is Bevy-free |
 | Input feel mistakes found late | Rework core API | Input schema decided in M1; core takes discrete actions with timestamps |
 | WASM perf with text/UI | Stretch slips | M6 explicitly last, non-blocking |
-| Scope creep (multiplayer) | Delay | §4 non-goals enforced |
+| Scope creep (multiplayer) | Delay | Netplay confined to the §15 v0.1 scope; lobby/relay/rollback stay post-v1 |
 
 ## 14. Open Questions
 
@@ -201,7 +206,15 @@ Suggested ordering is strict: no milestone starts its polish before its acceptan
 2. Include 180 rotation and hold UI animation in M2 or defer to M3?
 3. Sprint/40L mode as v1.1 quick win after M5?
 
-## 15. Future Extensions (post-v1)
+## 15. Versus (netplay v0.1) & Future Extensions
 
-Local two-player versus, online multiplayer (bevy networking), replays/watch, additional modes
-(sprint, ultra), skins, controller support, Steam packaging.
+**Implemented as netplay v0.1** (T24–T26 in tetris-plan.md + N1–N8 in netplay-plan.md):
+local two-player versus (shared keyboard, human or bot seats, Garbage/Race rules) and
+online 1v1 lockstep netplay — direct IP/port join over `bevy_renet`/netcode, delay-based
+input sync (D = max of the two peers' desires, default 8 ticks ≈ 133 ms), host-authoritative
+tick clock, snapshot-hash desync detection, version handshake. Unauthenticated netcode
+auth in v1; no pause in net matches (Esc = leave-with-confirm).
+
+**Post-v1:** lobbies, relay/signaling and LAN discovery, rollback netcode, session
+tokens/invites, replays/watch, additional modes (sprint, ultra), skins, controller
+support, Steam packaging.

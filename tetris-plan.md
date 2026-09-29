@@ -15,6 +15,10 @@ M1 tasks gate all app work; M2 slice gates M3/M4 polish.
 - M2 vertical slice **includes** 180° rotation and hold (both are core rules anyway).
 - CI is **local-only until M5** — no GitHub Actions until release hardening milestone.
 
+**Netplay v0.1 (2026-09-29):** T24–T26 in this plan plus N1–N8 of
+[netplay-plan.md](netplay-plan.md) together form **netplay v0.1** — the local versus
+core/bridge/on-screen stack here, extended to online 1v1 lockstep there.
+
 ## Prerequisites
 
 - Rust stable 1.95 (`rustup`; Bevy 0.19.1 MSRV is rustc 1.95.0 — bumped from 1.90 during T1),

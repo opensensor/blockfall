@@ -1,8 +1,10 @@
 # Blockfall
 
-A fast, modern single-player falling-block puzzle game built in Rust on the
+A fast, modern falling-block puzzle game built in Rust on the
 [Bevy](https://bevyengine.org) ECS engine (`tetris` was the working title — see
-[PRD.md](PRD.md) §14 #1 for the rename decision).
+[PRD.md](PRD.md) §14 #1 for the rename decision). Single-player marathon plus 1v1
+versus — local (shared keyboard, human or bot opponent) and online lockstep
+netplay (see [Playing online](#playing-online)).
 
 Gameplay follows modern community-standard mechanics: SRS rotation with wall
 kicks and T-spin detection, 7-bag randomizer, hold, ghost piece, lock delay,
@@ -25,6 +27,8 @@ greedy bot playing seeded runs.
 ## Features
 
 - **Arcade marathon mode** — levels, escalating gravity, guideline-style scoring
+- **1v1 versus** — local (shared keyboard, human or bot) and **online lockstep
+  netplay** over direct IP join, delay-based input sync (default ≈ 133 ms)
 - **Modern controls feel** — DAS/ARR, hard drop, lock delay, ghost piece, hold
 - **SRS rotation** with wall kicks, including basic T-spin detection
 - **7-bag randomizer** with seeded, reproducible runs (`TETRIS_SEED=<u64>`)
@@ -46,6 +50,40 @@ greedy bot playing seeded runs.
 | Rotate 180 | A |
 | Hold | C (Shift too) |
 | Pause | Esc / P |
+
+> **Versus & online matches.** The two seats use the fixed P1/P2 presets (not
+> the solo bindings above): host/left = P1 (WASD cluster), guest/right = P2
+> (arrows). There is **no pause in online matches** — Esc there opens a
+> leave-with-confirm instead.
+
+## Playing online
+
+From the title screen: **Online** → **Host** or **Join**. The host listens on
+UDP port **27015** (the Host screen shows it with an `ip:port` connect hint);
+the guest types `ip:port` at the Join screen
+(keyboard-only entry: digits, dots, colon — Bevy 0.19 has no clipboard paste).
+Both peers then run the identical deterministic match from a shared seed; inputs
+land with a negotiated delay D = max(host, guest), 8 ticks ≈ 133 ms by default
+(`TETRIS_NET_DELAY`). Host and guest both see both boards rendered locally —
+there is no video/state streaming, only inputs.
+
+- **NAT / port-forwarding.** Connections are direct IP. For play over the
+  internet the host must **port-forward UDP 27015** to their machine (and allow
+  it through any host firewall); the Host screen shows the host's LAN IPv4 when
+  one exists — over the internet, share your public IP instead. LAN play works
+  with no setup beyond the firewall.
+- **The port is open while listening.** v1 uses unauthenticated netcode
+  (protocol-ID check only): anyone who can reach the port with a matching
+  protocol version can join while you are listening. Keep sessions short and
+  press Esc on the Host screen (`net_stop`) when you are done.
+- **No matchmaking.** There is no lobby, relay, LAN discovery or session token
+  (all post-v1). A join failure (≈10 s timeout) reads "host offline or match
+  full" — netcode cannot tell the two apart with one seat.
+- **Mismatched builds** are refused by the version handshake — both sides need
+  the same game version.
+- Mid-match, Esc opens a confirm ("Leave match?"); leaving sends a graceful bye
+  so the opponent sees "opponent left". A desync freezes both boards and offers
+  a return to title.
 
 ## Build & run
 
@@ -81,6 +119,9 @@ package id intentionally stays `tetris-app`).
 | `TETRIS_BOT=1` | Greedy solver plays marathon (soak tests, captures) |
 | `TETRIS_CONFIG_DIR=<path>` | Override the settings/best-score directory |
 | `TETRIS_SHOT=<paths>` | Window screenshots via Bevy's built-in `Screenshot` pass: `a.png@90,b.png@1200` captures at the given `Update` frame numbers |
+| `TETRIS_NET=host:<port>` / `join:<ip:port>` | Desktop netplay harness: bot-vs-bot-across-the-wire (Garbage → Race), logs `NET match_done`/`final_hash`, exits 0 on matching hashes, 1 on desync/loss/stall |
+| `TETRIS_NET_DELAY=<2..=30>` | Desired input delay in ticks for online matches (default 8 ≈ 133 ms); both peers adopt `max(host, guest)` |
+| `TETRIS_NET_FORK=guest:<tick>` / `host:<tick>` | Test hook: fork the named peer's mirror at the given tick, proving desync detection fires |
 
 Example — capture a mid-game stack:
 
@@ -119,7 +160,8 @@ tetris/
 │       └── assets/           # sfx/, bgm_loop.wav, icon.png (+ generators)
 ├── assets/screenshots/       # README screenshots (TETRIS_SHOT captures)
 ├── PRD.md                    # product requirements
-└── tetris-plan.md            # task plan T0–T23
+├── netplay-plan.md           # netplay task plan N1–N8 (online 1v1)
+└── tetris-plan.md            # task plan T0–T26
 ```
 
 `tetris-core` never links Bevy — the app side bridges a fixed-step simulation
