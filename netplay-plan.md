@@ -461,9 +461,92 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   behavior regression test (vs `Bot` still gets the arrow+solo-alternate
   preset); `start_net_match` seed-propagation test (guest `Match` seed ==
   host's). clippy/fmt clean.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `Controller::Net` added (additive). No existing test was modified —
+  the only cross-file compile carve-out was `winner_text`
+  (`screens_menu.rs:277`), which gets a minimal
+  `Controller::Net => "OPPONENT WINS"` arm (+comment line); **N5 refines this
+  arm's copy** (it is documented as N5-owned copy, this is the N4→N5 handoff).
+  **Bridge gating**: `versus_bridge_system` gains `Option<Res<NetSession>>` and
+  early-returns on `status == InMatch` *before* the `!active` queue clear — the
+  lockstep systems own the queues, `steps` and crowning in `InMatch` (no
+  double-step). With the session `Idle`/absent the path is byte-identical
+  (`net_idle_leaves_the_bridge_drain_path_byte_identical` asserts the stepped
+  snapshot equals a hand-advanced `Match`). `versus_restart_on_r_system` gains
+  the same optional param and is inert in `InMatch` (local reseed risk).
+  `versus_bot_system` **unchanged** — a `Bot` local seat's pushes schedule with
+  delay like human actions. **Ordering pinned** in `VersusBridgePlugin`:
+  `versus_bot_system.before(net_lockstep_host_system).before(net_lockstep_
+  guest_system)` — the lockstep fns appear only in `.before()` (records an edge,
+  never re-adds them; no-op when a plugin is mounted without the other), and the
+  bridge keeps its existing `.after(versus_bot_system)`.
+  **Input** (`input.rs`): lone-human override now `p1_human && !(p2_human ||
+  p2_net)`, so a `Net` seat counts as occupied. This is the deliberate,
+  `Net`-scoped behavior adjustment (not pure additive) the plan called for; the
+  RED→GREEN evidence is `net_host_seat_pair_uses_p1_wasd_and_never_the_remote_
+  queue` (fails before the fix: the host took the arrow preset). The two-seat
+  configuration N5 arms (`Human+Net` host / `Net+Human` guest) *is* the routing:
+  a `Net` seat gets `out=None` in `drive_versus_side`, so local keys can never
+  reach the remote queue — no role branch needed in `versus_input_system`.
+  `Human+Bot` lone-human behavior untouched (regression test added:
+  `lone_human_vs_bot_still_gets_arrow_and_solo_alternate_preset`).
+  **Lifecycle** (`versus.rs`, `&mut World` free fns): `start_net_match(world,
+  rule, local_side, seed, delay)` — host honors `SEED_ENV` (`env_seed().
+  unwrap_or(seed)`) for harness runs else the caller's `seed` (N5 = wall clock,
+  N6 = fixed), flips `Ready→InMatch` via `enter_match()`, `reset_for_match`,
+  builds its mirror, and sends `MatchStart{seed,rule,match_delay}` via
+  `RenetServerOut`. Guest: builds its mirror **only** from `MatchStart`
+  (never a local seed) — `end_net_match(world)` = lockstep reset + `end_versus`
+  (leaves transport/session alone; N5's Back-to-title uses `net_leave_to_title`).
+  **N4 contract hook (session.rs, recorded)**: `guest_net_system` gained a
+  `ResMut<NetLockstep>` param and now parks the *initial* `MatchStart`
+  (`Handshaking|Ready`) into `pending_start` alongside the status flip, so a
+  single consumer (`guest_pending_start_system`, Update, guest-only) rebuilds the
+  mirror identically for first start and mid-match rematches. The host never
+  consumes `pending_start` (shields it from a hostile mid-match `MatchStart`).
+  **Seed-propagation test** = real-UDP two-app loopback (`start_net_match_
+  propagates_the_seed_to_the_guest_mirror`, port 0 like N3's): host starts via
+  `start_net_match`, guest mirrors purely off the wire, asserts
+  `guest.seed == host.seed` (a wall-clock seed could never equal the fixed one)
+  and hash-equal mirrors after 30 shared lockstep ticks. GREEN-after-
+  implementation (the wiring can't fail before it exists); the *gating*
+  correctness is non-vacuously proven by that loopback staying hash-equal (an
+  ungated bridge would fork it) and by the RED preset test. **Winner surfacing
+  in `InMatch` is alive via the lockstep** (N3's `winner_surfaces_through_lockstep`)
+  — N4's gate defers crowning to it (verified: the gated bridge writes neither
+  `VersusWinner` nor `steps` in `InMatch`). **Gates**: fmt, clippy `-D` clean;
+  `cargo test --workspace` = 197 app (+8 new) + 136 core + 6 integration, all
+  existing tests green UNMODIFIED.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/versus.rs`
+  (`Controller::Net`, InMatch gating of the bridge + R handler, lockstep
+  ordering pin, `start_net_match`/`end_net_match`/`setup_net_mirror`/
+  `guest_pending_start_system`, gate-matrix + lifecycle + loopback tests),
+  `crates/tetris-app/src/input.rs` (lone-human `Net`-seat fix + preset tests),
+  `crates/tetris-app/src/screens_menu.rs` (**one carve-out**: `winner_text`
+  `Controller::Net` arm), `crates/tetris-app/src/core_bridge/net/session.rs`
+  (N4 contract hook: park the initial guest `MatchStart` in `pending_start`),
+  `netplay-plan.md` (this entry).
+- **N5 handoff** (see also N3's `net_leave_to_title`/`NET_OVERLAY_ZINDEX`):
+  - `winner_text` Net arm currently returns `"OPPONENT WINS"` (both roles).
+    Refine as needed; `winner_text(winner, p1, p2)` already carries both seats.
+  - `start_net_match(world: &mut World, rule: AttackRule, local_side: Side,
+    seed: u64, delay: u8)` and `end_net_match(world: &mut World)`. N5's Host
+    "start" button: call `start_net_match(world, rule, Side::Left,
+    wall_clock_seed(), session.input_delay)` (it flips the session itself; it
+    honors `TETRIS_SEED` when set, so leave the `seed` arg to the caller for
+    real play and let the harness pin it). Guest needs nothing — the mirror is
+    built from `MatchStart`.
+  - **Rematch**: host calls `start_net_match` again (re-arms its own mirror and
+    resends `MatchStart`); the guest auto-rebuilds via `pending_start` →
+    `guest_pending_start_system` within ≤1 frame, resetting to the new seed at
+    tick 0. Do NOT route guest Rematch through `start_versus`/`start_net_match`
+    locally (guest must never reseed locally), and R is already suppressed in
+    `InMatch`. Local-seat controllers (`Human` for a duel) are preserved across
+    rebuild; the remote seat is always forced to `Controller::Net`.
+  - N6 bot-vs-bot-across-the-wire: arm each peer's *local* seat to `Bot`
+    (host `Bot+Net`, guest `Net+Bot`) — `versus_bot_system` pushes the local
+    queue and the lockstep transports it with zero special-casing. The local
+    controller follows `NetSession::role`, not a `start_net_match` arg.
 
 ### N5: Online menu flow, IP entry, status & error overlays, exits
 - **depends_on**: [N4]
