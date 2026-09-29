@@ -48,6 +48,11 @@ pub const APP_DIR_NAME: &str = "tetris";
 pub const SETTINGS_FILE: &str = "settings.json";
 /// Best-score file name.
 pub const BEST_FILE: &str = "best.json";
+/// Netplay profile file name (netplay-plan.md N5). Deliberately a **separate
+/// file** with a separate resource: the T1 contract (`state.rs:1-3`) forbids
+/// reshaping [`Settings`], so netplay persistence piggybacks on this module's
+/// helpers instead of the settings wire format.
+pub const NET_PROFILE_FILE: &str = "net_profile.json";
 /// Environment variable that overrides the config dir (used by tests).
 pub const CONFIG_DIR_ENV: &str = "TETRIS_CONFIG_DIR";
 
@@ -78,6 +83,19 @@ pub struct PersistedBestScore {
     pub level: u32,
     /// Lines cleared in the best run.
     pub lines: u32,
+}
+
+/// Netplay profile (netplay-plan.md N5): the UI state worth remembering
+/// between runs for online play. A **separate resource + file**
+/// ([`NET_PROFILE_FILE`]) from [`Settings`] — the T1 contract in `state.rs`
+/// forbids reshaping `Settings`, so this struct lives here and round-trips on
+/// its own. `SettingsPersistPlugin` loads it at `Startup` and rewrites it
+/// (atomically, like every other file here) whenever a change settles.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, Resource)]
+pub struct NetProfile {
+    /// Last join address submitted by the player — prefilled into the IP
+    /// entry widget on the Online → Join screen.
+    pub last_join_addr: String,
 }
 
 /// Wire mirror of [`Bind`]: `{"Key":"KeyA"}` / `"WheelUp"` / `"WheelDown"`.
@@ -298,6 +316,83 @@ pub fn save_once(
     save_to(&config_dir(), settings, bindings, best)
 }
 
+/// Path-injectable [`NetProfile`] loader: missing or corrupt
+/// [`NET_PROFILE_FILE`] falls back to the default (empty prefill) exactly
+/// like the other files here — never panics.
+pub fn net_profile_load_from(dir: &Path) -> NetProfile {
+    read_json_opt::<NetProfile>(&dir.join(NET_PROFILE_FILE)).unwrap_or_default()
+}
+
+/// Load the [`NetProfile`] from the platform [`config_dir`].
+pub fn net_profile_load() -> NetProfile {
+    net_profile_load_from(&config_dir())
+}
+
+/// Path-injectable [`NetProfile`] writer: one atomic swap (tmp + rename),
+/// the dir created when absent, a failed write leaving the old file intact.
+pub fn net_profile_save_to(dir: &Path, profile: &NetProfile) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    write_atomic(&dir.join(NET_PROFILE_FILE), &to_bytes(profile)?)
+}
+
+/// Save the [`NetProfile`] immediately to the platform [`config_dir`].
+pub fn net_profile_save(profile: &NetProfile) -> io::Result<()> {
+    net_profile_save_to(&config_dir(), profile)
+}
+
+/// Startup load of the live [`NetProfile`] resource from disk.
+fn net_profile_load_system(mut profile: ResMut<NetProfile>) {
+    let loaded = net_profile_load();
+    if loaded != *profile {
+        *profile = loaded;
+    }
+}
+
+/// Private latch: `true` while a [`NetProfile`] change still needs the disk.
+#[derive(Resource, Default)]
+struct NetProfilePending(bool);
+
+/// Persist [`NetProfile`] whenever it settles: writes fire the frame *after*
+/// a change (first frame is skipped), so `to_bytes` never runs inside a
+/// `ResMut` borrow. The change itself already dirtied the resource, so a
+/// failed write keeps the latch set and retries next frame; [`AppExit`] gets
+/// one final flush.
+fn net_profile_flush_system(
+    profile: Res<NetProfile>,
+    mut primed: Local<bool>,
+    mut pending: ResMut<NetProfilePending>,
+) {
+    if !*primed {
+        *primed = true;
+        return;
+    }
+    if profile.is_changed() {
+        pending.0 = true;
+    }
+    if !pending.0 {
+        return;
+    }
+    if net_profile_save(&profile).is_ok() {
+        pending.0 = false;
+    } else {
+        warn!("could not persist net profile");
+    }
+}
+
+/// Last-chance [`NetProfile`] flush on app exit.
+fn net_profile_exit_system(
+    mut exits: MessageReader<AppExit>,
+    profile: Res<NetProfile>,
+    pending: Res<NetProfilePending>,
+) {
+    if exits.read().next().is_none() || !pending.0 {
+        return;
+    }
+    if let Err(err) = net_profile_save(&profile) {
+        warn!("could not persist net profile on exit: {err}");
+    }
+}
+
 /// Last-seen settings/bindings fingerprint; the first frame after load only
 /// primes it, so loading never self-dirties.
 #[derive(Debug, Default, Resource)]
@@ -434,7 +529,9 @@ fn exit_flush_system(
 /// Registers [`PersistedBestScore`] for T17 and auto-persists: debounced on
 /// any [`Settings`]/[`KeyBindings`] change (T16 edits need no extra call),
 /// immediately on `CoreEvent(GameEvent::GameOver)`, and once more on
-/// [`AppExit`] if a debounced save is still in flight.
+/// [`AppExit`] if a debounced save is still in flight. N5 adds the separate
+/// [`NetProfile`] resource on top: loaded at `Startup`, rewritten (atomic,
+/// same discipline) one frame after a change and once more on [`AppExit`].
 pub struct SettingsPersistPlugin;
 
 impl Plugin for SettingsPersistPlugin {
@@ -446,12 +543,20 @@ impl Plugin for SettingsPersistPlugin {
             .init_resource::<PersistedBestScore>()
             .init_resource::<SettingsFingerprint>()
             .init_resource::<SaveQueue>()
-            .add_systems(Startup, load_system)
+            .init_resource::<NetProfile>()
+            .init_resource::<NetProfilePending>()
+            .add_systems(Startup, (load_system, net_profile_load_system))
             .add_systems(
                 Update,
-                (best_score_system, change_detection_system, flush_system).chain(),
+                (
+                    best_score_system,
+                    change_detection_system,
+                    flush_system,
+                    net_profile_flush_system,
+                )
+                    .chain(),
             )
-            .add_systems(Last, exit_flush_system);
+            .add_systems(Last, (exit_flush_system, net_profile_exit_system));
     }
 }
 
@@ -777,5 +882,101 @@ mod tests {
         assert_eq!(config_dir(), dir.path());
         std::env::remove_var(CONFIG_DIR_ENV);
         assert!(config_dir().ends_with(APP_DIR_NAME));
+    }
+
+    // ---- N5: separate net_profile.json persistence ----
+
+    #[test]
+    fn net_profile_round_trips_through_temp_dir() {
+        let dir = TempDir::new("netprofile");
+        let profile = NetProfile {
+            last_join_addr: "192.168.1.42:27015".to_string(),
+        };
+        net_profile_save_to(dir.path(), &profile).expect("save net profile");
+        assert_eq!(net_profile_load_from(dir.path()), profile);
+
+        // Overwrite round-trips too (a later join replaces the prefill).
+        let updated = NetProfile {
+            last_join_addr: "10.0.0.9:40000".to_string(),
+        };
+        net_profile_save_to(dir.path(), &updated).expect("re-save net profile");
+        assert_eq!(net_profile_load_from(dir.path()), updated);
+    }
+
+    #[test]
+    fn net_profile_missing_file_loads_default() {
+        let dir = TempDir::new("netprofile-missing");
+        assert_eq!(
+            net_profile_load_from(dir.path()),
+            NetProfile {
+                last_join_addr: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn net_profile_corrupt_file_loads_default_without_panicking() {
+        let dir = TempDir::new("netprofile-corrupt");
+        fs::write(dir.path().join(NET_PROFILE_FILE), b"{ nope ]").unwrap();
+        assert_eq!(net_profile_load_from(dir.path()), NetProfile::default());
+    }
+
+    #[test]
+    fn net_profile_atomic_save_leaves_no_tmp_file() {
+        let dir = TempDir::new("netprofile-atomic");
+        net_profile_save_to(dir.path(), &NetProfile::default()).unwrap();
+        let raw = fs::read_to_string(dir.path().join(NET_PROFILE_FILE)).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).expect("valid json");
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn net_profile_is_its_own_file_not_mixed_into_settings() {
+        // The T1 contract: Settings is never reshaped — saving a net profile
+        // must not touch settings.json / best.json at all.
+        let dir = TempDir::new("netprofile-isolated");
+        let (settings, bindings, best) = default_trio();
+        save_to(dir.path(), &settings, &bindings, best).unwrap();
+        net_profile_save_to(
+            dir.path(),
+            &NetProfile {
+                last_join_addr: "127.0.0.1:27015".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(load_from(dir.path()), (settings, bindings, best));
+        assert!(dir.path().join(NET_PROFILE_FILE).exists());
+    }
+
+    /// Full plugin path: `TETRIS_CONFIG_DIR` override, boot, change the
+    /// resource, and the separate file lands on disk (with the exit flush as
+    /// the safety net).
+    #[test]
+    fn net_profile_plugin_round_trip() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new("netprofile-plugin");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(SettingsPersistPlugin);
+        app.update();
+
+        // Startup load against an empty dir → empty prefill, nothing written.
+        assert_eq!(*app.world().resource::<NetProfile>(), NetProfile::default());
+        assert!(!dir.path().join(NET_PROFILE_FILE).exists());
+
+        app.world_mut().resource_mut::<NetProfile>().last_join_addr =
+            "192.168.0.7:27015".to_string();
+        app.update();
+        let loaded = net_profile_load_from(dir.path());
+        assert_eq!(loaded.last_join_addr, "192.168.0.7:27015");
+
+        std::env::remove_var(CONFIG_DIR_ENV);
     }
 }
