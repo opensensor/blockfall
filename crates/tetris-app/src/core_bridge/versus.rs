@@ -33,10 +33,14 @@
 //! per match, exiting after [`HARNESS_MATCHES`] completed matches.
 
 use bevy::prelude::*;
+use bevy_renet::RenetServer;
 
 use tetris_core::actions::Action;
 use tetris_core::versus::{AttackRule, Match, MatchEvent, Side, DEFAULT_RACE_LINES};
 
+use super::net::lockstep::{self, NetLockstep, NetOut, RenetServerOut};
+use super::net::protocol::NetMsg;
+use super::net::session::{NetRole, NetSession, NetStatus, DEFAULT_INPUT_DELAY};
 use super::{bot_side_drive, env_seed, wall_clock_seed, BotState, SimPaused};
 use crate::input::VersusActions;
 use crate::state::AppState;
@@ -59,6 +63,12 @@ pub enum Controller {
     Human,
     /// The T14 greedy snapshot solver.
     Bot,
+    /// The remote peer in a netplay match (netplay-plan.md N4). Never driven
+    /// by local keys or the local bot: its actions arrive over the wire via
+    /// the N3 lockstep path. A `Net` seat counts as *occupied* for the
+    /// [`versus_input_system`](crate::input::versus_input_system) lone-human
+    /// override, so the local side keeps its canonical two-seat preset.
+    Net,
 }
 
 /// Match outcome, observable without touching the NonSend [`VersusMatch`]:
@@ -179,6 +189,169 @@ pub fn end_versus(versus: &mut VersusMatch, winner: &mut VersusWinner, app_state
 }
 
 // ---------------------------------------------------------------------------
+// Netplay lifecycle (netplay-plan.md N4): `start_versus`/`end_versus` mirrors
+// that run the mirror through the N3 lockstep path. The host honors
+// [`SEED_ENV`](super::SEED_ENV) (harness runs) else the caller's `seed`
+// (wall clock from N5), builds its mirror locally, and ships `MatchStart`; the
+// guest rebuilds its mirror **only** from that received `MatchStart` (never a
+// locally derived seed) in [`guest_pending_start_system`].
+// ---------------------------------------------------------------------------
+
+/// Point both peers' [`VersusMatch`] at the shared mirror: fresh [`Match`]
+/// from `seed`/`rule`, [`NetLockstep`] reset to `delay`, the remote seat (the
+/// side opposite `local_side`) forced to [`Controller::Net`], and the local
+/// seat left as the caller arranged it (`Human` for a net duel, `Bot` for the
+/// N6 bot-vs-bot harness — the local controller always follows `NetSession::role`).
+///
+/// The host also flips `Ready → InMatch` (see [`NetSession::enter_match`]) and
+/// emits [`NetMsg::MatchStart`]; the guest never calls this directly for a
+/// live match (it parks the received start and rebuilds through
+/// [`guest_pending_start_system`]). Shared by the host start and the guest's
+/// `pending_start` consumer so both peers construct the mirror identically.
+fn setup_net_mirror(world: &mut World, seed: u64, rule: AttackRule, delay: u8, local_side: Side) {
+    let role = world.resource::<NetSession>().role;
+    if let Some(mut lockstep) = world.get_resource_mut::<NetLockstep>() {
+        lockstep.reset_for_match(delay);
+        lockstep.role = role;
+    }
+    if !world.contains_non_send::<VersusMatch>() {
+        return;
+    }
+    world.resource_scope::<VersusWinner, ()>(|world, mut winner| {
+        let mut versus = world.non_send_mut::<VersusMatch>();
+        versus.match_ = Match::new(seed, rule);
+        versus.seed = seed;
+        versus.rule = rule;
+        versus.steps = 0;
+        versus.crowned = false;
+        versus.bots = Default::default();
+        versus.bot_cooldown = [0; 2];
+        versus.active = true;
+        // The remote seat is always the peer; the local seat keeps whatever
+        // the caller arranged (`Human` for a duel, `Bot` for the harness),
+        // defaulting to `Human` if it was left a stale `Net`.
+        let current_local = if local_side == Side::Left {
+            versus.p1
+        } else {
+            versus.p2
+        };
+        let local = if matches!(current_local, Controller::Net) {
+            Controller::Human
+        } else {
+            current_local
+        };
+        let (remote, local) = (Controller::Net, local);
+        if local_side == Side::Left {
+            versus.p1 = local;
+            versus.p2 = remote;
+        } else {
+            versus.p1 = remote;
+            versus.p2 = local;
+        }
+        winner.0 = None;
+    });
+}
+
+/// Start a netplay mirror match on this peer (the [`start_versus`] analogue
+/// for the wire, `netplay-plan.md` N4).
+///
+/// * **Host** (`NetSession::role == Host`, local seat `Side::Left`): resolves
+///   the seed (`SEED_ENV` for harness runs, else the passed `seed` — N5
+///   supplies a wall clock, N6 a fixed one), flips `Ready → InMatch`, resets
+///   the lockstep, builds its mirror, and sends `MatchStart { seed, rule,
+///   match_delay }` so the peer mirrors from the *same* seed.
+/// * **Guest**: builds its mirror directly from `seed`/`rule`/`delay`. In a
+///   real match the guest does not call this — it receives `MatchStart` and
+///   rebuilds in [`guest_pending_start_system`] — but the symmetric entry keeps
+///   the harness/tests able to drive both ends.
+///
+/// `local_side` is this peer's seat (host `Left` / guest `Right`, per
+/// [`lockstep::local_side`]); the opposite seat is forced to
+/// [`Controller::Net`]. Idempotent enough to re-arm the mirror (e.g. a host
+/// rematch), which also wipes any parked `pending_start` and stale batches.
+pub fn start_net_match(
+    world: &mut World,
+    rule: AttackRule,
+    local_side: Side,
+    seed: u64,
+    delay: u8,
+) {
+    let seed = env_seed().unwrap_or(seed);
+    let role = world.resource::<NetSession>().role;
+    if role == NetRole::Host {
+        world.resource_mut::<NetSession>().enter_match();
+    }
+    setup_net_mirror(world, seed, rule, delay, local_side);
+    if role == NetRole::Host {
+        let peer = world.resource::<NetSession>().peer;
+        let has_server = world.contains_resource::<RenetServer>();
+        if let (Some(peer), true) = (peer, has_server) {
+            let server = world.resource_mut::<RenetServer>();
+            let mut out = RenetServerOut {
+                server: server.into_inner(),
+                peer,
+            };
+            let msg = NetMsg::MatchStart {
+                seed,
+                rule,
+                match_delay: delay,
+            };
+            out.send(&msg);
+            info!("net: match start seed {seed} rule {rule:?} delay {delay} (host)");
+        } else {
+            warn!("net: start_net_match host without a live connection — guest gets no MatchStart");
+        }
+    }
+}
+
+/// Tear the netplay mirror down (the [`end_versus`] analogue N5 pairs with
+/// `net_leave_to_title`): clears the [`NetLockstep`] clock/buffers and runs
+/// the full [`end_versus`] teardown. Leaves the transport/session alone —
+/// call `net_leave_to_title` for the whole exit, or `start_net_match` again to
+/// re-arm on the same connection.
+pub fn end_net_match(world: &mut World) {
+    if let Some(mut lockstep) = world.get_resource_mut::<NetLockstep>() {
+        lockstep.reset_for_match(DEFAULT_INPUT_DELAY);
+    }
+    if !world.contains_non_send::<VersusMatch>() {
+        return;
+    }
+    world.resource_scope::<AppState, ()>(|world, state| {
+        world.resource_scope::<VersusWinner, ()>(|world, winner| {
+            let versus = world.non_send_mut::<VersusMatch>();
+            end_versus(versus.into_inner(), winner.into_inner(), state.into_inner());
+        });
+    });
+}
+
+/// Guest mirror (re)builder driven by the [`NetLockstep::pending_start`]
+/// parking slot. A `MatchStart` parked mid-`InMatch` (a rematch) — or parked
+/// by the session bridge for the very first start (see the session docs) —
+/// rebuilds the guest's mirror and lockstep before the next fixed step, so
+/// the two peers stay on one seed and the lockstep starts the fresh mirror at
+/// tick 0. `VersusMatch::active` gates the lockstep's stepping, so nothing can
+/// execute on the mirror before this rebuild runs. Runs on the guest only:
+/// the host drives its own starts through [`start_net_match`], never a parked
+/// `pending_start` (which also shields the host from a hostile mid-match
+/// `MatchStart`).
+fn guest_pending_start_system(world: &mut World) {
+    let Some(session) = world.get_resource::<NetSession>() else {
+        return;
+    };
+    let (role, status) = (session.role, session.status.clone());
+    if role != NetRole::Guest || status != NetStatus::InMatch {
+        return;
+    }
+    let parked = world.resource_mut::<NetLockstep>().pending_start.take();
+    let Some((seed, rule, delay)) = parked else {
+        return;
+    };
+    let local_side = lockstep::local_side(role);
+    setup_net_mirror(world, seed, rule, delay, local_side);
+    info!("net: guest mirror (re)built from MatchStart seed {seed} rule {rule:?} delay {delay}");
+}
+
+// ---------------------------------------------------------------------------
 // Fixed-step systems
 // ---------------------------------------------------------------------------
 
@@ -241,7 +414,17 @@ fn versus_bridge_system(
     mut winner: ResMut<VersusWinner>,
     app_state: Res<AppState>,
     paused: Res<SimPaused>,
+    net: Option<Res<NetSession>>,
 ) {
+    // N4 gating (netplay-plan.md N3 contract): while a netplay match is live
+    // the lockstep systems own stepping, `steps` bookkeeping and crowning.
+    // Draining here too would double-step and fork the mirror, so the whole
+    // block (incl. the `!active` queue clear — the lockstep owns the queues
+    // in `InMatch`) is skipped. With the session `Idle` (or absent) this is
+    // byte-identical to the pre-netplay path.
+    if net.is_some_and(|session| session.status == NetStatus::InMatch) {
+        return;
+    }
     if !versus.active {
         actions.left.clear();
         actions.right.clear();
@@ -286,8 +469,15 @@ fn versus_restart_on_r_system(
     versus: NonSendMut<VersusMatch>,
     winner: ResMut<VersusWinner>,
     app_state: ResMut<AppState>,
+    net: Option<Res<NetSession>>,
 ) {
     let Some(keys) = keys else { return };
+    // R would reseed the local mirror and fork it against the peer (netplay-
+    // plan.md risk "Rematch local reseed"); a net rematch flows through
+    // `MatchStart` instead, so the R handler is inert while `InMatch`.
+    if net.is_some_and(|session| session.status == NetStatus::InMatch) {
+        return;
+    }
     if !versus.active || !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
@@ -464,8 +654,27 @@ impl Plugin for VersusBridgePlugin {
             .init_resource::<VersusHarness>()
             .add_message::<VersusEvent>()
             .add_systems(Startup, versus_harness_startup)
-            .add_systems(Update, (versus_restart_on_r_system, versus_harness_update))
-            .add_systems(FixedUpdate, versus_bot_system)
+            .add_systems(
+                Update,
+                (
+                    versus_restart_on_r_system,
+                    versus_harness_update,
+                    guest_pending_start_system,
+                ),
+            )
+            // N3's lockstep contract: pin the step systems **after** the bot
+            // driver so a `Bot`-seat's same-frame pushes are scheduled with
+            // delay like human actions (the bridge keeps its existing
+            // `.after(versus_bot_system)`). Referencing the lockstep systems
+            // only in `.before()` records an ordering edge; it does not
+            // re-add them (they live on `NetLockstepPlugin`), and it is a
+            // no-op in apps that mount one plugin without the other.
+            .add_systems(
+                FixedUpdate,
+                versus_bot_system
+                    .before(lockstep::net_lockstep_host_system)
+                    .before(lockstep::net_lockstep_guest_system),
+            )
             .add_systems(FixedUpdate, versus_bridge_system.after(versus_bot_system));
     }
 }
@@ -978,6 +1187,250 @@ mod tests {
         assert!(
             matches!(exits.first(), Some(AppExit::Success)),
             "harness exits after {HARNESS_MATCHES} matches: {exits:?}"
+        );
+    }
+
+    // ---- N4 gate matrix + netplay lifecycle (netplay-plan.md) ------------
+    //
+    // `NetSession` rides along on every `CoreBridgePlugin` app (idle by
+    // default), so the gate tests flip its `status` directly.
+
+    use crate::core_bridge::net::protocol;
+    use crate::core_bridge::net::session::{net_host, net_join, net_stop};
+
+    fn set_net_status(app: &mut App, status: crate::core_bridge::net::session::NetStatus) {
+        app.world_mut()
+            .resource_mut::<crate::core_bridge::net::session::NetSession>()
+            .status = status;
+    }
+
+    fn net_status(app: &App) -> crate::core_bridge::net::session::NetStatus {
+        app.world()
+            .resource::<crate::core_bridge::net::session::NetSession>()
+            .status
+            .clone()
+    }
+
+    #[test]
+    fn net_idle_leaves_the_bridge_drain_path_byte_identical() {
+        // With the session `Idle` the bridge drains/ticks/steps exactly as it
+        // did before netplay existed: the stepped snapshot is byte-identical
+        // to a `Match` advanced by hand through the same order.
+        let mut app = test_app(2);
+        assert_eq!(
+            net_status(&app),
+            NetStatus::Idle,
+            "CoreBridgePlugin carries an idle NetSession"
+        );
+        activate(&mut app, Controller::Human, Controller::Human);
+        let seed = app.world().non_send::<VersusMatch>().seed;
+        push_side(&mut app, Side::Left, &[Action::HardDrop]);
+        push_side(&mut app, Side::Right, &[Action::HardDrop]);
+
+        fixed_step(&mut app);
+
+        let snap = versus(&app);
+        assert!(snap.left.score > 0 && snap.right.score > 0);
+        assert_eq!(versus_steps(&app), 1);
+        let mut reference = Match::new(seed, AttackRule::Garbage);
+        reference.apply(Side::Left, Action::HardDrop);
+        reference.tick(Side::Left);
+        reference.apply(Side::Right, Action::HardDrop);
+        reference.tick(Side::Right);
+        assert_eq!(snap, reference.snapshot(), "Idle bridge == direct path");
+    }
+
+    #[test]
+    fn net_inmatch_gate_skips_the_bridge_drain_and_defers_bookkeeping() {
+        // `InMatch` with no lockstep transport (no `RenetServer`/`RenetClient`):
+        // neither the bridge nor the lockstep may step, so the match is fully
+        // frozen, the queues are held (not drained), steps stay 0 and crowning
+        // is deferred to the lockstep path (proven live in N3's
+        // `winner_surfaces_through_lockstep`).
+        let mut app = test_app(2);
+        activate(&mut app, Controller::Human, Controller::Human);
+        set_net_status(&mut app, NetStatus::InMatch);
+        push_side(&mut app, Side::Left, &[Action::HardDrop]);
+        push_side(&mut app, Side::Right, &[Action::Hold]);
+
+        let before = versus(&app);
+        for _ in 0..3 {
+            fixed_step(&mut app);
+        }
+
+        assert_eq!(versus(&app), before, "bridge drain skipped while InMatch");
+        assert_eq!(versus_steps(&app), 0, "steps deferred to the lockstep");
+        let actions = app.world().resource::<VersusActions>();
+        assert_eq!(
+            actions.left,
+            vec![Action::HardDrop],
+            "queues held, not drained"
+        );
+        assert_eq!(actions.right, vec![Action::Hold]);
+        assert_eq!(
+            *app.world().resource::<VersusWinner>(),
+            VersusWinner(None),
+            "crowning deferred (bridge must not double-crown)"
+        );
+    }
+
+    #[test]
+    fn net_inmatch_suppresses_r_restart() {
+        let mut app = test_app(8);
+        activate(&mut app, Controller::Human, Controller::Human);
+        push_side(&mut app, Side::Left, &[Action::HardDrop]);
+        fixed_step(&mut app); // steps once while Idle
+        let progressed = versus(&app);
+        assert!(versus_steps(&app) > 0, "progressed while Idle");
+
+        set_net_status(&mut app, NetStatus::InMatch);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.world_mut().run_schedule(Update);
+
+        assert_eq!(
+            versus(&app),
+            progressed,
+            "R suppressed while InMatch — a local reseed would fork the mirror"
+        );
+        assert!(app.world().non_send::<VersusMatch>().active);
+    }
+
+    #[test]
+    fn end_net_match_clears_the_mirror_and_lockstep() {
+        let mut app = test_app(9);
+        // Arm a host mirror directly through the public lifecycle entry.
+        start_net_match(app.world_mut(), AttackRule::Garbage, Side::Left, 0xABCD, 4);
+        assert!(app.world().non_send::<VersusMatch>().active);
+        app.world_mut().resource_mut::<NetLockstep>().tick = 11;
+
+        end_net_match(app.world_mut());
+
+        assert!(!app.world().non_send::<VersusMatch>().active);
+        assert_eq!(*app.world().resource::<AppState>(), AppState::Title);
+        assert_eq!(*app.world().resource::<VersusWinner>(), VersusWinner(None));
+        assert_eq!(app.world().resource::<NetLockstep>().tick, 0);
+        // Session/transport are deliberately left alone by end_net_match.
+        assert_eq!(
+            net_status(&app),
+            NetStatus::Idle,
+            "end_net_match never touched the session (was Idle here)"
+        );
+    }
+
+    /// Full-path seed propagation over real UDP loopback: the host starts a
+    /// match through [`start_net_match`], the guest rebuilds its mirror purely
+    /// from the received `MatchStart`, and the N4 → N3 pipeline keeps both
+    /// clocks stepping on that one shared seed.
+    ///
+    /// Not RED-before-implementation: the wiring cannot fail before it exists.
+    /// The non-vacuous assertion is `guest.seed == host.seed` — a locally
+    /// derived (wall-clock) guest seed could never equal the fixed `seed`.
+    #[test]
+    fn start_net_match_propagates_the_seed_to_the_guest_mirror() {
+        let seed = 0x1234_5678_9ABC_DEF0u64;
+        let rule = AttackRule::Garbage;
+        let delay = 4u8;
+
+        let mut host = net_versus_app();
+        let mut guest = net_versus_app();
+        net_host(host.world_mut(), 0);
+        let addr: std::net::SocketAddr = {
+            let listen = host
+                .world()
+                .resource::<crate::core_bridge::net::session::NetSession>()
+                .listen_addr
+                .expect("listening");
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, listen.port()).into()
+        };
+        net_join(guest.world_mut(), addr);
+        drive_both_until(&mut host, &mut guest, 2_000, |h, g| {
+            net_status(h) == NetStatus::Ready && net_status(g) == NetStatus::Ready
+        });
+
+        start_net_match(host.world_mut(), rule, Side::Left, seed, delay);
+        assert_eq!(host.world().non_send::<VersusMatch>().seed, seed);
+        assert!(host.world().non_send::<VersusMatch>().active);
+        assert_eq!(net_status(&host), NetStatus::InMatch);
+
+        drive_both_until(&mut host, &mut guest, 2_000, |_, g| {
+            g.world().non_send::<VersusMatch>().active && net_status(g) == NetStatus::InMatch
+        });
+
+        assert_eq!(
+            guest.world().non_send::<VersusMatch>().seed,
+            seed,
+            "the guest must mirror the host's wire seed, never a local one"
+        );
+        assert_eq!(guest.world().non_send::<VersusMatch>().rule, rule);
+        assert_eq!(
+            protocol::snapshot_hash(&host.world().non_send::<VersusMatch>().match_.snapshot()),
+            protocol::snapshot_hash(&guest.world().non_send::<VersusMatch>().match_.snapshot()),
+            "mirrors hash-equal at match start"
+        );
+
+        // Keep both clocked: after 30 shared ticks both seeds are unchanged
+        // and the guest's lockstep advanced in lock with the host's.
+        let target = 30u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while host.world().resource::<NetLockstep>().tick < target
+            || guest.world().resource::<NetLockstep>().tick < target
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "loopback lockstep stalled out"
+            );
+            host.update();
+            guest.update();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(guest.world().non_send::<VersusMatch>().seed, seed);
+        assert_eq!(
+            protocol::snapshot_hash(&host.world().non_send::<VersusMatch>().match_.snapshot()),
+            protocol::snapshot_hash(&guest.world().non_send::<VersusMatch>().match_.snapshot()),
+            "mirrors still agree after {target} lockstep ticks"
+        );
+
+        net_stop(host.world_mut());
+        net_stop(guest.world_mut());
+    }
+
+    /// Headless app carrying the whole production stack (solo core + versus
+    /// bridge + netplay) so the loopback exercises the real N4 wiring: the
+    /// InMatch-gated bridge, the lockstep systems and the guest `pending_start`
+    /// rebuilder. `AppState::Playing` opens the lockstep gates from frame 0.
+    fn net_versus_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins((CoreBridgePlugin, crate::input::InputPlugin));
+        app.init_resource::<AppState>()
+            .init_resource::<Settings>()
+            .init_resource::<RebindingCapture>();
+        *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
+        app
+    }
+
+    fn drive_both_until(
+        host: &mut App,
+        guest: &mut App,
+        frames: usize,
+        done: impl Fn(&App, &App) -> bool,
+    ) {
+        for _ in 0..frames {
+            host.update();
+            guest.update();
+            if done(host, guest) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "loopback condition not reached in {frames} frames (host {:?} tick {}, guest {:?} tick {})",
+            net_status(host),
+            host.world().resource::<NetLockstep>().tick,
+            net_status(guest),
+            guest.world().resource::<NetLockstep>().tick,
         );
     }
 }

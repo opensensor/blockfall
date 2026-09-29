@@ -679,6 +679,7 @@ fn guest_net_system(
     transport: Option<Res<NetcodeClientTransport>>,
     mut messages: MessageWriter<NetEvent>,
     mut commands: Commands,
+    mut lockstep: ResMut<super::lockstep::NetLockstep>,
 ) {
     if session.role != NetRole::Guest {
         return;
@@ -720,6 +721,12 @@ fn guest_net_system(
                 }) => {
                     if session.apply(NetTrigger::MatchStart) {
                         session.input_delay = match_delay;
+                        // N4 contract hook: park the initial start for
+                        // `guest_pending_start_system` to build the mirror
+                        // from (the guest never derives its own seed). Later
+                        // rematches arrive once `InMatch`, when N3's lockstep
+                        // already owns the channel and parks them itself.
+                        lockstep.pending_start = Some((seed, rule, match_delay));
                         info!("net: match start seed {seed} rule {rule:?} delay {match_delay}");
                     }
                 }

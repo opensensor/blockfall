@@ -741,13 +741,17 @@ fn versus_input_system(mut params: VersusInputParams) {
 
     let p1_human = matches!(params.versus.p1, Controller::Human);
     let p2_human = matches!(params.versus.p2, Controller::Human);
+    // A `Net` seat counts as occupied (netplay-plan.md N4): without this the
+    // host's `Human+Net` pair would trip `lone_human_p1` and the host would be
+    // handed the arrow/solo-alternate preset instead of its WASD `bindings.p1`.
+    let p2_net = matches!(params.versus.p2, Controller::Net);
 
     // A lone human (vs the bot) drives with the arrow preset — the same
     // keys as solo play. A two-human match keeps the classic shared-keyboard
     // split: P1 WASD on the left, P2 arrows on the right. The lone human's
     // copy also claims the solo alternate keys (Space hard drop, X/Z
     // rotations, C/Shift hold) — all free because no P2 seat competes.
-    let lone_human_p1 = p1_human && !p2_human;
+    let lone_human_p1 = p1_human && !(p2_human || p2_net);
 
     let solo_arrow_preset;
     let (p1_preset, p2_preset) = if lone_human_p1 {
@@ -1222,5 +1226,82 @@ mod tests {
             "second presses of hard drop, rotate, hold and move all re-fire"
         );
         assert_eq!(right, Vec::new(), "the bot side never takes keyboard");
+    }
+
+    // ---- N4 netplay seat-pair preset routing (netplay-plan.md) ----
+
+    /// Host seat pair `Human+Net`: the local (left) seat drives with the P1
+    /// (WASD) preset — *not* the lone-human arrow preset — and the remote
+    /// (Net) queue is never fed by local keys.
+    #[test]
+    fn net_host_seat_pair_uses_p1_wasd_and_never_the_remote_queue() {
+        let mut app = versus_test_app(Controller::Human, Controller::Net);
+        press(&mut app, KeyCode::KeyA);
+        press(&mut app, KeyCode::KeyQ);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            left,
+            vec![Action::MoveLeft, Action::Hold],
+            "host left seat takes the P1 WASD preset"
+        );
+        assert!(right.is_empty(), "the remote (Net) queue is never touched");
+
+        // Arrows belong to the absent P2 seat: they must not drive the host's
+        // left side — the assertion that fails *before* the lone-human fix
+        // (which would hand the host the arrow/solo preset).
+        let mut app = versus_test_app(Controller::Human, Controller::Net);
+        press(&mut app, KeyCode::ArrowLeft);
+        press(&mut app, KeyCode::Comma);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert!(left.is_empty(), "arrows are not the host's WASD preset");
+        assert!(right.is_empty());
+    }
+
+    /// Guest seat pair `Net+Human`: the local (right) seat drives with the P2
+    /// (arrow) preset and the remote (Net) queue is never fed by local keys.
+    #[test]
+    fn net_guest_seat_pair_uses_p2_arrows_and_never_the_remote_queue() {
+        let mut app = versus_test_app(Controller::Net, Controller::Human);
+        press(&mut app, KeyCode::ArrowLeft);
+        press(&mut app, KeyCode::Comma);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            right,
+            vec![Action::MoveLeft, Action::Hold],
+            "guest right seat takes the P2 arrow preset"
+        );
+        assert!(left.is_empty(), "the remote (Net) queue is never touched");
+
+        // WASD belongs to the absent P1 seat: must not drive the guest's right.
+        let mut app = versus_test_app(Controller::Net, Controller::Human);
+        press(&mut app, KeyCode::KeyA);
+        press(&mut app, KeyCode::KeyQ);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert!(right.is_empty(), "WASD is not the guest's P2 preset");
+        assert!(left.is_empty());
+    }
+
+    /// Regression guard for the `Net`-seat-occupied fix: a `Bot` seat must NOT
+    /// count as occupying P2, so a lone human vs the Bot still gets the
+    /// arrow + solo-alternate preset (Space hard drop, X/Z rotates, C/Shift
+    /// hold) on the left seat.
+    #[test]
+    fn lone_human_vs_bot_still_gets_arrow_and_solo_alternate_preset() {
+        let mut app = versus_test_app(Controller::Human, Controller::Bot);
+        press(&mut app, KeyCode::Space); // solo-alternate hard drop
+        press(&mut app, KeyCode::KeyX); // solo-alternate rotate cw
+        press(&mut app, KeyCode::KeyC); // solo-alternate hold
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            left,
+            vec![Action::HardDrop, Action::RotateCw, Action::Hold],
+            "vs Bot the lone human keeps the arrow+solo-alternate preset on the left seat"
+        );
+        assert!(right.is_empty(), "the bot side never takes keyboard");
     }
 }

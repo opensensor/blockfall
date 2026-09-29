@@ -276,6 +276,8 @@ pub fn winner_text(winner: Side, p1: Controller, p2: Controller) -> String {
     let controller = if winner == Side::Left { p1 } else { p2 };
     match controller {
         Controller::Bot => "BOT WINS".to_string(),
+        // N4 compile carve-out; N5 refines the netplay copy.
+        Controller::Net => "OPPONENT WINS".to_string(),
         Controller::Human if winner == Side::Left => "PLAYER 1 WINS".to_string(),
         Controller::Human => "PLAYER 2 WINS".to_string(),
     }
