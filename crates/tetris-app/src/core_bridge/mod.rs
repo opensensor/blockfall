@@ -573,6 +573,10 @@ impl Plugin for CoreBridgePlugin {
             .init_resource::<MarathonStats>()
             // T25: 1v1 versus bridge (inactive until a match starts).
             .add_plugins(VersusBridgePlugin)
+            // N2: netplay session (netplay-plan.md) — same mount slot; the
+            // bevy_renet plugins inside are resource-gated, so an Idle
+            // session costs nothing per frame.
+            .add_plugins(net::NetPlugin)
             .add_systems(Startup, seed_from_env_at_startup)
             .add_systems(
                 Update,

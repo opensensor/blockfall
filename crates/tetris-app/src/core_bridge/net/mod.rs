@@ -305,3 +305,6 @@
 // Consumed progressively: N2 (session/plugin), N3 (lockstep), N6 (harness).
 #[allow(dead_code)]
 pub mod protocol;
+pub mod session;
+
+pub use session::*;
