@@ -592,9 +592,56 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   sign-off gate (author's rule: agent runs the checklist, posts, stops):
   two machines play a full garbage match over LAN + internet; default delay
   feels responsive. clippy/fmt/test gates green.
-- **status**: Not Completed
+- **status**: Completed
 - **log**:
-- **files edited/created**:
+  - Keyboard-only IP:port entry as specified. Clipboard finding: **Bevy 0.19
+    removed clipboard support entirely** (no `clipboard` surface anywhere in
+    `bevy_window`/`bevy_winit` 0.19.1 — verified against the vendored
+    sources), so paste is unavailable with or without `main.rs`; the entry is
+    keyboard-only by platform, not by shortcut. Charset digits/dots/colon
+    (Shift+`;` → `:`), Backspace/Delete, Enter/NumpadEnter submit, 44-char
+    cap; `parse_join_addr` accepts trimmed `IPv4:port` with port ≠ 0.
+  - Local/Online axis realized as a sibling Title **"Online"** entry (marker
+    `OnlineButton`, spawned in `build_menu_ui`, owned panel flow in
+    `online_ui.rs`) rather than a stage inside the 1v1 submenu — every
+    existing T26 `VersusFlow` stage test passes untouched, satisfying the
+    "never disturbs solo/local-versus flows" contract.
+  - Wiring gates in `screens_menu.rs`: `pause_chord_system` returns early
+    while `NetStatus::InMatch` (Esc belongs to the leave-confirm; lockstep
+    has no authoritative pause); `versus_button_clicks` skips Rematch/Menu
+    while `InMatch` (host re-arms through `start_net_match` — never the
+    local-reseed `start_versus` — Menu runs `net_leave_to_title`); guest
+    `VersusRematchButton` hidden (role gate); winner headline role-aware via
+    `net_winner_text` once a seat is `Controller::Net`; `TitleRoot` hidden
+    while the online flow is open (same discipline as the 1v1 submenus,
+    per the recorded click-swallow regressions).
+  - `OnlineUiPlugin` mounts from `MenuScreensPlugin::build` (single canonical
+    mount). Overlay roots carry explicit `NET_OVERLAY_ZINDEX` so their
+    buttons pick over the frozen-but-visible versus HUD (teardown contract
+    respected: `SimPaused` held, `VersusMatch` stays active until Back to
+    title runs `net_leave_to_title`).
+  - `net_profile.json` is a **separate** resource (`NetProfile`) with its own
+    load/flush/exit systems chained beside the settings ones; `Settings` in
+    `state.rs` untouched (T1). Last-submitted join address persists and
+    prefills the entry.
+  - Cross-module seam: the screens wiring names `crate::core_bridge::net::*`
+    (the `mod net;`-private blocker posted to the board); unblocked by N6's
+    one-line `pub(crate) mod net;` in `core_bridge/mod.rs`.
+  - Tests: 31 `online_ui` (14 pure entry/status/text logic + 17 headless
+    flow/overlay/teardown) and 4 new `screens_menu` (Title button stage
+    transitions with title-hide, no-cross-talk with solo/versus, role-aware
+    headline ×4 role/winner combos, local headline unchanged); existing T26
+    suite passes unmodified. **Pending author sign-off**: two-machine LAN +
+    internet playtest and delay-feel check (an agent cannot operate two
+    machines; request: host on machine A, join B→A over LAN for one full
+    garbage match, repeat over internet, confirm default `TETRIS_NET_DELAY`
+    feels responsive, plus mid-match leave from each end).
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/online_ui.rs`
+  (new — flow machine, entry, overlays, session watcher, mountable plugin),
+  `crates/tetris-app/src/screens_menu.rs` (Online title entry, `InMatch`
+  pause/rematch/menu gates, role-aware headline, title-hide, plugin mount),
+  `crates/tetris-app/src/settings_persist.rs` (`NetProfile` +
+  load/flush/exit helpers + tests)
 
 ### N6: Cross-process net harness + CI-automatable end-to-end test
 - **depends_on**: [N4]
