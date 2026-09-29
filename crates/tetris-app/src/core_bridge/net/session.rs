@@ -43,6 +43,14 @@
 //! on. N3 must therefore also consume `Bye` in its own drain — this module
 //! only handles `Bye` while still inside the handshake window.
 //!
+//! **Consume-on-read discipline**: renet's reliable channels hand each
+//! message to exactly one `receive_message` call, so a session drain must
+//! *stop* at its status boundary, not keep reading past it and discard —
+//! messages the session layer leaves unread survive on the channel for the
+//! lockstep drain in the same or the next frame. Draining past the guest's
+//! `MatchStart` transition and dropping the `TickBatch`es behind it was the
+//! N6 tick-0 stall (regression-tested in `harness.rs`).
+//!
 //! # API surprises resolved here (beyond the Verified API notes)
 //!
 //! - The built-in `client_just_connected`/`client_just_disconnected`
@@ -616,7 +624,14 @@ fn host_net_system(
 
     // ReliableOrdered: the app-level Hello (N3 owns this channel once the
     // handshake is done — see the boundary note in the module docs).
-    while let Some(bytes) = server.receive_message(peer, DefaultChannel::ReliableOrdered) {
+    // Symmetric with the guest drain: stop consuming the moment the status
+    // leaves `Handshaking` — renet consumes reliable messages on read, so
+    // anything queued behind the `Hello` must survive for its owner (the
+    // `Bye` window below, or N3's `server_inbox` from `InMatch` on).
+    while session.status == NetStatus::Handshaking {
+        let Some(bytes) = server.receive_message(peer, DefaultChannel::ReliableOrdered) else {
+            break;
+        };
         match protocol::decode(&bytes) {
             Ok(NetMsg::Hello { version, delay }) => {
                 if version == PROTOCOL_VERSION {
@@ -711,28 +726,35 @@ fn guest_net_system(
     }
 
     // Wire drain until the match starts (N3 owns the channels in InMatch).
-    if matches!(session.status, NetStatus::Handshaking | NetStatus::Ready) {
-        while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
-            match protocol::decode(&bytes) {
-                Ok(NetMsg::MatchStart {
-                    seed,
-                    rule,
-                    match_delay,
-                }) => {
-                    if session.apply(NetTrigger::MatchStart) {
-                        session.input_delay = match_delay;
-                        // N4 contract hook: park the initial start for
-                        // `guest_pending_start_system` to build the mirror
-                        // from (the guest never derives its own seed). Later
-                        // rematches arrive once `InMatch`, when N3's lockstep
-                        // already owns the channel and parks them itself.
-                        lockstep.pending_start = Some((seed, rule, match_delay));
-                        info!("net: match start seed {seed} rule {rule:?} delay {match_delay}");
-                    }
+    // The status is re-checked every iteration: renet consumes reliable
+    // messages *on read*, so the drain must stop at the `InMatch`
+    // transition without touching what follows `MatchStart` — the
+    // `TickBatch`es queued behind it in the same poll window belong to N3's
+    // `client_inbox` (discarding them stalls the mirror at tick 0 forever;
+    // N6 routed fixup).
+    while matches!(session.status, NetStatus::Handshaking | NetStatus::Ready) {
+        let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) else {
+            break;
+        };
+        match protocol::decode(&bytes) {
+            Ok(NetMsg::MatchStart {
+                seed,
+                rule,
+                match_delay,
+            }) => {
+                if session.apply(NetTrigger::MatchStart) {
+                    session.input_delay = match_delay;
+                    // N4 contract hook: park the initial start for
+                    // `guest_pending_start_system` to build the mirror
+                    // from (the guest never derives its own seed). Later
+                    // rematches arrive once `InMatch`, when N3's lockstep
+                    // already owns the channel and parks them itself.
+                    lockstep.pending_start = Some((seed, rule, match_delay));
+                    info!("net: match start seed {seed} rule {rule:?} delay {match_delay}");
                 }
-                Ok(other) => debug!("net: ignoring {other:?} before match start"),
-                Err(e) => warn!("net: dropping undecodable payload: {e}"),
             }
+            Ok(other) => debug!("net: ignoring {other:?} before match start"),
+            Err(e) => warn!("net: dropping undecodable payload: {e}"),
         }
     }
     if matches!(session.status, NetStatus::Handshaking | NetStatus::Ready) {
@@ -1121,27 +1143,20 @@ mod tests {
     // net_host + net_join → connect → both peers Ready (host on valid
     // Hello) → clean guest exit → host sees the loss.
     //
-    // Fixed port from `TETRIS_TEST_NET_PORT` (deterministic default
-    // [`TEST_PORT_DEFAULT`]). Collision caveat: a *foreign* process holding
-    // the port fails the fixture, so it is serialized with every other
-    // socket test in the binary through the shared [`TEST_NET_LOCK`]
-    // (N6's harness must take the same lock).
+    // Port strategy: **port 0 + read-back** (the N3 loopback smoke and the
+    // N4 seed-propagation precedent; the N6 harness pairs use it too). The
+    // old fixed `TETRIS_TEST_NET_PORT` (default 34857) contended with
+    // *foreign* suites binding the same port — `--test-threads=1` hid it in
+    // one binary, parallel runs flaked across binaries. These fixtures need
+    // no known port (the guest learns it from `NetSession::listen_addr`),
+    // so they bind port 0 and drop the lock entirely. [`TEST_NET_LOCK`]
+    // now only guards the two tests that genuinely need fixed-port
+    // guarantees: the occupied-port bind-failure probe and the dead-port
+    // watchdog fixture.
 
     use std::sync::Mutex;
 
     pub(crate) static TEST_NET_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Default loopback port for the socket tests (`TETRIS_TEST_NET_PORT`
-    /// overrides). Collision caveat: pick one unlikely to clash with local
-    /// services if this default does.
-    pub const TEST_PORT_DEFAULT: u16 = 34_857;
-
-    fn test_net_port() -> u16 {
-        std::env::var("TETRIS_TEST_NET_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(TEST_PORT_DEFAULT)
-    }
 
     /// Reserve an OS-assigned free port by briefly binding port 0.
     fn bind_any_port() -> SocketAddr {
@@ -1149,6 +1164,18 @@ mod tests {
             .expect("free port bind")
             .local_addr()
             .expect("local addr")
+    }
+
+    /// Host on an OS-assigned port (port 0 + read-back), returning the
+    /// loopback address a guest should join.
+    fn hosted_on_free_port(host: &mut App) -> SocketAddr {
+        net_host(host.world_mut(), 0);
+        let listen = host
+            .world()
+            .resource::<NetSession>()
+            .listen_addr
+            .expect("port 0 bind must publish its bound address");
+        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), listen.port())
     }
 
     fn net_app() -> App {
@@ -1194,13 +1221,9 @@ mod tests {
 
     #[test]
     fn loopback_connect_handshake_then_clean_bye() {
-        let _guard = TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = test_net_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
         let mut host = net_app();
         let mut guest = net_app();
-        net_host(host.world_mut(), port);
+        let addr = hosted_on_free_port(&mut host);
         assert_eq!(session_status(&host), NetStatus::Listening);
         net_join(guest.world_mut(), addr);
         assert_eq!(session_status(&guest), NetStatus::Connecting);
@@ -1252,13 +1275,9 @@ mod tests {
 
     #[test]
     fn loopback_peer_exit_surfaces_lost_on_host() {
-        let _guard = TEST_NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = test_net_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
         let mut host = net_app();
         let mut guest = net_app();
-        net_host(host.world_mut(), port);
+        let addr = hosted_on_free_port(&mut host);
         net_join(guest.world_mut(), addr);
         drive_until(&mut host, &mut guest, 1_000, |h, g| {
             session_status(h) == NetStatus::Ready && session_status(g) == NetStatus::Ready

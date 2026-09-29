@@ -62,11 +62,10 @@
 //! unequal streams).
 //!
 //! Port strategy: **port 0** (OS-assigned), like N3's loopback smoke and N4's
-//! seed-propagation test — the fixed `TETRIS_TEST_NET_PORT` + `TEST_NET_LOCK`
-//! dance exists to serialize tests that *need* a known port, and these tests
-//! do not (the lock is unreachable from here anyway: `mod tests` in
-//! `session.rs` is private and that file is not N6-owned). Zero collision
-//! risk with the N2 socket tests or a parallel test binary by construction.
+//! seed-propagation test. None of these tests need a known port — and after
+//! the N6 follow-up no netplay test binds a fixed port at all — so a
+//! parallel foreign suite can no longer collide with them (the old shared
+//! `TETRIS_TEST_NET_PORT` flaked exactly that way).
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -79,7 +78,7 @@ use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
 use super::lockstep::local_side;
 use super::session::{net_host, net_join, net_stop, NetEvent, NetRole, NetSession, NetStatus};
 use crate::core_bridge::wall_clock_seed;
-use crate::core_bridge::{start_net_match, Controller, SimPaused, VersusMatch, VersusWinner};
+use crate::core_bridge::{start_net_match, Controller, VersusMatch, VersusWinner};
 use crate::state::AppState;
 
 /// Env var selecting the desktop netplay harness mode: `host:<port>` or
@@ -113,11 +112,6 @@ const EXIT_HOLD: Duration = Duration::from_secs(2);
 /// A live match whose lockstep tick has not advanced for this long is a
 /// stall: the harness fails (exit 1) instead of hanging forever.
 pub const NET_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Host-side grace window after `MatchStart` during which the simulation is
-/// held in [`SimPaused`] so the guest's pre-match wire drain completes before
-/// any `TickBatch` is produced (see [`start_desktop_match`]).
-const MATCH_START_HOLD: Duration = Duration::from_millis(250);
 
 /// Parsed [`NET_ENV`] mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,10 +215,6 @@ struct NetDesktopHarness {
     /// only the host runs [`start_desktop_match`], so the guest needs a reset
     /// that a fresh wire match seed provides.
     last_crowned_seed: Option<u64>,
-    /// Host: while `Some`, [`SimPaused`] is held so no `TickBatch` can reach
-    /// the guest before its `MatchStart` drain completes (see
-    /// [`start_desktop_match`]).
-    hold_until: Option<Instant>,
     /// Host: when to send the next `MatchStart` (post-crown hold).
     restart_at: Option<Instant>,
     /// Both matches done: when to tear down and exit successfully.
@@ -258,7 +248,6 @@ pub fn net_harness_startup(world: &mut World) {
         mode,
         matches_done: 0,
         last_crowned_seed: None,
-        hold_until: None,
         restart_at: None,
         exit_at: None,
         stall_tick: 0,
@@ -319,18 +308,15 @@ fn side_hash(snapshot: &tetris_core::game::GameSnapshot) -> u64 {
 /// [`start_net_match`] (the N4 lifecycle: `SEED_ENV` wins over the wall-clock
 /// seed, `MatchStart` goes on the wire, the guest mirrors from it).
 ///
-/// The host simulation is held in [`SimPaused`] for [`MATCH_START_HOLD`]
-/// after `MatchStart`: `guest_net_system`'s pre-match wire drain reads the
-/// whole reliable channel the instant it transitions `InMatch`, discarding
-/// every `TickBatch` queued behind `MatchStart` ("ignoring … before match
-/// start") — and any batches produced by the host before the guest's first
-/// `InMatch` poll land in exactly that window (one guest poll may cover
-/// several host updates). A guest that loses batch 0 stalls at tick 0
-/// forever. The hold lets the guest's drain complete before any batch is
-/// produced. (The drain itself is N2's; once it stops dropping post-
-/// `MatchStart` messages in the same pass, this hold is harmless belt-and-
-/// braces.)
-fn start_desktop_match(world: &mut World, harness: &mut NetDesktopHarness, rule: AttackRule) {
+/// No post-start hold is needed: the session-layer wire drains stop exactly
+/// at the guest's `MatchStart` transition (`session` module docs'
+/// consume-on-read discipline), so any `TickBatch` the host produces before
+/// the guest mirror materializes stays on the reliable channel, is buffered
+/// by N3's lockstep and replayed in order — the stall regression test
+/// ([`matchstart_transition_frame_does_not_swallow_queued_tickbatches`] in
+/// the tests) pins that. (The 250 ms `SimPaused` hold this used to arm was
+/// a workaround for the pre-match drain discarding those batches.)
+fn start_desktop_match(world: &mut World, rule: AttackRule) {
     if let Some(mut versus) = world.get_non_send_mut::<VersusMatch>() {
         versus.p1 = Controller::Bot;
     }
@@ -338,11 +324,9 @@ fn start_desktop_match(world: &mut World, harness: &mut NetDesktopHarness, rule:
     let delay = world.resource::<NetSession>().input_delay;
     let seed = wall_clock_seed();
     info!("NET match_start rule={rule:?} seed={seed} delay={delay}");
-    world.insert_resource(SimPaused(true));
     start_net_match(world, rule, Side::Left, seed, delay);
     // `last_crowned_seed` needs no reset: the fresh wall-clock seed is not yet
     // recorded, so the crowning block will fire for this match on both roles.
-    harness.hold_until = Some(Instant::now() + MATCH_START_HOLD);
 }
 
 /// The desktop loop (mirrors `versus_harness_update`): host starts matches,
@@ -366,15 +350,6 @@ pub fn net_harness_update(world: &mut World) {
         .remove_resource::<NetDesktopHarness>()
         .expect("checked above");
 
-    // Release the post-MatchStart hold: by now the guest has polled the
-    // wire and its pre-match drain is done (see start_desktop_match).
-    if harness.hold_until.is_some_and(|until| now >= until) {
-        harness.hold_until = None;
-        if let Some(mut paused) = world.get_resource_mut::<SimPaused>() {
-            paused.0 = false;
-        }
-    }
-
     // Host: first match once the peer is Ready; later matches when the
     // post-crown hold expires (re-arms through the wire MatchStart).
     if role == NetRole::Host && harness.matches_done < DESKTOP_MATCHES {
@@ -385,7 +360,7 @@ pub fn net_harness_update(world: &mut World) {
         if start_now {
             harness.restart_at = None;
             let rule = DESKTOP_RULES[harness.matches_done as usize];
-            start_desktop_match(world, &mut harness, rule);
+            start_desktop_match(world, rule);
             // The fresh mirror cleared VersusWinner; the `winner` read above
             // still holds the PREVIOUS match's crowning — drop it so the
             // rematch is never logged as an instant 0-tick winner.
@@ -777,40 +752,15 @@ mod tests {
             .collect()
     }
 
-    /// Start the match with the host held in [`SimPaused`] until the guest
-    /// mirror is live, mirroring [`start_desktop_match`]: the host's first
-    /// batches are queued before the guest's first `InMatch` poll, and
-    /// `guest_net_system`'s pre-match drain discards everything the reliable
-    /// channel holds behind `MatchStart` — losing batch 0 would stall the
-    /// mirror at tick 0 forever. While paused the host produces no batches
-    /// at all, so the drain window closes over an empty stream; the test
-    /// releases the hold only once it has *seen* the guest mirror active
-    /// (its drain is provably done then), plus two settling frames.
-    fn start_net_match_quiet(
-        host: &mut App,
-        guest: &mut App,
-        rule: AttackRule,
-        seed: u64,
-        delay: u8,
-    ) {
-        host.world_mut().insert_resource(SimPaused(true));
+    /// Start the match **live** — no `SimPaused` "quiet window" gate (the N6
+    /// workaround was removed together with the drain bug it papered over):
+    /// the host begins producing batches immediately, so every E2E run
+    /// crosses the exact `MatchStart`-transition window the stall regression
+    /// test (`matchstart_transition_frame_does_not_swallow_queued_tickbatches`)
+    /// pins — the guest must catch up from the batches queued on the wire.
+    fn start_net_match_live(host: &mut App, rule: AttackRule, seed: u64, delay: u8) {
         start_net_match(host.world_mut(), rule, Side::Left, seed, delay);
         assert_eq!(session_status(host), NetStatus::InMatch);
-        drive_until(
-            host,
-            guest,
-            Duration::from_secs(30),
-            "guest mirror (paused window)",
-            |_, g| {
-                session_status(g) == NetStatus::InMatch
-                    && g.world().non_send::<VersusMatch>().active
-            },
-        );
-        for _ in 0..2 {
-            host.update();
-            guest.update();
-        }
-        host.world_mut().resource_mut::<SimPaused>().0 = false;
     }
 
     /// The CI end-to-end test: a full Garbage match between two Bots across
@@ -825,7 +775,7 @@ mod tests {
         let delay = 4;
         // Host arms its local seat first: setup_net_mirror preserves it.
         host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
-        start_net_match_quiet(&mut host, &mut guest, rule, seed, delay);
+        start_net_match_live(&mut host, rule, seed, delay);
 
         // The guest mirror must materialize purely from the wire MatchStart.
         drive_until(
@@ -947,7 +897,7 @@ mod tests {
     fn e2e_fork_injection_detected() {
         let (mut host, mut guest) = connect_pair(12.0);
         let seed = 0xE2E5_E2E0_0000_0002;
-        start_net_match_quiet(&mut host, &mut guest, AttackRule::Garbage, seed, 4);
+        start_net_match_live(&mut host, AttackRule::Garbage, seed, 4);
         drive_until(
             &mut host,
             &mut guest,
@@ -1013,6 +963,81 @@ mod tests {
         assert!(
             diverged,
             "recorded streams must actually differ once forked (common: {common:?})"
+        );
+
+        net_stop(host.world_mut());
+        net_stop(guest.world_mut());
+    }
+
+    /// Regression (N6 routed fixup — production stall): the guest's
+    /// `MatchStart` transition frame must stop consuming the reliable channel
+    /// at the transition, leaving every `TickBatch` queued behind `MatchStart`
+    /// in the same poll window for N3's lockstep drain. The pre-fix
+    /// `guest_net_system` drained the whole channel past the transition and
+    /// discarded the batches ("ignoring … before match start") — and renet
+    /// consumes reliable messages *on read*, so the lost batch 0 was never
+    /// resent and the mirror stalled at tick 0 forever.
+    ///
+    /// The window is deterministic: handshaked pair, match started while the
+    /// guest is never `update()`d — every packet the host sends sits unread in
+    /// the guest's socket, and the netcode client delivers the whole backlog
+    /// inside one poll (`update` reads until WouldBlock).
+    #[test]
+    fn matchstart_transition_frame_does_not_swallow_queued_tickbatches() {
+        let (mut host, mut guest) = connect_pair(12.0);
+        let seed = 0xE2E5_E2E0_0000_0003;
+        host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
+
+        // Start the match with the guest frozen: `MatchStart` plus the host's
+        // first batches pile up on the wire before the guest polls again.
+        start_net_match(host.world_mut(), AttackRule::Garbage, Side::Left, seed, 4);
+        assert_eq!(session_status(&host), NetStatus::InMatch);
+        for _ in 0..40 {
+            host.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            lockstep_tick(&host) >= 3,
+            "host must have produced batches 0..{} while the guest was frozen",
+            lockstep_tick(&host),
+        );
+
+        // The guest's single transition-frame poll: `MatchStart` and the
+        // queued batches are all in its reliable channel right now.
+        guest.update();
+        assert_eq!(session_status(&guest), NetStatus::InMatch);
+
+        // Fixed: the mirror materializes from the parked start, executes the
+        // queued batches and ticks past 0. Pre-fix RED: tick 0 forever,
+        // `stall_steps` climbing (batch 0 was discarded in the drain).
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "guest ticks past 0 (no transition-frame stall)",
+            |_, g| lockstep_tick(g) > 0,
+        );
+
+        // And it executed *every* queued batch, in order: freeze the host at
+        // its current tick, let the guest replay its backlog, then the two
+        // mirrors must be snapshot-identical at that tick (a swallowed or
+        // misordered batch either stalls the replay below or forks the board).
+        let host_tick = lockstep_tick(&host);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while lockstep_tick(&guest) < host_tick {
+            guest.update();
+            assert!(
+                Instant::now() < deadline,
+                "guest never replayed the host's queued batches: tick {}/{}",
+                lockstep_tick(&guest),
+                host_tick,
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            versus_snapshot(&host),
+            versus_snapshot(&guest),
+            "guest must have applied every queued batch identically"
         );
 
         net_stop(host.world_mut());
