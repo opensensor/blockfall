@@ -216,8 +216,11 @@ pub fn net_fork_system(
 struct NetDesktopHarness {
     mode: NetHarnessMode,
     matches_done: u32,
-    /// The running match's result has been logged (once).
-    logged: bool,
+    /// Seed of the last match whose crowning has been logged. Keyed by seed
+    /// (not a `logged` bool) so *both* roles count each `MatchStart`'s result:
+    /// only the host runs [`start_desktop_match`], so the guest needs a reset
+    /// that a fresh wire match seed provides.
+    last_crowned_seed: Option<u64>,
     /// Host: while `Some`, [`SimPaused`] is held so no `TickBatch` can reach
     /// the guest before its `MatchStart` drain completes (see
     /// [`start_desktop_match`]).
@@ -254,7 +257,7 @@ pub fn net_harness_startup(world: &mut World) {
     world.insert_resource(NetDesktopHarness {
         mode,
         matches_done: 0,
-        logged: false,
+        last_crowned_seed: None,
         hold_until: None,
         restart_at: None,
         exit_at: None,
@@ -267,13 +270,36 @@ pub fn net_harness_startup(world: &mut World) {
     }
 }
 
-/// `NET fail …` + graceful peer teardown + hard exit 1. Direct
-/// [`std::process::exit`] because the frozen `main()` drops the [`AppExit`]
-/// value (module docs).
+/// `NET fail …` + graceful peer teardown + hard exit 1. Direct process exit
+/// because the frozen `main()` drops the [`AppExit`] value (module docs).
+///
+/// On unix this goes through libc `_exit` rather than [`std::process::exit`]:
+/// a normal `exit()` runs atexit handlers while the winit/GPU threads are
+/// still live mid-frame, which segfaults (exit 139, not 1 — verified on
+/// X11 + NVIDIA). `_exit` skips the handlers entirely, so the exit code is
+/// exactly 1; stderr is flushed first so the `NET fail` line survives.
 fn net_harness_fail(world: &mut World, reason: &str) -> ! {
     error!("NET fail {reason}");
     net_stop(world);
-    std::process::exit(1);
+    net_harness_exit_failure()
+}
+
+fn net_harness_exit_failure() -> ! {
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let _ = std::io::stdout().flush();
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn _exit(code: std::ffi::c_int) -> !;
+        }
+        // SAFETY: `_exit` is async-signal-safe and terminates the process
+        // immediately; no Rust destructors run (intentional — the whole app
+        // is being torn down).
+        unsafe { _exit(1) }
+    }
+    #[cfg(not(unix))]
+    std::process::exit(1)
 }
 
 /// FNV-1a-64 over the bincode bytes of one side's `GameSnapshot` — the same
@@ -314,7 +340,8 @@ fn start_desktop_match(world: &mut World, harness: &mut NetDesktopHarness, rule:
     info!("NET match_start rule={rule:?} seed={seed} delay={delay}");
     world.insert_resource(SimPaused(true));
     start_net_match(world, rule, Side::Left, seed, delay);
-    harness.logged = false;
+    // `last_crowned_seed` needs no reset: the fresh wall-clock seed is not yet
+    // recorded, so the crowning block will fire for this match on both roles.
     harness.hold_until = Some(Instant::now() + MATCH_START_HOLD);
 }
 
@@ -331,7 +358,7 @@ pub fn net_harness_update(world: &mut World) {
     let versus_active = world
         .get_non_send::<VersusMatch>()
         .is_some_and(|v| v.active);
-    let winner = world.resource::<VersusWinner>().0;
+    let mut winner = world.resource::<VersusWinner>().0;
     let tick = world.resource::<super::lockstep::NetLockstep>().tick;
     let now = Instant::now();
 
@@ -359,6 +386,10 @@ pub fn net_harness_update(world: &mut World) {
             harness.restart_at = None;
             let rule = DESKTOP_RULES[harness.matches_done as usize];
             start_desktop_match(world, &mut harness, rule);
+            // The fresh mirror cleared VersusWinner; the `winner` read above
+            // still holds the PREVIOUS match's crowning — drop it so the
+            // rematch is never logged as an instant 0-tick winner.
+            winner = None;
         }
     }
 
@@ -373,25 +404,29 @@ pub fn net_harness_update(world: &mut World) {
         }
     }
 
-    // Crowning is deterministic on both mirrors: log once per match.
-    if versus_active && winner.is_some() && !harness.logged {
-        harness.logged = true;
-        harness.matches_done += 1;
+    // Crowning is deterministic on both mirrors: log once per match, keyed by
+    // the freshly-crowned match's seed so the guest — which never runs
+    // `start_desktop_match` — still counts every wire `MatchStart`.
+    if versus_active && winner.is_some() {
         let versus = world.non_send::<VersusMatch>();
-        let (left, right) = (
-            versus.match_.left.snapshot(),
-            versus.match_.right.snapshot(),
-        );
-        info!("NET match_done seed={} ticks={}", versus.seed, versus.steps);
-        info!(
-            "NET final_hash left={left} right={right}",
-            left = side_hash(&left),
-            right = side_hash(&right),
-        );
-        if harness.matches_done >= DESKTOP_MATCHES {
-            harness.exit_at = Some(now + EXIT_HOLD);
-        } else {
-            harness.restart_at = Some(now + REMATCH_HOLD);
+        if harness.last_crowned_seed != Some(versus.seed) {
+            harness.last_crowned_seed = Some(versus.seed);
+            harness.matches_done += 1;
+            let (left, right) = (
+                versus.match_.left.snapshot(),
+                versus.match_.right.snapshot(),
+            );
+            info!("NET match_done seed={} ticks={}", versus.seed, versus.steps);
+            info!(
+                "NET final_hash left={left} right={right}",
+                left = side_hash(&left),
+                right = side_hash(&right),
+            );
+            if harness.matches_done >= DESKTOP_MATCHES {
+                harness.exit_at = Some(now + EXIT_HOLD);
+            } else {
+                harness.restart_at = Some(now + REMATCH_HOLD);
+            }
         }
     }
 
@@ -415,9 +450,21 @@ pub fn net_harness_update(world: &mut World) {
                 net_harness_fail(world, &format!("desync detected at tick {tick}"))
             }
             NetEvent::PeerLost(reason) => {
-                if !resolved {
-                    net_harness_fail(world, &format!("connection lost: {reason:?}"))
+                if resolved {
+                    // Peer finished and left: clean success, mirroring the
+                    // host's own exit path (`AppExit::Success`, no
+                    // `std::process::exit` — that segfaults when invoked
+                    // mid-frame with GPU/tracing atexit handlers loaded).
+                    info!(
+                        "NET peer left after resolved run (matches_done={}) exiting clean: {reason:?}",
+                        harness.matches_done
+                    );
+                    net_stop(world);
+                    world.insert_resource(harness);
+                    world.write_message(AppExit::Success);
+                    return;
                 }
+                net_harness_fail(world, &format!("connection lost: {reason:?}"))
             }
             NetEvent::JoinTimeout => {
                 if !resolved {
@@ -425,9 +472,17 @@ pub fn net_harness_update(world: &mut World) {
                 }
             }
             NetEvent::ByeReceived => {
-                if !resolved {
-                    net_harness_fail(world, "peer left before the match resolved")
+                if resolved {
+                    info!(
+                        "NET peer left after resolved run (matches_done={}) exiting clean",
+                        harness.matches_done
+                    );
+                    net_stop(world);
+                    world.insert_resource(harness);
+                    world.write_message(AppExit::Success);
+                    return;
                 }
+                net_harness_fail(world, "peer left before the match resolved")
             }
             NetEvent::PeerConnected | NetEvent::VersionMismatch | NetEvent::BindFailed(_) => {}
         }
