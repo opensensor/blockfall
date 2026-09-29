@@ -1,0 +1,489 @@
+# Plan: Networked 1v1 Opponent Support (Netplay)
+
+**Generated**: 2026-09-28 (rev 2 — post-review: net module re-homed under
+`core_bridge/`, CI strategy reworked, input/pause/rematch/teardown contracts
+made explicit, N7 re-scoped after verifying the core is integer-only)
+
+## Overview
+
+Adds online 1v1 versus to Blockfall on top of the existing local versus stack
+(T24–T26). Design decisions, confirmed with the author:
+
+- **Connection**: direct IP/port. Host opens a listening port; guest types
+  `ip:port`. No lobby, no signaling server, no LAN discovery (post-v1).
+- **Sync model**: deterministic **lockstep with input delay**. Both peers run
+  the identical `tetris_core::versus::Match` from one shared seed; inputs land
+  D ticks late (delay-based, default 8 fixed steps ≈ 133 ms). No rollback, no
+  state streaming — the opponent's board, HUD, next/hold, and pending garbage
+  all come *for free* from the local deterministic mirror. Host is the
+  authoritative tick clock; periodic snapshot-hash comparison detects desync.
+- **Transport**: `bevy_renet` 5.0.0 (crates.io verified 2026-09-28: depends
+  on `bevy_app ^0.19`, compatible with the pinned Bevy 0.19.1) with its
+  default **netcode** transport (encrypted UDP, connection management,
+  ReliableOrdered / ReliableUnordered / Unreliable channels). MIT/Apache —
+  compatible with the GPL-3.0 app.
+
+Integration philosophy mirrors T25: the net layer lives **under the existing
+bridge** as `crates/tetris-app/src/core_bridge/net/` (declared by
+`core_bridge/mod.rs`, which already declares `mod versus;`), and `NetPlugin`
+is mounted from `CoreBridgePlugin::build()` — the exact precedent
+`VersusBridgePlugin` uses. **`main.rs` stays frozen** (it is the only crate
+root: `mod` declarations at `main.rs:9-18`, the only production plugin list at
+`main.rs:50-60`). The net systems **gate the existing versus systems in and
+out**; the `tetris-core` public API stays frozen; solo play is untouched; the
+`AppState` enum is unchanged (net UI gates on `NetSession` status, like T26's
+`VersusFlow` stage machine).
+
+Determinism premise, verified at plan time: `tetris-core` contains **zero**
+`f32`/`f64` (timers are `u32`/`u64` tick counters, e.g.
+`game.rs:77-78`), and `Action`, `MatchSnapshot`, `GameSnapshot`, `Board` all
+derive `Serialize + Deserialize` (`actions.rs:11`, `versus.rs:158`,
+`game.rs:37`, `board.rs:22`). Lockstep mirrors are therefore cross-platform
+bit-exact by construction; no FP/FMA caveat is needed.
+
+Existing hooks this plan stands on:
+- `tetris_core::versus::Match` — `new(seed, rule)`, `apply(side, action)`,
+  `tick(side)`, `snapshot()`; serde types; fully deterministic from seed +
+  actions (proven by T24 tests + nightly soak).
+- `core_bridge/versus.rs` — `VersusMatch` (NonSend), `Controller {Human,Bot}`,
+  `VersusWinner`, `VersusEvent`, `start_versus`/`end_versus`, the 60 Hz
+  `versus_bridge_system` drain-then-tick order (actions first, then
+  `Match::tick` left,right — `core_bridge/versus.rs:256-264`),
+  `versus_bot_system`, `versus_restart_on_r_system` (R on `Update`), the
+  `TETRIS_1V1` in-process env-harness pattern.
+- `input.rs` — `VersusActions {left, right}`, `VersusBindings` P1/P2 presets,
+  the lone-human preset override (`input.rs:742-764` — `lone_human_p1`
+  currently triggers whenever `p2` is not `Human`: **N4 must account for it**,
+  see below), DAS/ARR via `ShiftRepeat`/`RepeatTimer`.
+- `screens_menu.rs` — `VersusFlow` stage machine, winner overlay
+  (`winner_text` at :275 exhaustively matches `Controller`), pause chord
+  (`pause_chord_system` :507-532), `VersusRematchButton` →
+  `rematch_versus` → `start_versus` (which re-seeds **locally** — dangerous
+  for mirrors, gated in N5), plus two recorded visibility regressions
+  (:1646-1693 click-swallowing active versus HUD; :960-975/:2055-2062
+  ZIndex click-through) that N3/N5's teardown contract must respect.
+- `core_bridge/mod.rs:573` — `CoreBridgePlugin::build()` mounts
+  `VersusBridgePlugin`; same slot mounts `NetPlugin`.
+- `settings_persist.rs` — load/save helpers reused by a **separate**
+  `net_profile` persistence (the T1 contract in `state.rs:1-3` forbids
+  reshaping `Settings`).
+
+## Wire protocol (agreed design, implemented in N1/N2/N3)
+
+Channel usage (client→server = guest→host; server→client = host→guest).
+Send types are **design intent** — N1's spike finalizes exact renet 2.0
+channel/message APIs (note: `resend_time` is a `ReliableUnordered` knob;
+ReliableOrdered resends continuously — do not treat the table as verified
+API):
+
+| Msg | Dir | Channel (intent) | Notes |
+| --- | --- | --- | --- |
+| `Hello { version, delay }` | guest→host | ReliableOrdered | version must equal `PROTOCOL_VERSION`; `delay` = guest's desired input delay, both sides adopt `D = max(host, guest)` |
+| `MatchStart { seed, rule }` | host→guest | ReliableOrdered | guest never starts play without it; also implements **rematch** (host sends a fresh one) |
+| `TickInput { tick, actions }` | guest→host | ReliableOrdered | arrives ≈D ticks early; D absorbs jitter |
+| `TickBatch { tick, left, right }` | host→guest | ReliableOrdered | sent **every** tick (empty lists included) — doubles as clock pacing; batch T is emitted when tick T−D executes |
+| `SnapshotHash { side, tick, left, right }` | both | ReliableUnordered | every 60 ticks; mismatch → desync teardown |
+| `Bye` | either | ReliableUnordered | clean exit → peer tears down to title overlay |
+
+- Roles: host = netcode **server** (`max_clients: 1`) and always
+  `Side::Left`; guest = netcode **client** and always `Side::Right` —
+  identical to the local P1/P2 split, so T26's versus HUD/viewport code is
+  reused unchanged.
+- Tick clock: the host's counter over `FixedUpdate` steps is authoritative;
+  the guest executes batches strictly in tick order. A tick whose remote
+  input hasn't arrived executes with an empty action list (never wait — the
+  hash check would otherwise flag a stall as divergence; late inputs are
+  dropped and logged, which is exactly why `D` is negotiated as `max`).
+- Input path: each side's local player queues actions for tick `T + D`; they
+  are queued locally AND sent immediately as `TickInput { T + D }`. At batch
+  build time the host merges its own delayed queue with the guest's
+  already-arrived `TickInput` for that tick, applies both sides to its local
+  `Match`, and ships the batch; the guest mirrors it.
+- Serialization: bincode 1.3 over the serde types. Snapshot hash: FNV-1a over
+  the bincode bytes of `MatchSnapshot` (process-stable, unlike std `Hash`).
+- Auth: v1 uses `ServerAuthentication::Unsecure` + fixed `PROTOCOL_ID`
+  (netcode still rejects wrong-protocol traffic). No session tokens in v1.
+- **Netcode limitation, designed around**: with `max_clients: 1` a second
+  inbound client is **silently dropped** by the transport (no server event).
+  "Match full" is therefore indistinguishable from "host offline" and is
+  presented as a join-timeout message, not a distinct event.
+
+## Dependency Graph
+
+```
+N1 ── N2 ── N3 ── N4 ──┬── N5 ──┐
+                        │        ├── N8 (docs)
+                        └── N6 ──┼── N7 (soak/audit)
+                                 └────── N8
+Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
+```
+
+## Tasks
+
+### N1: Wire protocol codec + dependency landing + API spike
+- **depends_on**: []
+- **location**: `Cargo.toml` (workspace deps), `crates/tetris-app/Cargo.toml`,
+  `crates/tetris-app/src/core_bridge/net/mod.rs` (new),
+  `crates/tetris-app/src/core_bridge/net/protocol.rs` (new),
+  `crates/tetris-app/src/core_bridge/mod.rs` (one `mod net;` line)
+- **description**: Add `bevy_renet = "5.0.0"` (default netcode feature) and
+  `bincode = "1.3"` to `[workspace.dependencies]` + `tetris-app` deps.
+  **First action — the spike**: against the downloaded crate source, pin and
+  record in a `net/mod.rs` doc section ("Verified API notes") every bevy_renet
+  5.0.0 / renet 2.0 / renet_netcode 2.0 surface N2/N3 will code against:
+  message payload encoding (raw bytes vs `Serialize` integration),
+  `ChannelConfig`/`SendType` shapes, `RenetServerPlugin`/`RenetClientPlugin`
+  resource and event types (`RenetServer`, `RenetClient`,
+  `RenetServerEvent`, `RenetReceive`/`RenetSend` sets), netcode
+  `ServerConfig`/`ClientAuthentication` fields, whether the bound port is
+  queryable when binding port 0 (else fixed-port test strategy), transport
+  drop/teardown semantics for un-listening, and connect timeout
+  configurability. Then define `PROTOCOL_ID: u64`,
+  `PROTOCOL_VERSION: &str`, the `NetMsg` enum (Hello{version,delay},
+  MatchStart, TickInput, TickBatch, SnapshotHash, Bye — embedding
+  `AttackRule`, `Action`, tick `u64`, `IoError`-free payloads),
+  `encode`/`decode` helpers, `decode` tolerant of unknown variants →
+  `Err(ProtocolError)`, and `snapshot_hash(&MatchSnapshot) -> u64`
+  (FNV-1a over bincode bytes).
+- **validation**: `cargo check --workspace`; round-trip unit tests for every
+  `NetMsg` variant incl. malformed/short-buffer `decode` rejection; hash
+  stability tests (same state equal, differing state differs); all existing
+  tests green (do not pin an exact count); clippy `-D warnings` + fmt clean.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N2: Net session resource + plugin + connection lifecycle
+- **depends_on**: [N1]
+- **location**: `core_bridge/net/mod.rs`, `core_bridge/net/session.rs` (new),
+  `core_bridge/mod.rs` (mount `NetPlugin` inside `CoreBridgePlugin::build()`)
+- **description**: `NetPlugin` adds `RenetServerPlugin` + `RenetClientPlugin`
+  and a `NetSession` resource: `role: NetRole {Host, Guest}`,
+  `status: NetStatus {Idle, Listening, BindFailed(String), Connecting,
+  Handshaking, Ready, InMatch, Lost(NetLossReason)}`, plus owned transport
+  resources while active. Free functions: `net_host(port)` (bind
+  `0.0.0.0:port`, `ServerConfig {max_clients: 1, protocol_id: PROTOCOL_ID,
+  authentication: Unsecure, public_addresses: bound}`; `std::net::UdpSocket`
+  bind error → `BindFailed(msg)`, no panic), `net_join(addr)`,
+  `net_stop()` (drop transport resources → port released; used by Esc-on-
+  Listening and all teardowns). Bridging systems on the renet sets:
+  server `ClientConnected` → expect `Hello`; valid → `Ready`, wrong version →
+  kick, guest mirrors: connected → `Hello{version, delay}` → on `MatchStart`
+  → `InMatch`. `client_just_disconnected` / `ClientDisconnected` / connect
+  timeout → `Lost(reason)`. One `NetEvent` Bevy `Message`
+  (`PeerConnected`, `PeerLost(reason)`, `VersionMismatch`, `BindFailed(msg)`,
+  `JoinTimeout` [≈10 s `Connecting` watchdog], `Desync {tick}`,
+  `ByeReceived`) for N5's UI. Host-side delay adoption: on `Hello`,
+  `D = max(local, peer)` on both sides (guest learns it from
+  `MatchStart.match_delay`; add that field). renet `update`/`send_packets`
+  are driven by the bevy_renet plugin — never poll renet manually.
+- **validation**: `NetStatus` transition-table tests with pure logic factored
+  out; an **in-process two-`App` integration test inside the crate**
+  (`#[cfg(test)]` in `session.rs`): two `App`s with `MinimalPlugins` +
+  `RenetServerPlugin`/`RenetClientPlugin` + netcode transports on a loopback
+  port (fixed test port from `TETRIS_TEST_NET_PORT` env with a deterministic
+  default, documented collision caveat), assert connect → both `Ready`, drop
+  client → host `Lost`. If MinimalPlugins proves insufficient for the renet
+  plugin's system-set ordering, fall back to adding `TimePlugin` and note it
+  in the mod doc. clippy/fmt clean; all existing tests green.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N3: Lockstep engine (tick clock, input delay, mirror stepping, desync check)
+- **depends_on**: [N2]
+- **location**: `core_bridge/net/mod.rs` (submodule decl),
+  `core_bridge/net/lockstep.rs` (new)
+- **description**: The tick driver for `NetStatus::InMatch`, on `FixedUpdate`
+  **in place of** the versus bridge's direct drain (N4 installs the gate;
+  here, provide systems + `NetLockstep` resource: per-side pending-input ring
+  `VecDeque<(tick, Vec<Action>)>`, host's `remote_inputs` fed from
+  `TickInput`, `tick: u64` host counter / guest next-expected-tick + a ≤D
+  batch buffer). Delay from `MatchStart.match_delay` (env default 8 via
+  `TETRIS_NET_DELAY`, clamp 2..=30 — `SEED_ENV` env pattern).
+  Ordering **must mirror `versus_bridge_system`**: apply actions, then
+  `tick(left)`, `tick(right)`; emit `VersusEvent` messages for every
+  `MatchEvent` produced, so T26 juice/audio/HUD work unmodified.
+  Host per step: build `TickBatch {tick, left, right}` from the due
+  delayed-queue + arrived remote inputs (missing remote ⇒ empty list, count
+  a `dropped_late_inputs` diagnostic), apply to local `Match`, send batch,
+  bump tick. Guest per step: if batch for expected tick buffered → apply
+  (actions then tick both sides), else stall (reliability guarantees eventual
+  arrival; count a `stall_steps` diagnostic). Both sides emit
+  `TickInput {tick, actions}` for their local side's queued actions.
+  Every 60 ticks both send `SnapshotHash` (host+guest full-match hash via
+  `snapshot_hash(match_.snapshot())`); mismatch → `NetEvent::Desync` and the
+  **teardown contract below**. **Gates**: skip when `SimPaused.0` or
+  `*app_state != Playing` — this is what makes the Lost/Desync freeze real
+  (N5 flips `SimPaused` and shows the overlay; the lockstep then simply
+  stops ticking while `VersusMatch.active` stays true so the frozen boards
+  remain rendered under the overlay). **Teardown contract** (both desync and
+  `Lost`/`Bye`): (1) set `SimPaused`, show the net overlay root with an
+  **explicit high `ZIndex`** (documented regressions at `screens_menu.rs:960`
+  and `:2055` show why); (2) the match stays `active` (frozen boards visible
+  behind the overlay, versus HUD must not swallow the overlay's buttons —
+  cover with a click-ability test); (3) the user's "Back to title" click runs
+  an `end_versus`-style full teardown (`active=false`, roots restored to the
+  clean-solo regime, `NetSession → Idle`).
+- **validation**: fake-transport seam (`NetOut` trait, N3-owned) running both
+  "peers" deterministically in one process: delay math (input at t batched at
+  t+D), empty-tick correctness, guest stall-and-recover on artificially
+  delayed batch delivery, late-input drop accounting, desync detection on a
+  deliberately forked mirror, teardown contract checks (SimPaused honored, no
+  tick progress while paused); **proptest**: two `Match`es fed the same
+  `TickBatch` stream are snapshot-identical at every tick. All existing tests
+  green; clippy/fmt clean.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N4: Versus bridge + input integration (`Controller::Net`)
+- **depends_on**: [N3]
+- **location**: `core_bridge/versus.rs`, `input.rs`,
+  `screens_menu.rs` (**one-line carve-out only**, see item 3)
+- **description**:
+  1. Extend `Controller` with `Net` (additive variant).
+  2. **Cross-file compile carve-out**: `winner_text` (`screens_menu.rs:275`)
+     exhaustively matches `Controller`, so N4 adds a minimal `Net` arm
+     ("OPPONENT" label) in `screens_menu.rs` — N5 refines it. (Documented
+     exception to N5's file ownership; waves are sequential anyway.)
+  3. Gate `versus_bridge_system`: when `NetSession.status == InMatch`, skip
+     the direct `Match::apply`/`tick` drain — N3's lockstep owns stepping —
+     while keeping `VersusWinner` surfacing and `steps` bookkeeping alive.
+     Suppress R-restart in **`versus_restart_on_r_system`** (that's the
+     actual `Update`-set R handler, not the bridge drain) during `InMatch` —
+     a local reseed would destroy mirror sync.
+  4. `versus_bot_system`: unchanged. A `Bot` side pushing its own side's
+     local queue transparently feeds the net input path — zero
+     special-casing, and the mechanism N6's bot-vs-bot relies on.
+  5. Input routing in `versus_input_system`: while `InMatch`, only the
+     local side's queue is fed from keys (host: left/P1 preset; guest:
+     right/P2 preset); the remote side's queue is never touched by local
+     keys. **Binding-preset fix**: the lone-human override
+     (`input.rs:750`, `lone_human_p1 = p1_human && !p2_human`) currently
+     fires for the host seat pair `Human+Net` and would hand the host the
+     arrow/solo-alternate preset; treat a `Net` seat as occupied
+     (`!(p2_human || p2_net)`), so host gets `bindings.p1` (WASD) and guest
+     gets `bindings.p2` (arrows) via the normal two-seat path. Preserves all
+     existing local-versus behavior (Net never appears locally). Not fully
+     "additive" — a deliberate behavior adjustment scoped to `Net` seats;
+     pinned by tests.
+  6. `start_net_match(rule, local_side, seed, delay)` / `end_net_match`
+     free functions mirroring the `start_versus`/`end_versus` pattern:
+     host honors `SEED_ENV` for harness runs else wall clock, constructs the
+     `Match` locally AND sends `MatchStart`; the guest constructs its
+     `Match` **only** from the received `MatchStart` seed/rule/delay — never
+     a locally derived seed.
+- **validation**: all existing tests green unmodified; new gate-matrix tests
+  (net Idle → bridge path byte-identical to today; InMatch → drain skipped,
+  winner surfacing alive, R suppressed); preset tests: host seat pair
+  `Human+Net` drives left via P1 bindings, guest seat pair `Net+Human` via
+  P2 bindings, remote queue untouched by local keys; lone-human local-versus
+  behavior regression test (vs `Bot` still gets the arrow+solo-alternate
+  preset); `start_net_match` seed-propagation test (guest `Match` seed ==
+  host's). clippy/fmt clean.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N5: Online menu flow, IP entry, status & error overlays, exits
+- **depends_on**: [N4]
+- **location**: `screens_menu.rs` (also refines the `Net` arm in
+  `winner_text`), `settings_persist.rs` (additive helpers for a separate
+  `net_profile` file)
+- **description**: Extend the `VersusFlow` stage machine with an
+  `OnlineFlow`: Title → "1 v 1" gains a Local/Online axis; Online →
+  **Host** (status `Listening`, shows port + connect hint; local-IPv4 hint
+  via the connect-to-public `UdpSocket` trick **with a fallback string** when
+  no route exists; "waiting for challenger…" on `Ready`; **Esc here calls
+  `net_stop()`** — un-listens and frees the port, then back) or **Join**
+  (text-entry widget: charset digits/dots/colon, backspace, Enter submits;
+  Bevy 0.19 clipboard paste only if it works without touching `main.rs`, else
+  keyboard-only — verify and log); status line per `NetStatus`
+  (connecting/handshaking/ready/waiting-for-host — the last covers the
+  guest-at-`Ready`-before-host-rule-pick gap). Host rule/opponent picker
+  (rule picker reused; right side forced `Net`) → `start_net_match` →
+  `MatchStart`. Overlays (winner-overlay spawn/visibility patterns, N3
+  teardown contract, explicit `ZIndex`): `BindFailed` ("port in use"),
+  `VersionMismatch`, `JoinTimeout`/`PeerLost` (frozen boards behind,
+  "Connection lost — host offline or match full" for timeouts),
+  `Desync {tick}` ("desync at tick N — match aborted"), `ByeReceived`
+  ("opponent left"). **Mid-match exit**: Esc during `InMatch` opens a
+  confirm overlay ("Leave match?" Leave/Stay) instead of the pause chord —
+  **pause chord gated off in `pause_chord_system` for `InMatch`** (lockstep
+  has no authoritative pause); Leave sends `Bye` + teardown. **Rematch**:
+  host-only (role-gate the `VersusRematchButton` for guests) and **routed
+  through `start_net_match` (fresh `MatchStart`), never `start_versus`** —
+  the local reseed in `start_versus` would fork the guest's mirror. Guest
+  side: the rematch button is hidden; the guest waits for the host's
+  `MatchStart`. Persist `net_profile.json` (last join address, prefilled in
+  the entry) via `settings_persist` helpers as a **separate** resource —
+  `Settings` in `state.rs` must not be reshaped (T1 contract,
+  `state.rs:1-3`). Esc walks OnlineFlow stages; entering Online never
+  disturbs solo/local-versus flows (their stage tests pass untouched).
+- **validation**: headless-App menu-flow tests per stage transition
+  (mirroring T26's flow tests); `winner_text` Net-arm test; overlay
+  trigger-and-teardown tests per `NetEvent` variant, incl. the recorded
+  visibility/click regressions' patterns (overlay buttons clickable while the
+  frozen versus HUD is visible); entry edit-logic unit tests (charset,
+  backspace, IPv4:port accept/reject); `net_profile` round-trip test. Author
+  sign-off gate (author's rule: agent runs the checklist, posts, stops):
+  two machines play a full garbage match over LAN + internet; default delay
+  feels responsive. clippy/fmt/test gates green.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N6: Cross-process net harness + CI-automatable end-to-end test
+- **depends_on**: [N4]
+- **location**: `core_bridge/net/harness.rs` (new, production env-var path +
+  `#[cfg(test)]` E2E), `core_bridge/net/mod.rs`, `core_bridge/mod.rs`
+  (harness startup hook like `ONE_V_ONE_ENV`), `.github/workflows/ci.yml`
+- **description**: Two deliverables, because CI **cannot run the real
+  binary** (verified: `main()` unconditionally adds `DefaultPlugins`; no
+  display on `ubuntu-latest`; `CARGO_BIN_EXE` spawns would crash on winit —
+  an xvfb full-binary CI job is explicitly out of scope for v1, logged as a
+  follow-up candidate):
+  1. **CI E2E test** (`#[cfg(test)]` in `harness.rs`): two `MinimalPlugins`
+     apps in one process over **real renet/netcode UDP on loopback** — real
+     session FSM, real lockstep driver, real `Match`es, host side driven by
+     `versus_bot_system` (`Bot` for left), guest side by a `Bot` for right —
+     a full garbage match to a crowned winner, asserting both sides'
+     per-60-tick `SnapshotHash` streams equal throughout and final snapshots
+     equal, both apps shut down cleanly. Plus a `TETRIS_NET_FORK=guest:<tick>`
+     test-only lockstep hook: one flipped input action at a tick → the
+     equality assertion **must** fire (proves the test isn't vacuous).
+     Port strategy per N2's fixed-test-port rule; mark
+     `#[ignore]`-parallel-safe (serial with the N2 socket test if needed).
+  2. **Desktop manual harness** `TETRIS_NET=host:<port>` /
+     `TETRIS_NET=join:<addr>` env modes mirroring `TETRIS_1V1` (full
+     `DefaultPlugins` app, human-run only): same bot-vs-bot-across-the-wire,
+     logs `NET match_done seed=… ticks=…`, `NET final_hash left=… right=…`,
+     exits after 2 matches (garbage, race); any `Desync`/`Lost`/120 s stall
+     → exit 1. Used for the N5 sign-off gate and real-NAT testing.
+  CI: the E2E rides the existing `cargo test --workspace` job (no new job,
+  no xvfb); add it to the nightly soak list note if flaky-skip is ever needed.
+- **validation**: locally: `cargo test -p tetris-app net::harness` green,
+  fork-injection variant fails as designed; `TETRIS_NET` host+join on one
+  machine via loopback complete 2 matches with identical `final_hash` and
+  exit 0; on two machines over the LAN the same holds (author runs).
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N7: Netplay soak + protocol-robustness audit
+- **depends_on**: [N6]
+- **location**: `core_bridge/net/harness.rs` (soak extension),
+  `core_bridge/net/protocol.rs` (fuzz tests), `netplay-plan.md` (audit log)
+- **description**: No FP-risk audit needed (core verified integer-only).
+  Instead: (a) extend the E2E into a 20-match soak (alternating
+  Garbage/Race, seed sweep, one very long Race-to-40 with garbage-storm
+  `MAX_GARBAGE_PER_LAND` churn), diffing per-tick hash streams across the
+  two in-process mirrors — end-to-end validation of serialization + plumbing +
+  lockstep under sustained load, tagged `#[ignore]` for the nightly job like
+  `tests/soak.rs`; (b) proptest byte-fuzz over `protocol::decode`: no panic,
+  only `ProtocolError` (host must never fall over on hostile bytes — relevant
+  because auth is Unsecure); (c) record the audit result in this plan's log,
+  including the two-machine desktop `TETRIS_NET` soak if the author ran it.
+- **validation**: 20-match soak green locally and on CI nightly
+  (`--ignored`), zero hash divergence over all matches; 10k-case decode fuzz
+  with no panic; audit conclusion written here.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### N8: Docs, PRD/README/CHANGELOG
+- **depends_on**: [N5, N6]
+- **location**: `README.md`, `PRD.md`, `CHANGELOG.md`
+- **description**: README: Features bullet (online 1v1 lockstep, delay-based),
+  Controls note (host = left/P1 preset, guest = right/P2 preset; no pause in
+  net matches, Esc = leave-with-confirm), env-var table rows (`TETRIS_NET`,
+  `TETRIS_NET_DELAY`, `TETRIS_NET_FORK`), "Playing online" section
+  (port-forward/NAT caveat + firewall note, "match is open while listening —
+  keep sessions short" warning). PRD: §4 multiplayer non-goal struck →
+  reference the implemented §15 scope; §15 marked for local+online versus,
+  keeping lobby/relay/discovery/rollback/session-tokens as post-v1.
+  CHANGELOG unreleased entry; tetris-plan.md note that T24–T26 + N1–N8 form
+  netplay v0.1.
+- **validation**: prose review; docs-only diff; links/anchors resolve.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+## Parallel Execution Groups
+
+| Wave | Tasks | Can Start When |
+| --- | --- | --- |
+| 1 | N1 | Immediately |
+| 2 | N2 | N1 |
+| 3 | N3 | N2 |
+| 4 | N4 | N3 |
+| 5 | N5, N6 | N4 (disjoint files after the N4→N5 `winner_text` handoff: `screens_menu.rs` vs `net/harness.rs` + `core_bridge/mod.rs` hook + CI) |
+| 6 | N7, N8 | N6 / N5+N6 |
+
+Netcode is inherently sequential in the core path (N1→N4); the only safe
+parallelism is N5∥N6 (wave 5) and N7∥N8 (wave 6).
+
+## Testing Strategy
+
+- **Protocol**: round-trip + malformed-decode unit tests (N1); byte-level
+  proptest fuzz with no-panic guarantee (N7).
+- **Session**: `NetStatus` transition-table tests; in-process two-
+  `MinimalPlugins`-App loopback connect/teardown test (N2) — the same
+  fixture style the repo already uses for headless app tests.
+- **Lockstep**: fake-`NetOut` seam tests (delay math, empty ticks, stall,
+  late-input drop, desync detection, SimPaused freeze) + the
+  same-batch-stream proptest (N3).
+- **End-to-end**: two in-process apps over real netcode UDP loopback,
+  bot-vs-bot to a crowned winner with per-tick hash equality + non-vacuous
+  fork injection (N6, in CI); `TETRIS_NET` desktop harness for real-network
+  and two-machine sign-off (N6/N5).
+- **Soak**: 20-match ignored-tagged nightly (N7), alongside the existing
+  core soak.
+- **Regressions**: all existing tests stay green unmodified (exact counts are
+  a moving target — do not pin them); solo + local-versus gate-matrix tests
+  (N4) guard the paths netplay bypasses. Rule bugs reproduce headlessly via
+  the N3 seam first (repo discipline). Human gates follow the repo's
+  author-sign-off rule.
+
+## Risks & Mitigations
+
+- **ReliableOrdered head-of-line stalls**: a lost batch packet stalls the
+  guest mirror until retransmit; past ~RTT it shows as a hitch. Accepted for
+  v1 (~2-4 KB/s at 60 Hz); mitigation path (Unreliable + NACK +
+  re-request) explicitly deferred.
+- **Netcode auth is Unsecure (v1)**: anyone reaching the port with the right
+  `PROTOCOL_ID` can complete the handshake; the decode fuzz (N7) guarantees
+  hostile bytes can't crash the host; the host additionally ignores all
+  gameplay messages before handshake, and the Host screen warns the match is
+  open while listening. Session tokens/invites deferred.
+- **Second-guest silent drop** (netcode `max_clients: 1`): no `MatchFull`
+  signal exists; surfaced as the `JoinTimeout` message wording ("host
+  offline or match full").
+- **Renet 2.0 API surface unverified at plan time**: `Cargo.lock` has no
+  renet entries yet; N1's spike must pin *every* API this plan's N2/N3 code
+  against and record it in `net/mod.rs` doc notes before wave 2 starts —
+  not just the codec.
+- **Input-delay misalignment**: `Hello.delay` + `MatchStart.match_delay`
+  negotiate `D = max(peers)` so a host/guest `TETRIS_NET_DELAY` mismatch
+  silently widens the delay instead of dropping inputs.
+- **Lone-human preset override hijack**: `lone_human_p1` must treat `Net` as
+  an occupied seat (N4.5) or the host loses WASD + solo-alternate keys;
+  pinned by dedicated preset tests.
+- **Rematch local reseed**: `start_versus` reseeds locally (verified
+  `core_bridge/versus.rs:143-168`) — guest Rematch must be hidden and host
+  Rematch routed via `MatchStart`; otherwise mirrors fork silently.
+- **Overlay/HUD visibility regressions**: the repo has recorded bugs for
+  active-versus click swallowing and overlay ZIndex; N3's teardown contract
+  + N5's clickable-overlay test are mandatory, not optional polish.
+- **Pause semantics**: pause chord off in `InMatch`; `SimPaused` is the only
+  net-mode freeze (Lost/Desync); mid-match exit is Esc-confirm → `Bye`. All
+  three stated, gated in named systems.
+- **Headless CI limits**: full-binary CI E2E impossible without xvfb + audio
+  workarounds — out of v1 scope; coverage comes from in-process real-transport
+  tests + manual desktop harness.
+- **Port collisions in tests**: fixed test ports (env override
+  `TETRIS_TEST_NET_PORT`) with serial execution against the N2 socket test;
+  documented.
+- **`Controller` enum exhaustiveness**: the only external breakage site is
+  `winner_text`; handled by N4's carve-out arm and clippy `-D warnings`.
