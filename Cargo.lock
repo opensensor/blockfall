@@ -5260,7 +5260,7 @@ dependencies = [
 
 [[package]]
 name = "tetris-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "bevy_kira_audio",
@@ -5275,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "tetris-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",

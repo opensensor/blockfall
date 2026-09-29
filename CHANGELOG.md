@@ -3,7 +3,7 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [Unreleased]
+## [0.2.0] — 2026-09-29
 
 ### Added
 
@@ -72,4 +72,5 @@ First public release.
     `TETRIS_SHOT` screenshot hook for visual regression checks
   - GPLv3 license
 
+[0.2.0]: https://github.com/opensensor/blockfall/releases/tag/v0.2.0
 [0.1.0]: https://github.com/opensensor/blockfall/releases/tag/v0.1.0
