@@ -50,7 +50,7 @@ use crate::state::AppState;
 mod versus;
 pub use versus::*;
 
-mod net;
+pub(crate) mod net;
 
 /// Env var overriding the run seed with a fixed `u64` (T14: reproducible
 /// marathons; applies at startup and on every restart).
@@ -577,6 +577,15 @@ impl Plugin for CoreBridgePlugin {
             // bevy_renet plugins inside are resource-gated, so an Idle
             // session costs nothing per frame.
             .add_plugins(net::NetPlugin)
+            // N6: netplay harness — the `TETRIS_NET=host:<port>|join:<addr>`
+            // desktop bot-vs-bot-across-the-wire mode and the
+            // `TETRIS_NET_FORK=<role>:<tick>` desync-injection hook, wired
+            // exactly like the TETRIS_1V1 pattern above: all three systems
+            // are inert no-ops (a couple of env reads) unless those vars are
+            // set, so headless tests and normal play pay nothing.
+            .add_systems(Startup, net::harness::net_harness_startup)
+            .add_systems(Update, net::harness::net_harness_update)
+            .add_systems(FixedUpdate, net::harness::net_fork_system)
             .add_systems(Startup, seed_from_env_at_startup)
             .add_systems(
                 Update,
