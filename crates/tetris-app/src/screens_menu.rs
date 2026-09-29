@@ -65,11 +65,15 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
-use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
+use tetris_core::versus::{AttackRule, DEFAULT_RACE_LINES, Side};
 
+use crate::core_bridge::net::online_ui::{
+    OnlineButton, OnlineFlow, OnlineUiPlugin, net_winner_text,
+};
+use crate::core_bridge::net::{NetRole, NetSession, NetStatus};
 use crate::core_bridge::{
-    end_versus, restart_run, start_versus, Controller, GameCore, SimPaused, VersusMatch,
-    VersusWinner,
+    Controller, GameCore, SimPaused, VersusMatch, VersusWinner, end_versus, restart_run,
+    start_versus,
 };
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
@@ -430,6 +434,7 @@ type MenuRoots<'w, 's> = Query<
 struct RootVisibilityParams<'w, 's> {
     state: Res<'w, AppState>,
     flow: Res<'w, VersusFlow>,
+    online_flow: Option<Res<'w, OnlineFlow>>,
     versus: Option<NonSend<'w, VersusMatch>>,
     winner: Option<Res<'w, VersusWinner>>,
     roots: MenuRoots<'w, 's>,
@@ -442,14 +447,21 @@ fn sync_root_visibility(params: RootVisibilityParams) {
     let RootVisibilityParams {
         state,
         flow,
+        online_flow,
         versus,
         winner,
         mut roots,
     } = params;
     let versus_active = versus.is_some_and(|versus| versus.active);
     let match_over = versus_active && winner.is_some_and(|winner| winner.0.is_some());
+    // N5: an open online flow hides the title root (same discipline as the
+    // 1v1 submenus) so its buttons can never be clicked through a panel.
+    let online_open = online_flow.is_some_and(|online_flow| online_flow.open());
     for (mut vis, title, pause, over, versus_hud, versus_over) in roots.iter_mut() {
-        let wanted = if (title && *state == AppState::Title && flow.stage == VersusStage::Title)
+        let wanted = if (title
+            && *state == AppState::Title
+            && flow.stage == VersusStage::Title
+            && !online_open)
             || (pause && *state == AppState::Paused)
             || (over && *state == AppState::GameOver)
             || (versus_hud && versus_active)
@@ -516,8 +528,15 @@ fn pause_chord_system(
     freeze: Res<JuiceFreeze>,
     versus: Option<NonSend<VersusMatch>>,
     winner: Option<Res<VersusWinner>>,
+    net: Option<Res<NetSession>>,
 ) {
     if capture.capturing {
+        return;
+    }
+    // N5: net matches have no pause — lockstep is authoritative on both ends,
+    // so Escape belongs to the online flow's leave-confirm instead (its own
+    // system consumes the chord while [`NetStatus::InMatch`]).
+    if net.is_some_and(|net| net.status == NetStatus::InMatch) {
         return;
     }
     let finished_match = versus.is_some_and(|versus| versus.active)
@@ -680,6 +699,7 @@ struct VersusClickParams<'w, 's> {
     sim: ResMut<'w, SimPaused>,
     freeze: Res<'w, JuiceFreeze>,
     flow: ResMut<'w, VersusFlow>,
+    net: Option<Res<'w, NetSession>>,
 }
 
 fn versus_button_clicks(mut params: VersusClickParams) {
@@ -690,6 +710,13 @@ fn versus_button_clicks(mut params: VersusClickParams) {
             .as_deref()
             .is_some_and(|winner| winner.0.is_some());
     let on_title = *params.state == AppState::Title && !versus_active;
+    // N5: while a net match is live the winner overlay's Rematch/Menu belong
+    // to the online flow (host re-arms via `start_net_match`, Menu runs the
+    // full `net_leave_to_title` teardown). The local `start_versus` reseed
+    // here would fork the guest mirror — never a fallback on this path.
+    let net_in_match = params
+        .net
+        .is_some_and(|net| net.status == NetStatus::InMatch);
 
     for (_entity, interaction, one_v_one, garbage, race, human, bot, back, rematch, menu) in
         params.buttons.iter()
@@ -745,7 +772,7 @@ fn versus_button_clicks(mut params: VersusClickParams) {
             continue;
         }
 
-        if match_over {
+        if match_over && !net_in_match {
             if rematch {
                 if let (Some(versus), Some(winner)) =
                     (params.versus.as_deref_mut(), params.winner.as_deref_mut())
@@ -806,6 +833,7 @@ type VersusWinnerLabels<'w, 's> = Query<'w, 's, &'static mut Text, With<VersusWi
 fn sync_versus_winner_text(
     versus: Option<NonSend<VersusMatch>>,
     winner: Option<Res<VersusWinner>>,
+    net: Option<Res<NetSession>>,
     mut labels: VersusWinnerLabels,
 ) {
     let Some(winner_side) = winner.and_then(|winner| winner.0) else {
@@ -814,7 +842,14 @@ fn sync_versus_winner_text(
     let Some(versus) = versus else {
         return;
     };
-    let text = winner_text(winner_side, versus.p1, versus.p2);
+    // N5: once a seat is Net the generic "OPPONENT WINS" carve-out gives way
+    // to role-aware copy — the local seat winning reads "YOU WIN".
+    let text = if versus.p1 == Controller::Net || versus.p2 == Controller::Net {
+        let role = net.as_deref().map(|net| net.role).unwrap_or(NetRole::Host);
+        net_winner_text(winner_side, role)
+    } else {
+        winner_text(winner_side, versus.p1, versus.p2)
+    };
     for mut label in labels.iter_mut() {
         if label.0 != text {
             *label = Text::new(text.clone());
@@ -955,6 +990,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         root.spawn(label_node(pause_hint, 14.0));
         menu_button(root, "Start", StartButton);
         menu_button(root, "1 v 1", OneVOneButton);
+        menu_button(root, "Online", OnlineButton);
         menu_button(root, "Settings", OpenSettingsButton);
         menu_button(root, "Quit", QuitButton);
     });
@@ -1047,6 +1083,10 @@ impl Plugin for MenuScreensPlugin {
         if !app.world().contains_resource::<Messages<MouseWheel>>() {
             app.add_message::<MouseWheel>();
         }
+        // N5: the online flow shares the title screen (its "Online" button is
+        // spawned in `build_menu_ui`); the plugin is mount-guarded so adding
+        // it here is the single canonical mount point.
+        app.add_plugins(OnlineUiPlugin);
         #[cfg(not(test))]
         app.add_systems(Startup, startup_goto_title_system);
         app.add_systems(Startup, build_menu_ui).add_systems(
@@ -1556,9 +1596,9 @@ mod tests {
 
     // ---- T26: 1v1 flow, winner overlay, pause interaction ----
 
-    use crate::core_bridge::{start_versus, Controller, VersusMatch, VersusWinner};
+    use crate::core_bridge::{Controller, VersusMatch, VersusWinner, start_versus};
     use crate::input::VersusActions;
-    use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
+    use tetris_core::versus::{AttackRule, DEFAULT_RACE_LINES, Side};
 
     fn flow(app: &App) -> VersusFlow {
         *app.world().resource::<VersusFlow>()
@@ -2148,5 +2188,104 @@ mod tests {
             winner_text(Side::Right, Controller::Human, Controller::Bot),
             "BOT WINS"
         );
+    }
+
+    // ---- N5: online flow wiring ----
+
+    use crate::core_bridge::net::online_ui::OnlineStage;
+
+    #[test]
+    fn online_button_opens_the_flow_and_hides_the_title_behind_it() {
+        let mut app = menu_test_app();
+        set_state(&mut app, AppState::Title);
+        assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Visible);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<OnlineButton>(e).is_some(),
+        );
+        assert_eq!(
+            app.world().resource::<OnlineFlow>().stage,
+            OnlineStage::Mode
+        );
+        // The click system is exclusive; the visibility sync settles in the
+        // same frame (parallel schedule — one settle frame to be robust).
+        app.update();
+        assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Hidden);
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(
+            app.world().resource::<OnlineFlow>().stage,
+            OnlineStage::Closed
+        );
+        app.update();
+        assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Visible);
+    }
+
+    #[test]
+    fn clicking_online_leaves_solo_and_versus_flows_untouched() {
+        let mut app = menu_test_app();
+        set_state(&mut app, AppState::Title);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<OnlineButton>(e).is_some(),
+        );
+        // No run started, no 1v1 submenu opened — the Online marker simply
+        // is not one of `menu_button_clicks`' cases.
+        assert_eq!(app_state(&app), AppState::Title);
+        let flow = *app.world().resource::<VersusFlow>();
+        assert_eq!(flow.stage, VersusStage::Title);
+    }
+
+    #[test]
+    fn winner_headline_is_role_aware_once_a_seat_is_net() {
+        for (role, winner, expected) in [
+            (NetRole::Host, Side::Left, "YOU WIN"),
+            (NetRole::Guest, Side::Right, "YOU WIN"),
+            (NetRole::Host, Side::Right, "OPPONENT WINS"),
+            (NetRole::Guest, Side::Left, "OPPONENT WINS"),
+        ] {
+            let mut app = menu_test_app();
+            set_state(&mut app, AppState::Playing);
+            app.world_mut()
+                .resource_scope::<AppState, ()>(|world, state| {
+                    world.resource_scope::<VersusWinner, ()>(|world, winner_res| {
+                        let versus = world.non_send_mut::<VersusMatch>();
+                        start_versus(
+                            versus.into_inner(),
+                            winner_res.into_inner(),
+                            state.into_inner(),
+                            AttackRule::Garbage,
+                            Controller::Human,
+                            Controller::Net,
+                        );
+                    });
+                });
+            app.world_mut().resource_mut::<VersusWinner>().0 = Some(winner);
+            let mut net = app.world_mut().resource_mut::<NetSession>();
+            net.role = role;
+            net.status = NetStatus::InMatch;
+            app.update();
+            app.update();
+            assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Visible);
+            let label = text_of(&mut app, |world, e| {
+                world.get::<VersusWinnerText>(e).is_some()
+            });
+            assert_eq!(label, expected, "{role:?} winner {winner:?}");
+        }
+    }
+
+    #[test]
+    fn local_winner_headline_never_says_you_win_in_plain_versus() {
+        // Controller::Human/Human with a crowned winner keeps the T26 copy —
+        // the net role-aware path must not leak into local versus.
+        let mut app = menu_test_app();
+        crown_winner(&mut app, Controller::Human);
+        app.update();
+        app.update();
+        let label = text_of(&mut app, |world, e| {
+            world.get::<VersusWinnerText>(e).is_some()
+        });
+        assert_eq!(label, "PLAYER 1 WINS");
     }
 }
