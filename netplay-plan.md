@@ -707,6 +707,17 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   `MATCH_START_HOLD` revisited once the drain bug is fixed.
 - **files edited/created**: `crates/tetris-app/src/core_bridge/net/harness.rs`,
   `crates/tetris-app/src/core_bridge/mod.rs`
+- **post-N6 fixup** (`f9d6d51`): drain bug root-fixed — `guest_net_system`
+  re-checks status each drain iteration (`while matches!(status,
+  Handshaking|Ready)`), never consuming past the `InMatch` transition;
+  symmetric guard added to the host `Hello` drain; consume-on-read rule in
+  module docs. Deterministic regression test
+  `matchstart_transition_frame_does_not_swallow_queued_tickbatches`
+  (RED: guest tick-0 stall; GREEN: all queued batches replayed in order,
+  snapshot-equal). `MATCH_START_HOLD` removed; E2Es start live (every run
+  crosses the old stall window). UDP tests moved to port-0 + read-back
+  (`TETRIS_TEST_NET_PORT` deleted; `TEST_NET_LOCK` kept for the occupied-port
+  probe). 3× parallel + serial full-suite green; systemic flake resolved.
 
 ### N7: Netplay soak + protocol-robustness audit
 - **depends_on**: [N6]
@@ -743,9 +754,27 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   CHANGELOG unreleased entry; tetris-plan.md note that T24–T26 + N1–N8 form
   netplay v0.1.
 - **validation**: prose review; docs-only diff; links/anchors resolve.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Docs-only commit `72baf12`. README: intro + Features bullet for
+  local/online versus; Controls blockquote (host/left = P1 WASD, guest/right
+  = P2 arrows; no pause in net matches, Esc = leave-with-confirm); "Playing
+  online" section (Host/Join flow, UDP port shown on Host screen,
+  keyboard-only `ip:port` entry — Bevy 0.19 has no clipboard API, D=max delay
+  ≈133 ms, NAT port-forward + firewall caveat, "port is open while listening"
+  warning, no-lobby/relay note with the "host offline or match full" wording,
+  version-handshake refusal, desync freeze); env table rows for `TETRIS_NET`,
+  `TETRIS_NET_DELAY` (default 8, clamp 2..=30), `TETRIS_NET_FORK` — all
+  fact-checked against code (harness.rs:87/91, session.rs:104-113/623,
+  online_ui.rs). PRD: §4 multiplayer non-goal struck → §15; §15 retitled
+  "Versus (netplay v0.1) & Future Extensions" splitting implemented
+  local+online versus from post-v1 (lobby/relay/discovery, rollback, session
+  tokens stay non-goals); §1/§13 pointers updated. CHANGELOG `[Unreleased]`
+  entry: netplay v0.1 = T24–T26 + N1–N8. tetris-plan.md: netplay v0.1 note.
+  Doc drift found+fixed en route: N5's "44-char cap" claim (code: 45);
+  stale pre-versus README/PRD claims. Author sign-off (two-machine LAN/
+  internet, delay feel) still open — checklist in N5 log.
+- **files edited/created**: `README.md`, `PRD.md`, `CHANGELOG.md`,
+  `tetris-plan.md`
 
 ## Parallel Execution Groups
 
