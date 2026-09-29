@@ -76,5 +76,5 @@ jobs:
       - name: Release soak (core)
         run: cargo test --release -p tetris-core -- --ignored
 
-      - name: Release soak (app netplay: 20 matches over loopback UDP)
+      - name: "Release soak (app netplay: 20 matches over loopback UDP)"
         run: cargo test --release -p tetris-app -- --ignored
