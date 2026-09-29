@@ -5267,6 +5267,7 @@ dependencies = [
  "bevy_renet",
  "bincode",
  "dirs",
+ "proptest",
  "serde",
  "serde_json",
  "tetris-core",

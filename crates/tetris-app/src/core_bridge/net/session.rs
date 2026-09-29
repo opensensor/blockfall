@@ -322,8 +322,10 @@ impl Default for NetSession {
 
 impl NetSession {
     /// Apply a trigger through the pure transition function; returns
-    /// whether the status actually changed.
-    fn apply(&mut self, trigger: NetTrigger) -> bool {
+    /// whether the status actually changed. Crate-visible so the lockstep
+    /// systems (N3) can drive the `Bye` trigger from the wire once they
+    /// own the channels (`InMatch`).
+    pub(crate) fn apply(&mut self, trigger: NetTrigger) -> bool {
         if let Some(next) = next_status(self.role, &self.status, &trigger) {
             self.status = next;
             true
@@ -493,11 +495,14 @@ fn build_client(addr: SocketAddr) -> Result<(NetcodeClientTransport, RenetClient
 /// sockets). This is the "Esc-on-Listening" and universal teardown entry
 /// point; safe to call in any state.
 pub fn net_stop(world: &mut World) {
-    if let (Some(mut transport), Some(mut server)) = (
-        world.remove_resource::<NetcodeServerTransport>(),
-        world.remove_resource::<RenetServer>(),
-    ) {
-        transport.disconnect_all(&mut server);
+    // Server and transport are removed independently: test seams (and any
+    // half-built session) may hold one without the other, and `Idle` after
+    // `net_stop` must mean *no* transport resources in the world.
+    let server = world.remove_resource::<RenetServer>();
+    if let Some(mut transport) = world.remove_resource::<NetcodeServerTransport>() {
+        if let Some(mut server) = server {
+            transport.disconnect_all(&mut server);
+        }
     }
     if let Some(mut transport) = world.remove_resource::<NetcodeClientTransport>() {
         transport.disconnect();
@@ -535,6 +540,7 @@ impl Plugin for NetPlugin {
         ))
         .init_resource::<NetSession>()
         .add_message::<NetEvent>()
+        .add_plugins(super::lockstep::NetLockstepPlugin)
         .add_observer(host_server_event_observer)
         .add_systems(
             Update,
