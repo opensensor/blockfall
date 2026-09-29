@@ -65,15 +65,15 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
-use tetris_core::versus::{AttackRule, DEFAULT_RACE_LINES, Side};
+use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
 
 use crate::core_bridge::net::online_ui::{
-    OnlineButton, OnlineFlow, OnlineUiPlugin, net_winner_text,
+    net_winner_text, OnlineButton, OnlineFlow, OnlineUiPlugin,
 };
 use crate::core_bridge::net::{NetRole, NetSession, NetStatus};
 use crate::core_bridge::{
-    Controller, GameCore, SimPaused, VersusMatch, VersusWinner, end_versus, restart_run,
-    start_versus,
+    end_versus, restart_run, start_versus, Controller, GameCore, SimPaused, VersusMatch,
+    VersusWinner,
 };
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
@@ -1596,9 +1596,9 @@ mod tests {
 
     // ---- T26: 1v1 flow, winner overlay, pause interaction ----
 
-    use crate::core_bridge::{Controller, VersusMatch, VersusWinner, start_versus};
+    use crate::core_bridge::{start_versus, Controller, VersusMatch, VersusWinner};
     use crate::input::VersusActions;
-    use tetris_core::versus::{AttackRule, DEFAULT_RACE_LINES, Side};
+    use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
 
     fn flow(app: &App) -> VersusFlow {
         *app.world().resource::<VersusFlow>()
