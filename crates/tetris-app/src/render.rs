@@ -121,8 +121,15 @@ pub const PIECE_COLORS: [Color; 7] = [
 /// Alpha applied to the active piece color when drawing the ghost.
 pub const GHOST_ALPHA: f32 = 0.3;
 
+/// Neutral fill for incoming versus garbage cells (`Piece::Garbage`),
+/// deliberately outside the tetromino palette so garbage reads as garbage.
+pub const GARBAGE_CELL_COLOR: Color = Color::srgb(0.42, 0.42, 0.47);
+
 /// Solid fill color for cells locked/spawned as `piece`.
 pub fn piece_color(piece: Piece) -> Color {
+    if piece == Piece::Garbage {
+        return GARBAGE_CELL_COLOR;
+    }
     let idx = Piece::ALL.iter().position(|p| *p == piece).unwrap_or(0);
     PIECE_COLORS[idx]
 }
@@ -306,6 +313,57 @@ struct CellPool {
     entities: Vec<Entity>,
 }
 
+/// Color of the boundary frame drawn around each playfield (solo and both
+/// versus halves) so the well is visible even where it is empty.
+pub const FRAME_COLOR: Color = Color::srgb(0.55, 0.55, 0.62);
+
+/// Marks one of the four bar sprites that outline a playfield frame.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldFrame {
+    /// Match side of the framed field; `None` for the solo field.
+    pub side: Option<Side>,
+}
+
+/// `(center, size)` of the four outline bars (top, bottom, left, right) of
+/// the field rectangle of `layout`, sitting just outside the cell grid.
+pub fn frame_bars(layout: &FieldLayout) -> [(Vec2, Vec2); 4] {
+    let c = layout.cell;
+    let pad = 0.18 * c;
+    let t = 0.14 * c;
+    let field_w = COLS as f32 * c;
+    let field_h = VISIBLE_ROWS as f32 * c;
+    let (x0, y_top) = (layout.origin.x, layout.origin.y);
+    let y_bot = y_top - field_h;
+    let long_h = field_w + 2.0 * (pad + t);
+    let inset = pad + t * 0.5;
+    [
+        (
+            Vec2::new(x0 + field_w * 0.5, y_top + inset),
+            Vec2::new(long_h, t),
+        ),
+        (
+            Vec2::new(x0 + field_w * 0.5, y_bot - inset),
+            Vec2::new(long_h, t),
+        ),
+        (
+            Vec2::new(x0 - inset, y_top - field_h * 0.5),
+            Vec2::new(t, field_h),
+        ),
+        (
+            Vec2::new(x0 + field_w + inset, y_top - field_h * 0.5),
+            Vec2::new(t, field_h),
+        ),
+    ]
+}
+
+/// Pooled boundary-frame bars (exactly four per visible field).
+#[derive(Resource, Default)]
+struct FramePools {
+    solo: Vec<Entity>,
+    versus_left: Vec<Entity>,
+    versus_right: Vec<Entity>,
+}
+
 /// Pooled versus cell sprites, one pool per match side (T26). Fully
 /// despawned whenever versus is inactive, and vice versa for [`CellPool`],
 /// so neither mode can leak entities into the other's frame.
@@ -365,6 +423,43 @@ fn clear_pool(commands: &mut Commands, pool: &mut Vec<Entity>) {
     }
 }
 
+/// Bring one pooled boundary frame (four bars) in line with `layout`:
+/// reuse, despawn surplus, spawn missing, and reposition every bar so the
+/// frame follows window resizes.
+fn sync_frame(
+    commands: &mut Commands,
+    pool: &mut Vec<Entity>,
+    layout: &FieldLayout,
+    side: Option<VersusCellSide>,
+) {
+    let bars = frame_bars(layout);
+    if pool.len() > bars.len() {
+        let surplus = pool.split_off(bars.len());
+        for entity in surplus {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (index, (center, size)) in bars.iter().enumerate() {
+        let sprite = Sprite {
+            color: FRAME_COLOR,
+            custom_size: Some(*size),
+            ..default()
+        };
+        let transform = Transform::from_xyz(center.x, center.y, -0.1);
+        let marker = FieldFrame {
+            side: side.map(|s| s.0),
+        };
+        if index < pool.len() {
+            commands
+                .entity(pool[index])
+                .insert((marker, sprite, transform));
+        } else {
+            let entity = commands.spawn((marker, sprite, transform)).id();
+            pool.push(entity);
+        }
+    }
+}
+
 /// Full refresh of all cell sprites from the newest snapshot. The fixed-step
 /// sim has already run for this frame (`RunFixedMainLoop` precedes
 /// `Update`), so this always reads the latest state; per-frame redraw is
@@ -378,6 +473,7 @@ fn render_playfield(
     windows: Query<&Window>,
     mut pool: ResMut<CellPool>,
     mut versus_pools: ResMut<VersusCellPools>,
+    mut frames: ResMut<FramePools>,
 ) {
     let Some(window) = windows.iter().next() else {
         return;
@@ -389,8 +485,21 @@ fn render_playfield(
 
     if let Some(versus) = versus.filter(|versus| versus.active) {
         clear_pool(&mut commands, &mut pool.entities);
+        clear_pool(&mut commands, &mut frames.solo);
         let snapshot = versus.match_.snapshot();
         let [left, right] = versus_layouts(size.x, size.y);
+        sync_frame(
+            &mut commands,
+            &mut frames.versus_left,
+            &left,
+            Some(VersusCellSide(Side::Left)),
+        );
+        sync_frame(
+            &mut commands,
+            &mut frames.versus_right,
+            &right,
+            Some(VersusCellSide(Side::Right)),
+        );
         let cells = frame_cells(&snapshot.left);
         sync_pool(
             &mut commands,
@@ -412,8 +521,11 @@ fn render_playfield(
 
     clear_pool(&mut commands, &mut versus_pools.left);
     clear_pool(&mut commands, &mut versus_pools.right);
+    clear_pool(&mut commands, &mut frames.versus_left);
+    clear_pool(&mut commands, &mut frames.versus_right);
     let Some(core) = core else { return };
     let layout = FieldLayout::fit(size.x, size.y);
+    sync_frame(&mut commands, &mut frames.solo, &layout, None);
     let cells = frame_cells(&core.game.snapshot());
     sync_pool(&mut commands, &mut pool.entities, &cells, &layout, None);
 }
@@ -426,6 +538,7 @@ impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CellPool>()
             .init_resource::<VersusCellPools>()
+            .init_resource::<FramePools>()
             .add_systems(Update, render_playfield);
     }
 }
@@ -444,6 +557,21 @@ mod tests {
     use tetris_core::game::Game;
 
     const EPS: f32 = 1e-4;
+
+    /// Regression: versus garbage (`Piece::Garbage`) must render in its own
+    /// neutral color — it used to be stamped as `Piece::O`, which drew 18
+    /// incoming rows as a giant yellow O-piece tower.
+    #[test]
+    fn garbage_cells_render_neutral_not_piece_colored() {
+        assert_eq!(piece_color(Piece::Garbage), GARBAGE_CELL_COLOR);
+        for piece in Piece::ALL {
+            assert_ne!(
+                piece_color(piece),
+                GARBAGE_CELL_COLOR,
+                "garbage must not share a tetromino palette color"
+            );
+        }
+    }
 
     /// Letterbox math: square cells on both axes, centered, field aspect
     /// preserved, cell as large as possible at several window shapes.
@@ -882,6 +1010,7 @@ mod tests {
     #[test]
     fn versus_frame_draws_both_boards() {
         let mut app = render_app(1);
+        app.add_plugins(crate::hud::HudPlugin);
         open_versus(&mut app, AttackRule::Garbage);
         push_versus(&mut app, &[Action::HardDrop]);
         versus_step(&mut app);
@@ -927,6 +1056,51 @@ mod tests {
                     && pos.x <= right.origin.x + right.cell * COLS as f32 + EPS
             );
         }
+    }
+
+    #[test]
+    fn field_frames_outline_the_active_field_layouts() {
+        let collect = |app: &mut App| -> Vec<(Option<Side>, Vec3, Vec2)> {
+            let mut bars = app
+                .world_mut()
+                .query::<(&FieldFrame, &Transform, &Sprite)>();
+            bars.iter(app.world())
+                .map(|(f, t, s)| (f.side, t.translation, s.custom_size.unwrap_or(Vec2::ZERO)))
+                .collect()
+        };
+        let matches = |bars: &[(Option<Side>, Vec3, Vec2)], layout: &FieldLayout, side| {
+            let expected = frame_bars(layout);
+            for (bar_side, pos, size) in bars {
+                assert_eq!(*bar_side, side);
+                assert!(
+                    expected.iter().any(|(center, bar)| {
+                        (pos.x - center.x).abs() < EPS
+                            && (pos.y - center.y).abs() < EPS
+                            && (size.x - bar.x).abs() < EPS
+                            && (size.y - bar.y).abs() < EPS
+                    }),
+                    "frame bar {pos:?} {size:?} outside the layout outline"
+                );
+            }
+        };
+
+        let mut app = render_app(1);
+        frame(&mut app, &[Action::HardDrop]);
+        let solo = collect(&mut app);
+        assert_eq!(solo.len(), 4, "solo field frame has four bars");
+        matches(&solo, &FieldLayout::fit(1280.0, 720.0), None);
+
+        open_versus(&mut app, AttackRule::Garbage);
+        app.update();
+        let versus_bars = collect(&mut app);
+        assert_eq!(versus_bars.len(), 8, "one outline per versus field");
+        let [left, right] = versus_layouts(1280.0, 720.0);
+        let (left_bars, right_bars): (Vec<_>, Vec<_>) = versus_bars
+            .into_iter()
+            .partition(|(side, _, _)| *side == Some(Side::Left));
+        assert_eq!(left_bars.len(), 4);
+        matches(&left_bars, &left, Some(Side::Left));
+        matches(&right_bars, &right, Some(Side::Right));
     }
 
     #[test]

@@ -427,6 +427,7 @@ type MenuRoots<'w, 's> = Query<
 #[derive(SystemParam)]
 struct RootVisibilityParams<'w, 's> {
     state: Res<'w, AppState>,
+    flow: Res<'w, VersusFlow>,
     versus: Option<NonSend<'w, VersusMatch>>,
     winner: Option<Res<'w, VersusWinner>>,
     roots: MenuRoots<'w, 's>,
@@ -438,6 +439,7 @@ struct RootVisibilityParams<'w, 's> {
 fn sync_root_visibility(params: RootVisibilityParams) {
     let RootVisibilityParams {
         state,
+        flow,
         versus,
         winner,
         mut roots,
@@ -445,7 +447,7 @@ fn sync_root_visibility(params: RootVisibilityParams) {
     let versus_active = versus.is_some_and(|versus| versus.active);
     let match_over = versus_active && winner.is_some_and(|winner| winner.0.is_some());
     for (mut vis, title, pause, over, versus_hud, versus_over) in roots.iter_mut() {
-        let wanted = if (title && *state == AppState::Title)
+        let wanted = if (title && *state == AppState::Title && flow.stage == VersusStage::Title)
             || (pause && *state == AppState::Paused)
             || (over && *state == AppState::GameOver)
             || (versus_hud && versus_active)
@@ -556,6 +558,8 @@ struct MenuClickParams<'w, 's> {
     freeze: Res<'w, JuiceFreeze>,
     quit: ResMut<'w, QuitRequested>,
     flow: Res<'w, VersusFlow>,
+    versus: Option<NonSendMut<'w, VersusMatch>>,
+    winner: Option<ResMut<'w, VersusWinner>>,
     exits: MessageWriter<'w, AppExit>,
 }
 
@@ -609,6 +613,19 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                 } else if settings {
                     open_settings(&mut params.state);
                 } else if to_title {
+                    // Pause → "Quit to Title" on an active 1v1 must tear the
+                    // match down like the winner overlay's Menu button: the
+                    // versus HUD root shows for the whole duration of an
+                    // active match, so a live match left running keeps its
+                    // full-screen root visible over the title and swallows
+                    // every subsequent menu click.
+                    if let (Some(versus), Some(winner)) =
+                        (params.versus.as_deref_mut(), params.winner.as_deref_mut())
+                    {
+                        if versus.active {
+                            end_versus(versus, winner, &mut params.state);
+                        }
+                    }
                     goto_title(&mut params.state, &mut params.sim, &params.freeze);
                 } else if quit {
                     quit_now();
@@ -940,19 +957,35 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         menu_button(root, "Quit", QuitButton);
     });
 
-    add_menu_root(&mut commands, VersusRulesRoot, PANEL_BG, |root| {
-        root.spawn(label_node("1 v 1 — RULE".to_string(), 40.0));
-        menu_button(root, "Garbage", RuleGarbageButton);
-        menu_button(root, "Race", RuleRaceButton);
-        menu_button(root, "Back", VersusBackButton);
-    });
+    // The submenu roots render and pick *over* the title (their `ZIndex`
+    // is load-bearing: top-level UI roots stack-sort by z only, and z-0
+    // ties fall back to the unordered UI-root set, which put them *under*
+    // the title at random. The title itself is hidden while a submenu is
+    // open (see `sync_root_visibility`) so its buttons can never be
+    // clicked through the panel.
+    add_menu_root(
+        &mut commands,
+        (VersusRulesRoot, ZIndex(1)),
+        PANEL_BG,
+        |root| {
+            root.spawn(label_node("1 v 1 — RULE".to_string(), 40.0));
+            menu_button(root, "Garbage", RuleGarbageButton);
+            menu_button(root, "Race", RuleRaceButton);
+            menu_button(root, "Back", VersusBackButton);
+        },
+    );
 
-    add_menu_root(&mut commands, VersusOpponentRoot, PANEL_BG, |root| {
-        root.spawn(label_node("1 v 1 — OPPONENT".to_string(), 40.0));
-        menu_button(root, "Human", OpponentHumanButton);
-        menu_button(root, "Bot", OpponentBotButton);
-        menu_button(root, "Back", VersusBackButton);
-    });
+    add_menu_root(
+        &mut commands,
+        (VersusOpponentRoot, ZIndex(1)),
+        PANEL_BG,
+        |root| {
+            root.spawn(label_node("1 v 1 — OPPONENT".to_string(), 40.0));
+            menu_button(root, "Human", OpponentHumanButton);
+            menu_button(root, "Bot", OpponentBotButton);
+            menu_button(root, "Back", VersusBackButton);
+        },
+    );
 
     add_menu_root(&mut commands, VersusOverRoot, DIM_BG, |root| {
         root.spawn((VersusWinnerText, label_node(String::new(), 48.0)));
@@ -1164,6 +1197,7 @@ mod tests {
         });
         app.add_plugins((
             CoreBridgePlugin,
+            crate::hud::HudPlugin,
             InputPlugin,
             MenuScreensPlugin,
             SettingsScreenPlugin,
@@ -1609,6 +1643,56 @@ mod tests {
     }
 
     #[test]
+    fn quit_to_title_from_paused_versus_ends_the_match() {
+        fn hud_root_vis(app: &mut App) -> (usize, usize) {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<&Visibility, With<VersusHudRoot>>();
+            let vis: Vec<_> = query.iter(world).copied().collect();
+            let shown = vis.iter().filter(|v| **v == Visibility::Visible).count();
+            (vis.len(), shown)
+        }
+
+        let mut app = menu_test_app();
+        click_1v1_path(&mut app, "race", "bot");
+        assert!(app.world().non_send::<VersusMatch>().active);
+        assert_eq!(
+            hud_root_vis(&mut app),
+            (2, 2),
+            "versus HUDs show for the active match"
+        );
+
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app_state(&app), AppState::Paused);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<PauseRoot>(e).is_some(),
+            |world, e| world.get::<QuitToTitleButton>(e).is_some(),
+        );
+
+        assert_eq!(app_state(&app), AppState::Title);
+        assert!(
+            !app.world().non_send::<VersusMatch>().active,
+            "Quit to Title must end the match: a live versus keeps its \
+             full-screen HUD root visible over the title and swallows every \
+             menu click"
+        );
+        assert_eq!(
+            hud_root_vis(&mut app),
+            (2, 0),
+            "HUD roots must release the title once the match ends"
+        );
+
+        // The title menu must be selectable again.
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<TitleRoot>(e).is_some(),
+            |world, e| world.get::<StartButton>(e).is_some(),
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert!(!app.world().non_send::<VersusMatch>().active);
+    }
+
+    #[test]
     fn versus_flow_back_button_and_escape_walk_the_submenus() {
         let mut app = menu_test_app();
         set_state(&mut app, AppState::Title);
@@ -1661,7 +1745,9 @@ mod tests {
         );
     }
 
-    /// Start a race-to-zero match and crown Left with one hard drop.
+    /// Start a race-to-zero match and crown Left: both sides lock their
+    /// first piece in the same step (under Race, reaching the target only
+    /// finishes a side), and the perfect tie goes to the first finisher.
     fn crown_winner(app: &mut App, p2: Controller) {
         app.world_mut()
             .resource_scope::<AppState, ()>(|world, state| {
@@ -1680,6 +1766,10 @@ mod tests {
         app.world_mut()
             .resource_mut::<VersusActions>()
             .left
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut()
+            .resource_mut::<VersusActions>()
+            .right
             .push(tetris_core::actions::Action::HardDrop);
         app.world_mut().run_schedule(FixedUpdate);
         app.update();
@@ -1752,6 +1842,290 @@ mod tests {
         assert_eq!(core.steps, 0);
         let snapshot = core.game.snapshot();
         assert!(snapshot.board.is_empty() && snapshot.score == 0);
+    }
+
+    // ---- Real-pointer regression (UiPlugin + bevy_ui's ui_focus_system) ----
+
+    use bevy::camera::visibility::InheritedVisibility;
+    use bevy::ui::UiPlugin;
+    use bevy::window::PrimaryWindow;
+
+    #[derive(Resource)]
+    struct UiWin(Entity);
+
+    /// App wiring for real pointer hit-testing. Bevy 0.19 writes
+    /// `Interaction` in bevy_ui's `ui_focus_system`, which reads
+    /// `Window::physical_cursor_position` and `ButtonInput<MouseButton>`
+    /// directly, so the harness drives exactly those two inputs through
+    /// winit's own pipeline shape: cursor writes to the `Window` and
+    /// `MouseButtonInput` *messages* replayed by the real
+    /// `mouse_button_input_system` (clear + reapply per frame).
+    ///
+    /// `emulate_inherited_visibility` stands in for the render world's
+    /// extract pass: without one, `InheritedVisibility` never exists and
+    /// `ui_focus_system` treats every node as un-interactable.
+    fn menu_ui_test_app() -> App {
+        let mut app = menu_test_app();
+        app.add_plugins(bevy::asset::AssetPlugin::default());
+        app.init_asset::<Image>();
+        app.init_asset::<bevy::image::TextureAtlasLayout>();
+        app.add_plugins(bevy::input::InputPlugin);
+        app.add_plugins(bevy::text::TextPlugin);
+        app.add_plugins(UiPlugin);
+        // `UiPlugin`'s viewport widgets require the picking core resources.
+        if !app
+            .world()
+            .contains_resource::<Messages<bevy::input::touch::TouchInput>>()
+        {
+            app.add_message::<bevy::input::touch::TouchInput>();
+        }
+        app.add_plugins(bevy::picking::DefaultPickingPlugins);
+        app.world_mut().spawn((
+            Camera2d,
+            bevy::ui::IsDefaultUiCamera,
+            Camera {
+                viewport: Some(bevy::camera::Viewport {
+                    physical_size: UVec2::new(1280, 720),
+                    ..default()
+                }),
+                ..default()
+            },
+        ));
+        let primary = {
+            let world = app.world_mut();
+            let mut q = world.query_filtered::<Entity, With<PrimaryWindow>>();
+            q.single(world).expect("primary window")
+        };
+        app.insert_resource(UiWin(primary));
+        app.add_systems(PostUpdate, emulate_inherited_visibility);
+        app.update();
+        app
+    }
+
+    /// Headless stand-in for the render world's `sync_visible_systems`:
+    /// mirror `Visibility` down the tree into `InheritedVisibility`.
+    fn emulate_inherited_visibility(world: &mut World) {
+        fn rec(world: &mut World, entity: Entity, parent_visible: bool) {
+            let visible = parent_visible
+                && world
+                    .get::<Visibility>(entity)
+                    .is_none_or(|v| *v != Visibility::Hidden);
+            let flag = if visible {
+                InheritedVisibility::VISIBLE
+            } else {
+                InheritedVisibility::HIDDEN
+            };
+            match world.get_mut::<InheritedVisibility>(entity) {
+                Some(mut current) => *current = flag,
+                None => {
+                    world.entity_mut(entity).insert(flag);
+                }
+            }
+            let children: Vec<Entity> = world
+                .get::<Children>(entity)
+                .map(|children| children.iter().collect())
+                .unwrap_or_default();
+            for child in children {
+                rec(world, child, visible);
+            }
+        }
+        let roots: Vec<Entity> = world
+            .iter_entities()
+            .filter(|e| e.contains::<Visibility>() && !e.contains::<ChildOf>())
+            .map(|e| e.id())
+            .collect();
+        for root in roots {
+            rec(world, root, true);
+        }
+    }
+
+    /// (label, center in window-logical coords) of every menu button.
+    fn button_rects(app: &mut App) -> Vec<(String, Vec2)> {
+        let world = app.world_mut();
+        let mut q = world.query::<(
+            &UiGlobalTransform,
+            Option<&StartButton>,
+            Option<&OneVOneButton>,
+            Option<&OpenSettingsButton>,
+            Option<&QuitButton>,
+            Option<&RuleGarbageButton>,
+            Option<&RuleRaceButton>,
+            Option<&OpponentHumanButton>,
+            Option<&OpponentBotButton>,
+            Option<&VersusBackButton>,
+            Option<&VersusRematchButton>,
+            Option<&VersusMenuButton>,
+        )>();
+        let mut out = Vec::new();
+        for (t, start, one, settings, quit, g, r, h, b, back, rematch, menu) in q.iter(world) {
+            let label = if start.is_some() {
+                "start"
+            } else if one.is_some() {
+                "1v1"
+            } else if settings.is_some() {
+                "settings"
+            } else if quit.is_some() {
+                "quit"
+            } else if g.is_some() {
+                "garbage"
+            } else if r.is_some() {
+                "race"
+            } else if h.is_some() {
+                "human"
+            } else if b.is_some() {
+                "bot"
+            } else if back.is_some() {
+                "back"
+            } else if rematch.is_some() {
+                "rematch"
+            } else if menu.is_some() {
+                "menu"
+            } else {
+                continue;
+            };
+            out.push((label.to_string(), t.translation.xy()));
+        }
+        out
+    }
+
+    fn rect_of(app: &mut App, label: &str) -> Vec2 {
+        button_rects(app)
+            .into_iter()
+            .find(|(l, _)| l == label)
+            .unwrap_or_else(|| panic!("{label} button laid out"))
+            .1
+    }
+
+    fn set_cursor(app: &mut App, at: Vec2) {
+        let win = app.world().resource::<UiWin>().0;
+        let mut w = app
+            .world_mut()
+            .entity_mut(win)
+            .get::<Window>()
+            .unwrap()
+            .clone();
+        w.set_cursor_position(Some(at));
+        app.world_mut().entity_mut(win).insert(w);
+        app.update();
+    }
+
+    fn send_button(app: &mut App, state: bevy::input::ButtonState) {
+        let win = app.world().resource::<UiWin>().0;
+        app.world_mut()
+            .resource_mut::<Messages<bevy::input::mouse::MouseButtonInput>>()
+            .write(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state,
+                window: win,
+            });
+        app.update();
+    }
+
+    /// Press frame, idle hold frames, release — a normal human click.
+    fn tap(app: &mut App, at: Vec2) {
+        set_cursor(app, at);
+        send_button(app, bevy::input::ButtonState::Pressed);
+        app.update();
+        send_button(app, bevy::input::ButtonState::Released);
+        app.update();
+    }
+
+    /// Press and release delivered inside a single frame (event batching).
+    fn tap_fast(app: &mut App, at: Vec2) {
+        set_cursor(app, at);
+        let win = app.world().resource::<UiWin>().0;
+        {
+            let world = app.world_mut();
+            let mut msgs = world.resource_mut::<Messages<bevy::input::mouse::MouseButtonInput>>();
+            msgs.write(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Pressed,
+                window: win,
+            });
+            msgs.write(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Released,
+                window: win,
+            });
+        }
+        app.update();
+        app.update();
+    }
+
+    /// Regression (real window): top-level menu roots share one UI camera
+    /// at `ZIndex(0)`, and Bevy's UI stack sorts sibling roots by z only —
+    /// z-0 ties fall back to the unordered UI-root set, which placed the
+    /// submenu roots *below* the title. Clicking "1 v 1" then "opened" a
+    /// submenu under the (opaque) title, so the title kept swallowing every
+    /// click and a 1v1 could never be configured. The submenu roots now
+    /// carry `ZIndex(1)` and the title hides while a submenu is open, so
+    /// real pointer input can only ever reach the visible panel.
+
+    #[test]
+    fn one_v_one_submenu_clicks_reach_the_submenu_not_the_title() {
+        let mut app = menu_ui_test_app();
+        set_state(&mut app, AppState::Title);
+        app.update();
+        let one = rect_of(&mut app, "1v1");
+        // Title "Settings" y-range sits under the rules panel but inside no
+        // submenu button — the pre-fix build opened Settings through the
+        // (invisible-under-title) submenu here.
+        let title_settings = rect_of(&mut app, "settings");
+        let garbage = rect_of(&mut app, "garbage");
+        let bot = rect_of(&mut app, "bot");
+
+        tap_fast(&mut app, one);
+        assert_eq!(flow(&app).stage, VersusStage::Rules, "1v1 opens rules");
+        assert_eq!(vis_of::<VersusRulesRoot>(&mut app), Visibility::Visible);
+        assert_eq!(
+            vis_of::<TitleRoot>(&mut app),
+            Visibility::Hidden,
+            "title must not stay interactive under the submenu"
+        );
+
+        // The title's Settings button sits under the open submenu: a real
+        // click at its center must be inert (this used to open Settings
+        // through the panel, stranding the player with no way to configure
+        // the match).
+        tap(&mut app, title_settings);
+        assert_eq!(app_state(&app), AppState::Title, "no click-through");
+        assert_eq!(flow(&app).stage, VersusStage::Rules);
+        assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+
+        tap_fast(&mut app, garbage);
+        assert_eq!(flow(&app).stage, VersusStage::Opponent);
+        assert_eq!(vis_of::<VersusOpponentRoot>(&mut app), Visibility::Visible);
+
+        tap_fast(&mut app, bot);
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active, "match launches through real input");
+        assert_eq!(rule, AttackRule::Garbage);
+        assert_eq!((p1, p2), (Controller::Human, Controller::Bot));
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(flow(&app).stage, VersusStage::Title);
+    }
+
+    /// Walking the flow with the submenu's Back button (which overlaps the
+    /// title's 1v1 button) returns to the title and restores it.
+    #[test]
+    fn one_v_one_back_button_walks_out_and_restores_the_title() {
+        let mut app = menu_ui_test_app();
+        set_state(&mut app, AppState::Title);
+        app.update();
+        let one = rect_of(&mut app, "1v1");
+        let back = rect_of(&mut app, "back");
+        tap_fast(&mut app, one);
+        assert_eq!(flow(&app).stage, VersusStage::Rules);
+
+        tap_fast(&mut app, back);
+        assert_eq!(flow(&app).stage, VersusStage::Title);
+        assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Visible);
+        assert_eq!(app_state(&app), AppState::Title);
+
+        // …and the title buttons work again afterwards.
+        let start = rect_of(&mut app, "start");
+        tap_fast(&mut app, start);
+        assert_eq!(app_state(&app), AppState::Playing);
     }
 
     #[test]

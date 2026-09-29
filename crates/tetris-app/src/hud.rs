@@ -369,6 +369,7 @@ fn sync_text_slot(
 
 /// Score/level/lines always present; combo/b2b only while active; pause
 /// hint reflects the live pause chord.
+#[allow(clippy::too_many_arguments)]
 fn sync_hud_texts(
     mut commands: Commands,
     core: Option<NonSend<GameCore>>,
@@ -377,7 +378,30 @@ fn sync_hud_texts(
     windows: Query<&Window>,
     mut entities: ResMut<HudTextEntities>,
     mut texts: TextQuery,
+    versus: Option<NonSend<VersusMatch>>,
 ) {
+    // Defensive self-heal: re-assert the solo-HUD hide every frame while a
+    // versus match runs, so no code path can leave solo panels visible on
+    // top of the versus fields (playtest leak: the next queue showed up
+    // over the right field mid-match).
+    let hud_wanted = if versus.is_some_and(|versus| versus.active) {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for entity in [
+        entities.score,
+        entities.level,
+        entities.lines,
+        entities.combo,
+        entities.b2b,
+        entities.pause_hint,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        commands.entity(entity).insert(hud_wanted);
+    }
     let Some(snapshot) = hud_snapshot(fixture.as_deref(), core.as_deref()) else {
         return;
     };
@@ -528,7 +552,21 @@ fn sync_hud_previews(
     mut next_q: NextQuery,
     mut hold_q: HoldQuery,
     mut cells: CellsQuery,
+    versus: Option<NonSend<VersusMatch>>,
 ) {
+    // Self-heal the versus hide every frame (see `sync_hud_texts`).
+    let hud_wanted = if versus.is_some_and(|versus| versus.active) {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for entity in entities
+        .hold_root
+        .into_iter()
+        .chain(entities.next_roots.iter().copied())
+    {
+        commands.entity(entity).insert(hud_wanted);
+    }
     let Some(snapshot) = hud_snapshot(fixture.as_deref(), core.as_deref()) else {
         return;
     };
@@ -649,6 +687,7 @@ const VERSUS_HOLD_MINI: f32 = 0.35;
 const VERSUS_NEXT_SLOTS: usize = 2;
 /// Incoming-garbage `+N` indicator color.
 const GARBAGE_COLOR: Color = Color::srgb(1.0, 0.45, 0.25);
+const FINISHED_COLOR: Color = Color::srgb(1.0, 0.81, 0.43);
 
 /// Compact-panel anchors for one side of an active versus match (T26),
 /// derived from [`crate::render::versus_layouts`] so HUD and playfield share
@@ -694,6 +733,9 @@ pub enum VersusHudSlot {
     Level,
     /// `+N` incoming-garbage indicator (empty text when nothing pending).
     Pending,
+    /// `FINISHED` badge for a side that completed a Race target (empty
+    /// text while it still races or tops out).
+    Status,
 }
 
 /// Marker on a versus stat [`Text2d`], tagged with the side it mirrors.
@@ -754,6 +796,16 @@ fn versus_pending_text(pending: u32) -> String {
     }
 }
 
+/// `FINISHED` badge text for a side that completed a Race target (empty
+/// while it still races).
+fn versus_status_text(finished: bool) -> String {
+    if finished {
+        "FINISHED".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// World-space center of a versus stat text.
 pub fn versus_text_center(anchor: &VersusPanelAnchor, slot: VersusHudSlot) -> Vec2 {
     let c = anchor.cell;
@@ -762,6 +814,7 @@ pub fn versus_text_center(anchor: &VersusPanelAnchor, slot: VersusHudSlot) -> Ve
         VersusHudSlot::Lines => anchor.field_top - 4.2 * c,
         VersusHudSlot::Level => anchor.field_top - 6.9 * c,
         VersusHudSlot::Pending => anchor.field_top - 9.2 * c,
+        VersusHudSlot::Status => anchor.field_top - 10.5 * c,
     };
     Vec2::new(anchor.panel_x, y)
 }
@@ -793,6 +846,7 @@ fn spawn_versus_side(commands: &mut Commands, side: Side) {
                 VersusHudSlot::Lines,
                 VersusHudSlot::Level,
                 VersusHudSlot::Pending,
+                VersusHudSlot::Status,
             ] {
                 root.spawn((
                     VersusHudText { side, slot },
@@ -801,10 +855,10 @@ fn spawn_versus_side(commands: &mut Commands, side: Side) {
                         font_size: bevy::text::FontSize::Px(12.0),
                         ..default()
                     },
-                    TextColor(if slot == VersusHudSlot::Pending {
-                        GARBAGE_COLOR
-                    } else {
-                        Color::WHITE
+                    TextColor(match slot {
+                        VersusHudSlot::Pending => GARBAGE_COLOR,
+                        VersusHudSlot::Status => FINISHED_COLOR,
+                        _ => Color::WHITE,
                     }),
                     Transform::from_xyz(0.0, 0.0, 0.5),
                 ));
@@ -824,7 +878,15 @@ fn spawn_versus_side(commands: &mut Commands, side: Side) {
                     for _ in 0..4 {
                         preview.spawn((
                             VersusMiniCell,
-                            Sprite::default(),
+                            // Explicit zero-size placeholder: a bare
+                            // `Sprite::default()` is a 100x100 white quad
+                            // that would flash giant if ever drawn before
+                            // the sync pass sizes it.
+                            Sprite {
+                                color: Color::NONE,
+                                custom_size: Some(Vec2::ZERO),
+                                ..default()
+                            },
                             Transform::from_translation(Vec3::ZERO),
                         ));
                     }
@@ -919,6 +981,11 @@ fn sync_versus_hud(
         } else {
             snapshot.pending.1
         };
+        let finished = if meta.side == Side::Left {
+            snapshot.finished.0
+        } else {
+            snapshot.finished.1
+        };
         font.font_size = bevy::text::FontSize::Px((anchor.cell * 0.45).max(8.0));
         transform.translation = versus_text_center(&anchor, meta.slot).extend(0.5);
         let content = match meta.slot {
@@ -926,6 +993,7 @@ fn sync_versus_hud(
             VersusHudSlot::Lines => format!("LINES\n{}", game.lines),
             VersusHudSlot::Level => format!("LEVEL\n{}", game.level),
             VersusHudSlot::Pending => versus_pending_text(pending),
+            VersusHudSlot::Status => versus_status_text(finished),
         };
         if text.0 != content {
             text.0 = content;

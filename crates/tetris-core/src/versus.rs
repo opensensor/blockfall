@@ -26,11 +26,18 @@
 //!   batch (constant within a batch, random across batches). If the push
 //!   moves occupied cells past the ceiling, or the garbage rows would land
 //!   on the side's active piece, that side tops out.
-//! - [`AttackRule::Race { target_lines }`]: no garbage; the first side to
-//!   clear `target_lines` wins.
+//! - [`AttackRule::Race { target_lines }`]: no garbage. Reaching
+//!   `target_lines` *finishes* a side instead of winning: its board
+//!   freezes (its `apply`/`tick` become no-ops) while the opponent keeps
+//!   playing. Once **all** sides have finished, the winner is the one with
+//!   the higher score, then level, then lines; a perfect tie goes to the
+//!   first side to the target. Racing fast is never punished, but a fast
+//!   finish alone never decides the match — the other side always gets to
+//!   play out its race.
 //! - Any top-out (block-out in normal play, or garbage overflow) hands the
-//!   win to the opponent. Once a winner is set, [`Match::apply`] is a
-//!   no-op returning an empty batch.
+//!   win to the opponent, even if that opponent already finished. Once a
+//!   winner is set, [`Match::apply`] is a no-op returning an empty batch,
+//!   and so is `apply`/`tick` for a side that already finished a Race.
 //!
 //! Event emission order inside one `apply`: `PieceLocked`, then
 //! `GarbageReceived` (+ `PlayerTopOut`/`WinnerCrowned` if the garbage was
@@ -49,6 +56,11 @@ use crate::prng::Rng;
 
 /// Default sprint distance for [`AttackRule::Race`] (PRD §15).
 pub const DEFAULT_RACE_LINES: u32 = 40;
+
+/// Most garbage rows a single lock can land on the receiver; the surplus of
+/// a bigger queued attack waits for the receiver's next locks (keeps even
+/// a huge burst playable instead of instantly burying a side).
+pub const MAX_GARBAGE_PER_LAND: u32 = 4;
 
 /// Which side of the match an action or event belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -81,7 +93,9 @@ impl Side {
 pub enum AttackRule {
     /// Line clears send garbage; top-out decides the match.
     Garbage,
-    /// No garbage; first side to clear `target_lines` wins.
+    /// No garbage. Reaching `target_lines` finishes (freezes) that side;
+    /// the match is decided once all sides have finished, by score, then
+    /// level, then lines (perfect tie: first to the target).
     Race {
         /// Cumulative cleared lines that win the match.
         target_lines: u32,
@@ -127,7 +141,8 @@ pub enum MatchEvent {
         /// Side that died.
         side: Side,
     },
-    /// `side` reached the race target (Race rule only).
+    /// `side` reached the race target (Race rule only): its board is
+    /// frozen from here on; the match stays open until every side finishes.
     RaceTargetReached {
         /// Side that finished the target.
         side: Side,
@@ -150,6 +165,9 @@ pub struct MatchSnapshot {
     pub pending: (u32, u32),
     /// Current winner (`None` while the match is open).
     pub winner: Option<Side>,
+    /// Whether each side has finished a Race target (frozen; `(left,
+    /// right)`, always `(false, false)` under Garbage).
+    pub finished: (bool, bool),
     /// Active attack rule.
     pub rule: AttackRule,
 }
@@ -163,6 +181,11 @@ pub struct Match {
     rule: AttackRule,
     winner: Option<Side>,
     pending: [u32; 2],
+    /// Finish order per side (`None` = still racing): the 1-based index in
+    /// which the side reached the Race target; always `None` under Garbage.
+    finished: [Option<u32>; 2],
+    /// Number of sides that have finished the Race target.
+    finish_clock: u32,
     rng: Rng,
 }
 
@@ -180,6 +203,8 @@ impl Match {
             rule,
             winner: None,
             pending: [0, 0],
+            finished: [None, None],
+            finish_clock: 0,
             rng,
         }
     }
@@ -203,9 +228,10 @@ impl Match {
     /// Apply one action for `side` to its game and run the versus rules:
     /// received garbage lands first on this side's lock (pushing its stack
     /// up), then this lock's attack (if any) queues on the opponent. After
-    /// a winner is set this is a no-op returning an empty batch.
+    /// a winner is set — or once this side has finished a Race target —
+    /// this is a no-op returning an empty batch.
     pub fn apply(&mut self, side: Side, action: Action) -> Vec<MatchEvent> {
-        if self.winner.is_some() {
+        if self.winner.is_some() || self.finished[side.index()].is_some() {
             return Vec::new();
         }
         let events = match side {
@@ -219,9 +245,9 @@ impl Match {
     /// `side` and run the same versus rules [`Match::apply`] runs after any
     /// lock: a lock that happens on the lock-delay timer clears lines,
     /// queues garbage and can top out exactly like an action-driven lock.
-    /// No-op once a winner is set.
+    /// No-op once a winner is set or this side has finished a Race target.
     pub fn tick(&mut self, side: Side) -> Vec<MatchEvent> {
-        if self.winner.is_some() {
+        if self.winner.is_some() || self.finished[side.index()].is_some() {
             return Vec::new();
         }
         let events = match side {
@@ -255,11 +281,15 @@ impl Match {
         }
 
         // Garbage rule: a queued batch lands first, before this lock's own
-        // attack is computed — the receiving side may die on it.
+        // attack is computed — the receiving side may die on it. At most
+        // [`MAX_GARBAGE_PER_LAND`] rows land per lock (guideline attack
+        // cap): a big accumulated attack arrives as a steady trickle over
+        // the receiver's next locks instead of burying them instantly, so
+        // even a huge burst stays playable.
         let i = side.index();
         if self.rule == AttackRule::Garbage && locked && !top_out && self.pending[i] > 0 {
-            let rows = self.pending[i];
-            self.pending[i] = 0;
+            let rows = self.pending[i].min(MAX_GARBAGE_PER_LAND);
+            self.pending[i] -= rows;
             out.push(MatchEvent::GarbageReceived { side, lines: rows });
             let hole = self.rng.next_below(COLS as u64) as usize;
             let old = self.game(side).snapshot().board;
@@ -293,10 +323,21 @@ impl Match {
                 }
             }
             AttackRule::Race { target_lines } => {
-                if locked && self.game(side).snapshot().lines >= target_lines {
+                // Reaching the target freezes this side; the match only
+                // ends once every side has finished (see module docs).
+                let i = side.index();
+                if locked
+                    && self.finished[i].is_none()
+                    && self.game(side).snapshot().lines >= target_lines
+                {
+                    self.finish_clock += 1;
+                    self.finished[i] = Some(self.finish_clock);
                     out.push(MatchEvent::RaceTargetReached { side });
-                    self.winner = Some(side);
-                    out.push(MatchEvent::WinnerCrowned { side });
+                    if self.finished[side.other().index()].is_some() {
+                        let winner = self.compare_finished();
+                        self.winner = Some(winner);
+                        out.push(MatchEvent::WinnerCrowned { side: winner });
+                    }
                 }
             }
         }
@@ -311,7 +352,33 @@ impl Match {
             right: self.right.snapshot(),
             pending: (self.pending[0], self.pending[1]),
             winner: self.winner,
+            finished: (self.finished[0].is_some(), self.finished[1].is_some()),
             rule: self.rule,
+        }
+    }
+
+    /// Whether `side` has finished a Race target (board frozen; always
+    /// `false` under Garbage).
+    pub fn finished(&self, side: Side) -> bool {
+        self.finished[side.index()].is_some()
+    }
+
+    /// Rank the two finished sides: higher score, then level, then lines;
+    /// a perfect tie rewards the first side to the target.
+    fn compare_finished(&self) -> Side {
+        let (left, right) = (self.left.snapshot(), self.right.snapshot());
+        let key = |g: &GameSnapshot| (g.score, g.level, g.lines);
+        if key(&left) != key(&right) {
+            return if key(&left) > key(&right) {
+                Side::Left
+            } else {
+                Side::Right
+            };
+        }
+        if self.finished[0] < self.finished[1] {
+            Side::Left
+        } else {
+            Side::Right
         }
     }
 
@@ -330,10 +397,10 @@ impl Match {
     }
 }
 
-/// Piece stamped into incoming garbage cells. `Piece` is frozen and has no
-/// garbage variant, so a real tetromino mark stands in (the app layer can
-/// recolor garbage rows at render time until a dedicated variant exists).
-const GARBAGE_MARK: Piece = Piece::O;
+/// Piece stamped into incoming garbage cells. `Piece::Garbage` exists so
+/// the board can carry garbage while the app renders it neutral instead of
+/// piece-colored.
+const GARBAGE_MARK: Piece = Piece::Garbage;
 
 /// Push `rows` garbage rows up from the bottom of `board`: every existing
 /// cell shifts up by `rows`, the `rows` new bottom rows come in full except
@@ -691,8 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn race_target_reached_wins_immediately() {
-        let seed = find_match_seed(Some(&[Piece::I]), None);
+    fn race_freezes_finishing_side_until_both_finish() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::I]));
         let mut m = Match::new(seed, AttackRule::Race { target_lines: 1 });
         setup_flat_gap(&mut m, Side::Left);
         let ev = m.apply(Side::Left, Action::HardDrop);
@@ -704,6 +771,34 @@ mod tests {
                     lines: 1
                 },
                 MatchEvent::RaceTargetReached { side: Side::Left },
+            ]
+        );
+        assert_eq!(
+            m.winner(),
+            None,
+            "finishing must not crown while the opponent still races"
+        );
+        assert!(m.finished(Side::Left));
+        assert!(!m.finished(Side::Right));
+
+        // The finished side's board is frozen; the opponent keeps racing.
+        let frozen = m.snapshot();
+        assert!(m.apply(Side::Left, Action::HardDrop).is_empty());
+        assert!(m.tick(Side::Left).is_empty());
+        assert_eq!(m.snapshot(), frozen, "finished side's board is frozen");
+
+        // Right clears its target too: equal one-single scores decide by
+        // finish order, so the first finisher wins.
+        setup_flat_gap(&mut m, Side::Right);
+        let ev = m.apply(Side::Right, Action::HardDrop);
+        assert_eq!(
+            ev,
+            vec![
+                MatchEvent::PieceLocked {
+                    side: Side::Right,
+                    lines: 1
+                },
+                MatchEvent::RaceTargetReached { side: Side::Right },
                 MatchEvent::WinnerCrowned { side: Side::Left },
             ]
         );
@@ -711,8 +806,85 @@ mod tests {
         assert_eq!(m.pending_attack(Side::Right), 0, "race never queues");
         let before = m.snapshot();
         assert!(m.apply(Side::Right, Action::HardDrop).is_empty());
-        assert!(m.apply(Side::Left, Action::HardDrop).is_empty());
         assert_eq!(m.snapshot(), before, "match frozen after crowning");
+    }
+
+    #[test]
+    fn race_better_score_wins_when_both_finish() {
+        // Left finishes with one single, Right answers with a 4-line
+        // tetris: the *later* finisher wins on score, not on speed.
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::I]));
+        let mut m = Match::new(seed, AttackRule::Race { target_lines: 1 });
+        setup_flat_gap(&mut m, Side::Left);
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert!(ev.contains(&MatchEvent::RaceTargetReached { side: Side::Left }));
+        assert_eq!(m.winner(), None);
+
+        setup_vertical_gap(&mut m, Side::Right, 4, 5);
+        let ev = drop_vertical_i(&mut m, Side::Right, 5);
+        assert!(
+            ev.contains(&MatchEvent::RaceTargetReached { side: Side::Right }),
+            "{ev:?}"
+        );
+        assert_eq!(m.winner(), Some(Side::Right), "tetris outscores a single");
+    }
+
+    #[test]
+    fn race_top_out_hands_win_to_finished_opponent() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, AttackRule::Race { target_lines: 1 });
+        setup_flat_gap(&mut m, Side::Left);
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert!(ev.contains(&MatchEvent::RaceTargetReached { side: Side::Left }));
+        assert_eq!(m.winner(), None);
+
+        // Same spawn-wall setup as the tick top-out test: Right's O locks
+        // on it, then every next piece block-outs at spawn.
+        let mut board = Board::new();
+        for r in 2..ROWS {
+            board.set(r, 4, Some(Piece::Z));
+            board.set(r, 5, Some(Piece::Z));
+        }
+        assert!(m.game_mut(Side::Right).install_board(board, false));
+        let mut log = Vec::new();
+        for _ in 0..40 {
+            log.extend(m.tick(Side::Right));
+            if m.winner().is_some() {
+                break;
+            }
+        }
+        assert!(
+            log.contains(&MatchEvent::PlayerTopOut { side: Side::Right }),
+            "{log:?}"
+        );
+        assert_eq!(m.winner(), Some(Side::Left));
+    }
+
+    #[test]
+    fn garbage_lands_at_most_the_cap_per_lock_and_drips_the_surplus() {
+        let seed = find_match_seed(Some(&[Piece::O]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, AttackRule::Garbage);
+        m.pending[Side::Right.index()] = MAX_GARBAGE_PER_LAND + 2;
+
+        let ev = m.apply(Side::Right, Action::HardDrop);
+        assert!(
+            ev.contains(&MatchEvent::GarbageReceived {
+                side: Side::Right,
+                lines: MAX_GARBAGE_PER_LAND
+            }),
+            "first lock lands exactly the cap: {ev:?}"
+        );
+        assert_eq!(m.pending_attack(Side::Right), 2);
+
+        let ev = m.apply(Side::Right, Action::HardDrop);
+        assert!(
+            ev.contains(&MatchEvent::GarbageReceived {
+                side: Side::Right,
+                lines: 2
+            }),
+            "the surplus arrives on the next lock: {ev:?}"
+        );
+        assert_eq!(m.pending_attack(Side::Right), 0);
     }
 
     #[test]

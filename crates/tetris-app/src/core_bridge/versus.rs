@@ -34,6 +34,7 @@
 
 use bevy::prelude::*;
 
+use tetris_core::actions::Action;
 use tetris_core::versus::{AttackRule, Match, MatchEvent, Side, DEFAULT_RACE_LINES};
 
 use super::{bot_side_drive, env_seed, wall_clock_seed, BotState, SimPaused};
@@ -94,6 +95,9 @@ pub struct VersusMatch {
     /// Per-side greedy bot executors (index = `Side::index()`), reused from
     /// the solo marathon machinery.
     bots: [BotState; 2],
+    /// Per-side pacing countdown: while `> 0` the side's bot idles (and the
+    /// counter ticks down), see [`BOT_LOCK_COOLDOWN_STEPS`].
+    bot_cooldown: [u32; 2],
 }
 
 impl VersusMatch {
@@ -109,6 +113,7 @@ impl VersusMatch {
             steps: 0,
             crowned: false,
             bots: Default::default(),
+            bot_cooldown: [0; 2],
         }
     }
 
@@ -124,6 +129,12 @@ impl Default for VersusMatch {
         Self::new(wall_clock_seed(), AttackRule::default())
     }
 }
+
+/// Fixed steps a versus bot idles after every lock before starting its next
+/// placement (at 60 Hz: ~1 lock/sec — a competitive human pace). Without it
+/// the greedy solver places a piece every handful of steps and buries the
+/// human side under a wall of garbage before they can react.
+pub const BOT_LOCK_COOLDOWN_STEPS: u32 = 60;
 
 /// Start (or replace) a versus match: fresh [`Match`] seeded from
 /// [`SEED_ENV`](super::SEED_ENV) when set (reproducible CI/headless runs) else wall clock,
@@ -150,6 +161,7 @@ pub fn start_versus(
     versus.steps = 0;
     versus.crowned = false;
     versus.bots = Default::default();
+    versus.bot_cooldown = [0; 2];
     versus.active = true;
     winner.0 = None;
     *app_state = AppState::Playing;
@@ -171,9 +183,13 @@ pub fn end_versus(versus: &mut VersusMatch, winner: &mut VersusWinner, app_state
 // ---------------------------------------------------------------------------
 
 /// Feed every [`Controller::Bot`] side's snapshot to the shared greedy bot
-/// executor and push its chosen action into that side's queue. Runs in
-/// `FixedUpdate` *before* [`versus_bridge_system`], so actions apply
-/// same-tick (same placement as the solo `bot_drive_system`).
+/// executor and push its chosen action into that side's queue. Sides that
+/// already finished a Race target (frozen boards) are skipped. Each bot is
+/// paced: after its hard drop it idles for [`BOT_LOCK_COOLDOWN_STEPS`]
+/// fixed steps, keeping it at a human-plausible lock rate instead of
+/// stacking 300 pieces a minute. Runs in `FixedUpdate` *before*
+/// [`versus_bridge_system`], so actions apply same-tick (same placement as
+/// the solo `bot_drive_system`).
 fn versus_bot_system(
     versus: NonSendMut<VersusMatch>,
     mut actions: ResMut<VersusActions>,
@@ -186,20 +202,31 @@ fn versus_bot_system(
     let versus = versus.into_inner();
     for (index, side) in [(0usize, Side::Left), (1, Side::Right)] {
         let controller = if index == 0 { versus.p1 } else { versus.p2 };
-        if controller != Controller::Bot {
+        if controller != Controller::Bot || versus.match_.finished(side) {
             continue;
         }
         let snapshot = match side {
             Side::Left => versus.match_.left.snapshot(),
             Side::Right => versus.match_.right.snapshot(),
         };
+        if versus.bot_cooldown[index] > 0 {
+            versus.bot_cooldown[index] -= 1;
+            continue;
+        }
         let state = &mut versus.bots[index];
         let queue = if index == 0 {
             &mut actions.left
         } else {
             &mut actions.right
         };
-        bot_side_drive(&snapshot, state, &mut |a| queue.push(a));
+        let mut dropped = false;
+        bot_side_drive(&snapshot, state, &mut |a| {
+            dropped |= matches!(a, Action::HardDrop);
+            queue.push(a);
+        });
+        if dropped {
+            versus.bot_cooldown[index] = BOT_LOCK_COOLDOWN_STEPS;
+        }
     }
 }
 
@@ -224,6 +251,7 @@ fn versus_bridge_system(
         return;
     }
     let versus = versus.into_inner();
+
     let mut events = Vec::new();
     for (side, queue) in [
         (Side::Left, std::mem::take(&mut actions.left)),
@@ -718,7 +746,9 @@ mod tests {
     #[test]
     fn winner_is_crowned_once_and_the_match_stays_frozen() {
         let mut app = test_app(7);
-        // Race to 0 lines: the first lock by either side ends the match.
+        // Race to 0 lines: each side's first lock *finishes* it; the
+        // crowning waits for the second finisher, then the perfect tie
+        // (all zeros) goes to the side that finished first.
         start_in_app(
             &mut app,
             AttackRule::Race { target_lines: 0 },
@@ -730,7 +760,23 @@ mod tests {
         fixed_step(&mut app);
         assert_eq!(
             *app.world().resource::<VersusWinner>(),
-            VersusWinner(Some(Side::Left))
+            VersusWinner(None),
+            "finishing alone never crowns"
+        );
+        let after_left = drained_versus(&mut app);
+        assert!(
+            after_left
+                .iter()
+                .any(|e| matches!(e.0, MatchEvent::RaceTargetReached { side: Side::Left })),
+            "left finishes while the match stays open: {after_left:?}"
+        );
+
+        push_side(&mut app, Side::Right, &[Action::HardDrop]);
+        fixed_step(&mut app);
+        assert_eq!(
+            *app.world().resource::<VersusWinner>(),
+            VersusWinner(Some(Side::Left)),
+            "first finisher takes the perfect tie"
         );
         assert_eq!(*app.world().resource::<AppState>(), AppState::Playing);
         let crowning = drained_versus(&mut app);
@@ -805,6 +851,46 @@ mod tests {
         assert!(drained_versus(&mut app).is_empty());
         // Solo is live again (still Title, so the solo core waits as always).
         assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+    }
+
+    #[test]
+    fn versus_bots_lock_at_most_once_per_cooldown_window() {
+        // Regression: unpaced, the greedy solver drops a piece every few
+        // fixed steps and buries the opponent in garbage within seconds.
+        // Each bot must idle for BOT_LOCK_COOLDOWN_STEPS after its own lock.
+        let mut app = test_app(42);
+        start_in_app(
+            &mut app,
+            AttackRule::Garbage,
+            Controller::Bot,
+            Controller::Bot,
+        );
+        let mut locks = [0u32; 2];
+        let window = 10 * BOT_LOCK_COOLDOWN_STEPS as usize; // ~10 s
+        for _ in 0..window {
+            fixed_step(&mut app);
+            let drained: Vec<VersusEvent> = app
+                .world_mut()
+                .resource_mut::<Messages<VersusEvent>>()
+                .drain()
+                .collect();
+            for e in drained {
+                if let MatchEvent::PieceLocked { side, .. } = e.0 {
+                    locks[if matches!(side, Side::Left) { 0 } else { 1 }] += 1;
+                }
+            }
+        }
+        for (index, n) in locks.iter().enumerate() {
+            assert!(
+                (*n as usize) <= window / BOT_LOCK_COOLDOWN_STEPS as usize + 2,
+                "side {index} locked {n} times in {window} fixed steps — \
+                 versus bot pacing broken"
+            );
+        }
+        assert!(
+            locks[0] + locks[1] > 0,
+            "the bots still play, they are only throttled"
+        );
     }
 
     #[test]

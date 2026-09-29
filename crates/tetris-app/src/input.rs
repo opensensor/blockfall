@@ -560,6 +560,11 @@ pub struct PlayerPreset {
 }
 
 /// The versus binding table (both sides in one resource).
+///
+/// Note: [`versus_input_system`] hands the arrow preset to a *lone* human
+/// side (vs the bot), so `p2` is what a solo keyboard player presses in a
+/// Human-vs-Bot match; `p1` (WASD) only applies to the left seat of a
+/// two-human match.
 #[derive(Debug, Clone, PartialEq, Eq, Resource)]
 pub struct VersusBindings {
     /// Left player (P1) preset.
@@ -652,13 +657,20 @@ fn drive_versus_side(
     let held_ccw = any(&preset.rotate_ccw);
     let held_hold = any(&preset.hold);
 
-    let move_left = held_left && !std::mem::replace(&mut machine.prev_left, held_left);
-    let move_right = held_right && !std::mem::replace(&mut machine.prev_right, held_right);
-    let soft = held_soft && !std::mem::replace(&mut machine.prev_soft, held_soft);
-    let hard = held_hard && !std::mem::replace(&mut machine.prev_hard, held_hard);
-    let rotate_cw = held_cw && !std::mem::replace(&mut machine.prev_cw, held_cw);
-    let rotate_ccw = held_ccw && !std::mem::replace(&mut machine.prev_ccw, held_ccw);
-    let hold = held_hold && !std::mem::replace(&mut machine.prev_hold, held_hold);
+    // NOTE: compute `was` unconditionally — `held && !replace(..)` would
+    // short-circuit on release and latch the previous state to `true`,
+    // killing every subsequent press edge for that slot.
+    fn press_edge(prev: &mut bool, now: bool) -> bool {
+        let was = std::mem::replace(prev, now);
+        now && !was
+    }
+    let move_left = press_edge(&mut machine.prev_left, held_left);
+    let move_right = press_edge(&mut machine.prev_right, held_right);
+    let soft = press_edge(&mut machine.prev_soft, held_soft);
+    let hard = press_edge(&mut machine.prev_hard, held_hard);
+    let rotate_cw = press_edge(&mut machine.prev_cw, held_cw);
+    let rotate_ccw = press_edge(&mut machine.prev_ccw, held_ccw);
+    let hold = press_edge(&mut machine.prev_hold, held_hold);
 
     let Some(out) = out else { return };
 
@@ -686,6 +698,7 @@ fn drive_versus_side(
     if hard {
         out.push(Action::HardDrop);
     }
+
     if rotate_cw {
         out.push(Action::RotateCw);
     }
@@ -729,8 +742,29 @@ fn versus_input_system(mut params: VersusInputParams) {
     let p1_human = matches!(params.versus.p1, Controller::Human);
     let p2_human = matches!(params.versus.p2, Controller::Human);
 
+    // A lone human (vs the bot) drives with the arrow preset — the same
+    // keys as solo play. A two-human match keeps the classic shared-keyboard
+    // split: P1 WASD on the left, P2 arrows on the right. The lone human's
+    // copy also claims the solo alternate keys (Space hard drop, X/Z
+    // rotations, C/Shift hold) — all free because no P2 seat competes.
+    let lone_human_p1 = p1_human && !p2_human;
+
+    let solo_arrow_preset;
+    let (p1_preset, p2_preset) = if lone_human_p1 {
+        let mut preset = bindings.p2.clone();
+        preset.hard_drop.push(KeyCode::Space);
+        preset.rotate_cw.push(KeyCode::KeyX);
+        preset.rotate_ccw.push(KeyCode::KeyZ);
+        preset.hold.push(KeyCode::KeyC);
+        preset.hold.push(KeyCode::ShiftLeft);
+        solo_arrow_preset = preset;
+        (&solo_arrow_preset, &bindings.p1)
+    } else {
+        (&bindings.p1, &bindings.p2)
+    };
+
     drive_versus_side(
-        &bindings.p1,
+        p1_preset,
         keys,
         das_ticks,
         arr_ticks,
@@ -743,7 +777,7 @@ fn versus_input_system(mut params: VersusInputParams) {
         },
     );
     drive_versus_side(
-        &bindings.p2,
+        p2_preset,
         keys,
         das_ticks,
         arr_ticks,
@@ -1076,5 +1110,117 @@ mod tests {
             col_before - 1,
             "the MoveLeft action reached the core"
         );
+    }
+
+    // ---- versus preset selection ----
+
+    /// Versus-active app: `VersusMatch` live with the given controllers,
+    /// `AppState::Playing`. Only `FixedPreUpdate` is ever run by these
+    /// tests, so the queues keep what the input systems pushed.
+    fn versus_test_app(p1: Controller, p2: Controller) -> App {
+        // `CoreBridgePlugin` already hosts `VersusMatch` (inactive by
+        // default); these tests just arm it and run `FixedPreUpdate`, so
+        // the queues keep whatever the input systems pushed.
+        let mut app = test_app();
+        {
+            let mut versus = app.world_mut().non_send_mut::<VersusMatch>();
+            versus.active = true;
+            versus.p1 = p1;
+            versus.p2 = p2;
+        }
+        *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
+        app
+    }
+
+    fn versus_queues(app: &App) -> (Vec<Action>, Vec<Action>) {
+        let actions = app.world().resource::<VersusActions>();
+        (actions.left.clone(), actions.right.clone())
+    }
+
+    fn step_pre(app: &mut App) {
+        let _ = app.world_mut().try_run_schedule(FixedPreUpdate);
+    }
+
+    #[test]
+    fn lone_human_vs_bot_drives_with_arrows_not_wasd() {
+        // Regression: the menu starts Human-vs-Bot with the human on P1,
+        // whose fixed preset is WASD — the solo muscle-memory arrow keys
+        // did nothing. A lone human must get the arrow preset instead.
+        let mut app = versus_test_app(Controller::Human, Controller::Bot);
+        press(&mut app, KeyCode::ArrowLeft);
+        press(&mut app, KeyCode::Space);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            left,
+            vec![Action::MoveLeft, Action::HardDrop],
+            "arrows and space drive the lone human seat"
+        );
+        assert_eq!(right, Vec::new(), "the bot side never takes keyboard");
+
+        // WASD is not bound to the lone human seat.
+        release(&mut app, KeyCode::ArrowLeft);
+        release(&mut app, KeyCode::Space);
+        press(&mut app, KeyCode::KeyA);
+        press(&mut app, KeyCode::KeyW);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            (left, right),
+            (vec![Action::MoveLeft, Action::HardDrop], Vec::new()),
+            "WASD stays silent while the human plays alone"
+        );
+    }
+
+    #[test]
+    fn two_humans_keep_the_classic_wasd_and_arrow_split() {
+        let mut app = versus_test_app(Controller::Human, Controller::Human);
+        press(&mut app, KeyCode::KeyA);
+        press(&mut app, KeyCode::ArrowLeft);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(left, vec![Action::MoveLeft], "P1 keeps WASD");
+        assert_eq!(right, vec![Action::MoveLeft], "P2 keeps arrows");
+    }
+
+    #[test]
+    fn versus_edges_refire_after_release() {
+        // Regression: `held && !mem::replace(prev, held)` short-circuits on
+        // release, so `prev` latched to `true` and only the FIRST press of
+        // every versus key ever queued an action (one hard drop per match,
+        // rotation dead after one use). Every press after a release must
+        // fire again.
+        let mut app = versus_test_app(Controller::Human, Controller::Bot);
+        press(&mut app, KeyCode::Space);
+        step_pre(&mut app);
+        release(&mut app, KeyCode::Space);
+        step_pre(&mut app);
+        press(&mut app, KeyCode::KeyX);
+        step_pre(&mut app);
+        release(&mut app, KeyCode::KeyX);
+        step_pre(&mut app);
+        press(&mut app, KeyCode::KeyC);
+        step_pre(&mut app);
+        release(&mut app, KeyCode::KeyC);
+        step_pre(&mut app);
+        press(&mut app, KeyCode::ArrowLeft);
+        step_pre(&mut app);
+        release(&mut app, KeyCode::ArrowLeft);
+        step_pre(&mut app);
+        press(&mut app, KeyCode::ArrowLeft);
+        step_pre(&mut app);
+        let (left, right) = versus_queues(&app);
+        assert_eq!(
+            left,
+            vec![
+                Action::HardDrop,
+                Action::RotateCw,
+                Action::Hold,
+                Action::MoveLeft,
+                Action::MoveLeft,
+            ],
+            "second presses of hard drop, rotate, hold and move all re-fire"
+        );
+        assert_eq!(right, Vec::new(), "the bot side never takes keyboard");
     }
 }

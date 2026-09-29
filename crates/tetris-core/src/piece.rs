@@ -10,7 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The seven standard tetrominoes.
+/// The seven standard tetrominoes, plus the garbage filler used by the
+/// versus `Match` (never dealt, never active, never rotated).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Piece {
     I,
@@ -20,6 +21,9 @@ pub enum Piece {
     S,
     T,
     Z,
+    /// Versus garbage row filler (T24, `versus::push_garbage_rows`). Not in
+    /// [`Piece::ALL`]: the 7-bag never deals it and no app path spawns it.
+    Garbage,
 }
 
 impl Piece {
@@ -59,6 +63,7 @@ impl Piece {
             (L, Ccw) => [(0, 0), (0, 1), (1, 1), (2, 1)],
 
             (O, _) => [(0, 0), (0, 1), (1, 0), (1, 1)],
+            (Garbage, _) => [(0, 0), (0, 1), (1, 0), (1, 1)],
 
             (S, Spawn) => [(0, 1), (0, 2), (1, 0), (1, 1)],
             (S, Cw) => [(0, 1), (1, 1), (1, 2), (2, 2)],
@@ -81,7 +86,7 @@ impl Piece {
     pub fn box_size(self) -> usize {
         match self {
             Piece::I => 4,
-            Piece::O => 2,
+            Piece::O | Piece::Garbage => 2,
             _ => 3,
         }
     }
