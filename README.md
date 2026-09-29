@@ -67,11 +67,27 @@ land with a negotiated delay D = max(host, guest), 8 ticks ≈ 133 ms by default
 (`TETRIS_NET_DELAY`). Host and guest both see both boards rendered locally —
 there is no video/state streaming, only inputs.
 
-- **NAT / port-forwarding.** Connections are direct IP. For play over the
-  internet the host must **port-forward UDP 27015** to their machine (and allow
-  it through any host firewall); the Host screen shows the host's LAN IPv4 when
-  one exists — over the internet, share your public IP instead. LAN play works
+- **Automatic router port mapping (UPnP).** When you Host, Blockfall asks
+  your router (UPnP IGD) to forward UDP 27015 to your machine, then shows
+  **`Friends join at <public-ip>:<port>`** — hand that to your guest and play
+  cross-WAN with zero router clicks. The lease is renewable (3600 s, refreshed
+  every 30 min while you host) and is deleted when you stop hosting (Esc). If
+  the Host screen instead shows **`UPnP unavailable — forward UDP 27015
+  manually (see below)`**, that is normal: the router has UPnP disabled, your
+  ISP controls the edge device, or the network blocks SSDP — LAN play is
+  unaffected. Press **U** on the Host screen to retry or disable the attempt
+  (remembered in the net profile).
+- **NAT / manual port-forwarding.** If UPnP is unavailable, connections are
+  still direct IP: for internet play **port-forward UDP 27015** to your
+  machine (and allow it through any host firewall); the Host screen shows the
+  host's LAN IPv4 when one exists — over the internet, share your public IP
+  (or the address your router's status page shows) instead. LAN play works
   with no setup beyond the firewall.
+- **Hosted UDP tunnels no longer work (2026).** Quick tunnels are not an
+  option for this game: **ngrok 3.39 removed the `udp` command entirely**
+  (only http/tcp/tls remain) and **cloudflared 2026.9 rejects UDP origins**
+  (`Currently Cloudflare Tunnel does not support udp protocol`). Netplay is
+  raw UDP (netcode), so UPnP/router mapping is the no-infrastructure path.
 - **The port is open while listening.** v1 uses unauthenticated netcode
   (protocol-ID check only): anyone who can reach the port with a matching
   protocol version can join while you are listening. Keep sessions short and

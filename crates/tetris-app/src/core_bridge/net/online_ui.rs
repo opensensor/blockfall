@@ -72,6 +72,7 @@ use super::protocol::NetMsg;
 use super::session::{
     net_host, net_join, net_stop, NetEvent, NetLossReason, NetRole, NetSession, NetStatus,
 };
+use super::upnp::{mapping_held, start_mapping, teardown_mapping, UpnpPlugin, UpnpState};
 use crate::core_bridge::{start_net_match, VersusMatch};
 use crate::screens_menu::{VersusFlow, VersusMenuButton, VersusRematchButton, VersusStage};
 use crate::settings_persist::NetProfile;
@@ -249,6 +250,39 @@ pub fn format_host_hint(ip: Option<Ipv4Addr>, port: u16) -> String {
     match ip {
         Some(ip) => format!("{ip}:{port}"),
         None => format!("0.0.0.0:{port} — {NO_ROUTE_HINT}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UPnP status line (WAN play addendum — see net/upnp.rs)
+// ---------------------------------------------------------------------------
+
+/// One-line copy for the Host screen's UPnP status label. The exact
+/// shipped strings:
+/// * attempt running → `Opening router port…`
+/// * mapped → `Friends join at <ext_ip>:<port>`
+/// * failed / no router / no route → `UPnP unavailable — forward UDP
+///   <port> manually (see README)` (never blocks play — LAN still works)
+/// * disabled via the `U` toggle (only while hosting) → `Router mapping off
+///   — press U to enable`
+#[must_use]
+pub fn upnp_status_text(state: &UpnpState, enabled: bool, hosting: bool, port: u16) -> String {
+    if !enabled {
+        return if hosting {
+            "Router mapping off — press U to enable".to_string()
+        } else {
+            String::new()
+        };
+    }
+    match state {
+        UpnpState::Off => String::new(),
+        UpnpState::Mapping { .. } => "Opening router port…".to_string(),
+        UpnpState::Mapped { external_ip, port } => {
+            format!("Friends join at {external_ip}:{port}")
+        }
+        UpnpState::Failed(_) => {
+            format!("UPnP unavailable — forward UDP {port} manually (see README)")
+        }
     }
 }
 
@@ -440,6 +474,10 @@ pub struct HostHintText;
 /// Dynamic status label on the Host panel.
 #[derive(Component)]
 pub struct HostStatusText;
+/// Dynamic UPnP/router-mapping status line on the Host panel (WAN play
+/// addendum, net/upnp.rs).
+#[derive(Component)]
+pub struct UpnpStatusText;
 /// Dynamic entry echo on the Join panel.
 #[derive(Component)]
 pub struct JoinEntryText;
@@ -655,6 +693,44 @@ pub fn online_entry_input_system(
     }
 }
 
+/// `U` on the Host screen toggles the router port mapping (WAN play
+/// addendum): off → best-effort `DeletePortMapping` + [`UpnpState::Off`];
+/// on → retry `AddPortMapping` immediately when still `Listening`. The
+/// choice persists in [`NetProfile::upnp_enabled`].
+pub fn upnp_toggle_system(world: &mut World) {
+    if world
+        .get_resource::<RebindingCapture>()
+        .is_some_and(|capture| capture.capturing)
+    {
+        return;
+    }
+    let on_host_screen = world
+        .get_resource::<AppState>()
+        .is_some_and(|state| *state == AppState::Title)
+        && world
+            .get_resource::<OnlineFlow>()
+            .is_some_and(|flow| flow.stage == OnlineStage::Host);
+    if !on_host_screen {
+        return;
+    }
+    let pressed = world
+        .get_resource::<ButtonInput<KeyCode>>()
+        .is_some_and(|keys| keys.just_pressed(KeyCode::KeyU));
+    if !pressed {
+        return;
+    }
+    let enabled = {
+        let mut profile = world.get_resource_or_insert_with(NetProfile::default);
+        profile.upnp_enabled = !profile.upnp_enabled;
+        profile.upnp_enabled
+    };
+    if enabled {
+        start_mapping(world);
+    } else {
+        teardown_mapping(world);
+    }
+}
+
 /// Button handling for every online root, the Title "Online" entry, the net
 /// branches of the winner overlay (host rematch / menu) and the Enter-submit
 /// flag. Exclusive: the handlers call the `&mut World` lifecycle functions
@@ -849,10 +925,13 @@ pub fn sync_online_labels(
     hint: Res<HostHint>,
     entry: Res<JoinEntry>,
     overlay: Res<NetOverlay>,
+    upnp: Option<Res<UpnpState>>,
+    profile: Option<Res<NetProfile>>,
     mut labels: Query<
         (
             Has<HostHintText>,
             Has<HostStatusText>,
+            Has<UpnpStatusText>,
             Has<JoinEntryText>,
             Has<JoinStatusText>,
             Has<NetErrorText>,
@@ -861,6 +940,7 @@ pub fn sync_online_labels(
         Or<(
             With<HostHintText>,
             With<HostStatusText>,
+            With<UpnpStatusText>,
             With<JoinEntryText>,
             With<JoinStatusText>,
             With<NetErrorText>,
@@ -878,6 +958,19 @@ pub fn sync_online_labels(
         format!("share this address: {share}")
     };
     let host_line = status_text(NetRole::Host, &status);
+    let upnp_line = upnp.as_deref().map_or_else(String::new, |state| {
+        let enabled = profile
+            .as_deref()
+            .is_none_or(|profile| profile.upnp_enabled);
+        let port = session
+            .as_deref()
+            .and_then(|s| s.listen_addr)
+            .map_or(DEFAULT_HOST_PORT, |addr| addr.port());
+        let hosting = session
+            .as_deref()
+            .is_some_and(|s| mapping_held(&s.status, s.role));
+        upnp_status_text(state, enabled, hosting, port)
+    });
     let echo = if entry.invalid {
         format!("{}▌  want IPv4 address:port", entry.text)
     } else {
@@ -885,11 +978,15 @@ pub fn sync_online_labels(
     };
     let join_line = status_text(NetRole::Guest, &status);
     let headline = overlay.text.clone().unwrap_or_default();
-    for (is_hint, is_host, is_join_entry, is_join_status, is_error, mut text) in labels.iter_mut() {
+    for (is_hint, is_host, is_upnp, is_join_entry, is_join_status, is_error, mut text) in
+        labels.iter_mut()
+    {
         let wanted = if is_hint {
             &hint_line
         } else if is_host {
             &host_line
+        } else if is_upnp {
+            &upnp_line
         } else if is_join_entry {
             &echo
         } else if is_join_status {
@@ -1054,8 +1151,9 @@ fn build_online_ui(mut commands: Commands) {
             root.spawn(label_node("HOST".to_string(), 40.0));
             root.spawn((HostHintText, label_node(String::new(), 22.0)));
             root.spawn((HostStatusText, label_node(String::new(), 22.0)));
+            root.spawn((UpnpStatusText, label_node(String::new(), 18.0)));
             root.spawn(label_node(
-                "pick a rule when your challenger joins".to_string(),
+                "pick a rule when your challenger joins — U toggles router mapping".to_string(),
                 15.0,
             ));
             online_button(root, "Garbage", OnlineRuleGarbageButton);
@@ -1121,6 +1219,11 @@ impl Plugin for OnlineUiPlugin {
             .init_resource::<LeaveConfirm>()
             .init_resource::<PressedLatch>()
             .init_resource::<NetProfile>();
+        // WAN play addendum: the UPnP driver lives with the Host screen that
+        // renders its status line and owns the `U` toggle; mounting here
+        // (not in NetPlugin) keeps `session.rs` untouched and lets tests
+        // swap the runner before any Host click.
+        app.add_plugins(UpnpPlugin);
         if !app.world().contains_resource::<NetSession>() {
             app.init_resource::<NetSession>();
         }
@@ -1136,6 +1239,7 @@ impl Plugin for OnlineUiPlugin {
                 (
                     online_esc_system,
                     online_entry_input_system,
+                    upnp_toggle_system,
                     online_click_system,
                 )
                     .chain(),
@@ -1427,6 +1531,11 @@ mod tests {
             app.add_plugins(OnlineUiPlugin);
         }
         app.update();
+        // WAN play addendum: never let the real SSDP/SOAP client leave the
+        // process in tests (the runner seam in net/upnp.rs).
+        app.world_mut()
+            .resource_mut::<super::super::upnp::UpnpDriver>()
+            .runner = |_, _, _| {};
         app
     }
 
@@ -2056,5 +2165,150 @@ mod tests {
         assert_ne!(vis, Visibility::Hidden, "local rematch stays visible");
         assert_eq!(status(&app), NetStatus::Idle);
         assert_eq!(flow(&app).stage, OnlineStage::Closed);
+    }
+
+    // ---- WAN play addendum: UPnP status line + U toggle ----
+
+    #[test]
+    fn upnp_status_line_exact_copy() {
+        assert_eq!(upnp_status_text(&UpnpState::Off, true, true, 27015), "");
+        assert_eq!(
+            upnp_status_text(&UpnpState::Mapping { port: 27015 }, true, true, 27015),
+            "Opening router port…"
+        );
+        assert_eq!(
+            upnp_status_text(
+                &UpnpState::Mapped {
+                    external_ip: "203.0.113.7".into(),
+                    port: 27015
+                },
+                true,
+                true,
+                27015
+            ),
+            "Friends join at 203.0.113.7:27015"
+        );
+        assert_eq!(
+            upnp_status_text(&UpnpState::Failed("718 conflict".into()), true, true, 27015),
+            "UPnP unavailable — forward UDP 27015 manually (see README)"
+        );
+        assert_eq!(
+            upnp_status_text(&UpnpState::Off, false, true, 27015),
+            "Router mapping off — press U to enable"
+        );
+        assert_eq!(
+            upnp_status_text(&UpnpState::Off, false, false, 27015),
+            "",
+            "the disabled hint only shows while hosting"
+        );
+    }
+
+    fn upnp_label(app: &mut App) -> String {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<&Text, With<UpnpStatusText>>();
+        query.single(world).expect("upnp label").0.clone()
+    }
+
+    #[test]
+    fn host_screen_renders_the_upnp_state_line() {
+        let mut app = online_app();
+        enter_online(&mut app);
+        {
+            let mut session = app.world_mut().resource_mut::<NetSession>();
+            session.role = NetRole::Host;
+            session.status = NetStatus::Listening;
+            session.listen_addr = Some("0.0.0.0:27015".parse().expect("addr"));
+        }
+        *app.world_mut().resource_mut::<UpnpState>() = UpnpState::Mapping { port: 27015 };
+        app.update();
+        assert_eq!(upnp_label(&mut app), "Opening router port…");
+
+        *app.world_mut().resource_mut::<UpnpState>() = UpnpState::Mapped {
+            external_ip: "203.0.113.7".into(),
+            port: 27015,
+        };
+        app.update();
+        assert_eq!(
+            upnp_label(&mut app),
+            "Friends join at 203.0.113.7:27015",
+            "the mapped line carries the public join address"
+        );
+
+        *app.world_mut().resource_mut::<UpnpState>() =
+            UpnpState::Failed("no UPnP router answered on the network".into());
+        app.update();
+        assert_eq!(
+            upnp_label(&mut app),
+            "UPnP unavailable — forward UDP 27015 manually (see README)",
+            "failure keeps it one line and never blocks play"
+        );
+    }
+
+    #[test]
+    fn u_key_on_the_host_screen_toggles_upnp_and_persists() {
+        let mut app = online_app();
+        enter_online(&mut app);
+        app.world_mut().resource_mut::<OnlineFlow>().stage = OnlineStage::Host;
+        {
+            let mut session = app.world_mut().resource_mut::<NetSession>();
+            session.role = NetRole::Host;
+            session.status = NetStatus::Listening;
+            session.listen_addr = Some("0.0.0.0:27015".parse().expect("addr"));
+        }
+        *app.world_mut().resource_mut::<UpnpState>() = UpnpState::Mapped {
+            external_ip: "203.0.113.7".into(),
+            port: 27015,
+        };
+        app.update();
+
+        press_key(&mut app, KeyCode::KeyU);
+        assert!(
+            !app.world().resource::<NetProfile>().upnp_enabled,
+            "U disables in the profile"
+        );
+        assert_eq!(
+            *app.world().resource::<UpnpState>(),
+            UpnpState::Off,
+            "disabling tears the mapping down"
+        );
+        assert_eq!(
+            upnp_label(&mut app),
+            "Router mapping off — press U to enable"
+        );
+
+        press_key(&mut app, KeyCode::KeyU);
+        assert!(app.world().resource::<NetProfile>().upnp_enabled);
+        assert_eq!(
+            *app.world().resource::<UpnpState>(),
+            UpnpState::Mapping { port: 27015 },
+            "re-enabling retries immediately while Listening (silent test runner)"
+        );
+    }
+
+    #[test]
+    fn esc_on_listening_clears_the_upnp_state() {
+        let mut app = online_app();
+        enter_online(&mut app);
+        app.world_mut().resource_mut::<OnlineFlow>().stage = OnlineStage::Host;
+        {
+            let mut session = app.world_mut().resource_mut::<NetSession>();
+            session.role = NetRole::Host;
+            session.status = NetStatus::Listening;
+            session.listen_addr = Some("0.0.0.0:27015".parse().expect("addr"));
+        }
+        *app.world_mut().resource_mut::<UpnpState>() = UpnpState::Mapped {
+            external_ip: "203.0.113.7".into(),
+            port: 27015,
+        };
+        app.update();
+        assert_eq!(upnp_label(&mut app), "Friends join at 203.0.113.7:27015");
+
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(status(&app), NetStatus::Idle);
+        assert_eq!(
+            *app.world().resource::<UpnpState>(),
+            UpnpState::Off,
+            "the net_stop teardown edge resets UPnP"
+        );
     }
 }

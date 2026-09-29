@@ -3,6 +3,22 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased]
+
+### Added
+
+- **UPnP IGD auto port mapping for cross-WAN hosting** (netplay-plan.md
+  addendum): hosting now asks the home router to forward the UDP port via
+  SSDP discovery + SOAP `AddPortMapping` (no new dependencies — hand-rolled
+  std client) and shows `Friends join at <public-ip>:<port>` on the Host
+  screen; the 1 h lease self-renews every 30 min while the session holds and
+  is deleted on `net_stop`/app exit. Routers without UPnP, blocked SSDP or
+  ISP-controlled edge devices show a one-line manual-forward hint instead —
+  LAN play is never affected. `U` on the Host screen toggles the attempt
+  (persisted as `upnp_enabled` in `net_profile.json`, additive serde
+  default), and hosted UDP tunnels (ngrok/cloudflared) are documented as
+  dead ends for raw UDP in 2026.
+
 ## [0.2.0] — 2026-09-29
 
 ### Added

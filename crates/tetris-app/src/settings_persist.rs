@@ -91,11 +91,33 @@ pub struct PersistedBestScore {
 /// forbids reshaping `Settings`, so this struct lives here and round-trips on
 /// its own. `SettingsPersistPlugin` loads it at `Startup` and rewrites it
 /// (atomically, like every other file here) whenever a change settles.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, Resource)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Resource)]
 pub struct NetProfile {
     /// Last join address submitted by the player — prefilled into the IP
     /// entry widget on the Online → Join screen.
     pub last_join_addr: String,
+    /// WAN play addendum: ask the router for an automatic UPnP IGD port
+    /// mapping when hosting. `#[serde(default = …)]` keeps pre-UPnP
+    /// `net_profile.json` files loading unchanged (missing ⇒ enabled,
+    /// matching [`default_upnp_enabled`]).
+    #[serde(default = "default_upnp_enabled")]
+    pub upnp_enabled: bool,
+}
+
+/// UPnP auto-mapping ships on: routers without UPnP answer with a clean
+/// failure the Host screen absorbs with the manual-forward line.
+#[must_use]
+pub fn default_upnp_enabled() -> bool {
+    true
+}
+
+impl Default for NetProfile {
+    fn default() -> Self {
+        Self {
+            last_join_addr: String::new(),
+            upnp_enabled: default_upnp_enabled(),
+        }
+    }
 }
 
 /// Wire mirror of [`Bind`]: `{"Key":"KeyA"}` / `"WheelUp"` / `"WheelDown"`.
@@ -891,6 +913,7 @@ mod tests {
         let dir = TempDir::new("netprofile");
         let profile = NetProfile {
             last_join_addr: "192.168.1.42:27015".to_string(),
+            upnp_enabled: true,
         };
         net_profile_save_to(dir.path(), &profile).expect("save net profile");
         assert_eq!(net_profile_load_from(dir.path()), profile);
@@ -898,6 +921,7 @@ mod tests {
         // Overwrite round-trips too (a later join replaces the prefill).
         let updated = NetProfile {
             last_join_addr: "10.0.0.9:40000".to_string(),
+            upnp_enabled: false,
         };
         net_profile_save_to(dir.path(), &updated).expect("re-save net profile");
         assert_eq!(net_profile_load_from(dir.path()), updated);
@@ -906,12 +930,39 @@ mod tests {
     #[test]
     fn net_profile_missing_file_loads_default() {
         let dir = TempDir::new("netprofile-missing");
-        assert_eq!(
-            net_profile_load_from(dir.path()),
-            NetProfile {
-                last_join_addr: String::new()
-            }
+        assert_eq!(net_profile_load_from(dir.path()), NetProfile::default());
+        assert!(
+            NetProfile::default().upnp_enabled,
+            "UPnP auto-mapping ships enabled"
         );
+    }
+
+    // ---- WAN play addendum: additive upnp_enabled field ----
+
+    #[test]
+    fn upnp_enabled_defaults_true_when_absent_from_json() {
+        // A pre-UPnP net_profile.json (written by v0.2.0) must load with
+        // the feature on, not fail and not silently disable it.
+        let dir = TempDir::new("upnp-default");
+        fs::write(
+            dir.path().join(NET_PROFILE_FILE),
+            br#"{"last_join_addr":"192.168.1.9:27015"}"#,
+        )
+        .unwrap();
+        let loaded = net_profile_load_from(dir.path());
+        assert_eq!(loaded.last_join_addr, "192.168.1.9:27015");
+        assert!(loaded.upnp_enabled);
+    }
+
+    #[test]
+    fn upnp_enabled_false_round_trips_and_stays_false() {
+        let dir = TempDir::new("upnp-off");
+        let profile = NetProfile {
+            last_join_addr: String::new(),
+            upnp_enabled: false,
+        };
+        net_profile_save_to(dir.path(), &profile).expect("save");
+        assert!(!net_profile_load_from(dir.path()).upnp_enabled);
     }
 
     #[test]
@@ -946,6 +997,7 @@ mod tests {
             dir.path(),
             &NetProfile {
                 last_join_addr: "127.0.0.1:27015".to_string(),
+                upnp_enabled: true,
             },
         )
         .unwrap();

@@ -309,5 +309,6 @@ pub mod online_ui;
 #[allow(dead_code)]
 pub mod protocol;
 pub mod session;
+pub mod upnp;
 
 pub use session::*;

@@ -945,3 +945,58 @@ parallelism is N5∥N6 (wave 5) and N7∥N8 (wave 6).
   documented.
 - **`Controller` enum exhaustiveness**: the only external breakage site is
   `winner_text`; handled by N4's carve-out arm and clippy `-D warnings`.
+
+## Addendum — WAN play (post-plan, 2026-09-29)
+
+The plan's "direct IP/port" story assumed the host can get a reachable UDP
+port; the v0.2.0 release shipped the manual port-forward docs only. Two
+no-infrastructure alternatives were verified as **dead ends in 2026**:
+
+- **ngrok 3.39.2 has no `udp` command** — raw UDP tunnels were removed in
+  v3; `ngrok --help` on the dev machine shows only `http`, `tcp`, `tls`.
+- **cloudflared 2026.9.3 rejects UDP origins** — verified live: `Error
+  validating origin URL: Currently Cloudflare Tunnel does not support udp
+  protocol.`
+
+The transport is raw UDP (`bevy_renet`/netcode) and guests already work with
+outbound-only connectivity, so the answer for the other half is the host's
+own router: **UPnP IGD `AddPortMapping`** (near-universal on consumer
+routers), giving true direct P2P with zero router clicks.
+
+**Design (shipped, `core_bridge/net/upnp.rs` — zero new dependencies):**
+SSDP `M-SEARCH` for `InternetGatewayDevice:1` (2 s timeout, replayed every
+500 ms) → fetch the device description → targeted-scan the XML for the
+`WANIPConnection:2` (fallback `:1`) `controlURL` (resolved against the
+`LOCATION`) → SOAP `AddPortMapping` (UDP, port N:N, internal client = the
+existing connect-to-public `UdpSocket` LAN-IPv4 trick, description
+`blockfall-netplay`, **lease 3600 s**) → `GetExternalIPAddress` for the
+`Friends join at <ext_ip>:<port>` share line. Every protocol byte decision
+is a **pure function over canned fixtures** (SSDP burst → LOCATION, device
+XML → controlURL, SOAP fault code → human text) plus a thin IO glue layer;
+the whole run executes on a background `std::thread` (never a frame) and
+reports through an mpsc mailbox polled by `upnp_driver_system`. A generation
+counter drops results that raced a teardown. Lease renewal re-`AddPortMapping`s
+on the stored control URL at 30 min (1 packet — discovery is not repeated)
+while the session still holds; renewal failures keep `Mapped` (a live match
+must not hear about a probe blip; the existing NAT hole survives anyway).
+Teardown: `net_stop` paths drop the session to `Idle`, the driver system
+watches that edge and best-effort `DeletePortMapping`s on a bounded-timeout
+thread; app exit attempts one synchronous delete — **SIGKILL leaves the
+self-expiring 1 h lease, which is exactly why the lease is finite and
+renewed**. SOAP faults become reasons (718 port conflict, 725 permanent
+leases only, 726 no such entry, 402 not a WAN connection, else generic).
+
+UI: the Host screen's status line runs `Opening router port…` →
+`Friends join at <ext_ip>:<port>` → on failure
+`UPnP unavailable — forward UDP <port> manually (see README)` (one line,
+never blocks play — LAN is unaffected). `U` toggles the attempt
+(persisted as `NetProfile::upnp_enabled`, additive serde default `true` —
+`Settings` stays unreshaped per the T1 contract).
+
+Testing: canned-fixture parser tests, transition-table + lease-math tests,
+and a **fake IGD** (std `TcpStream` loopback server serving a device
+description + SOAP responses incl. an HTTP-500-carried 718 fault) that pins
+the full client's wire format. No unit test sends real SSDP multicast — the
+real client is behind an injectable runner seam. Live probe on the dev
+machine (2026-09-29): no gateway answered SSDP on that network (documented,
+not gate-blocking); the UPnP-enabled-router sign-off stays with the author.
