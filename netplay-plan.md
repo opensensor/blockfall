@@ -149,9 +149,49 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   `NetMsg` variant incl. malformed/short-buffer `decode` rejection; hash
   stability tests (same state equal, differing state differs); all existing
   tests green (do not pin an exact count); clippy `-D warnings` + fmt clean.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Deps landed: bevy_renet 5.0.0 / renet 2.0.0 / renet_netcode 2.0.0 (+
+  new transitive `renetcode` 2.0.0 protocol crate) / bincode 1.3.3 — plan
+  version assumptions held. Full verified-API notes written in
+  `core_bridge/net/mod.rs` with file:line citations. Key corrections to plan
+  assumptions: (1) **second-guest is NOT silently dropped** — netcode sends a
+  `ConnectionDenied` packet at max_clients (`renetcode server.rs:303`), and
+  the guest can read it via transport `disconnect_reason()`, so "match full"
+  is distinguishable client-side (host side still gets no event); (2)
+  `resend_time` exists on **both** reliable SendType variants, not just
+  ReliableUnordered; (3) `ConnectionConfig` has **no timeout field** —
+  timeout rides on the netcode connect token and is hard-coded
+  (`expire 300 s / timeout 15 s`) for `ClientAuthentication::Unsecure`, so
+  the ~10 s JoinTimeout watchdog must be app-side (correctly ordered); (4)
+  `ServerConfig` also requires `current_time: Duration` and has no Default;
+  (5) server transport has **no** `local_addr()` — bind the `UdpSocket`
+  yourself, read `local_addr()` **before** moving it in, set
+  `public_addresses` from it (client transport *does* expose `addr()`);
+  (6) `RenetServerEvent`/`NetcodeErrorEvent` are Bevy 0.19 **observer
+  triggers** (`On<RenetServerEvent>` via `app.add_observer`), not readable
+  message queues — bridge them into `Messages<NetEvent>` from an observer;
+  (7) `NetcodeServerPlugin`/`NetcodeClientPlugin` are **required in addition
+  to** the two renet plugins (they own `send_packets`); (8) teardown verified:
+  zero `Drop` impls anywhere, transports own their sockets → removing
+  transport resources frees the port synchronously; also
+  `NetcodeClientTransport::update` errors **every frame** after a
+  disconnect — tear down promptly; (9) `MinimalPlugins` includes
+  `TimePlugin`, so the N2 headless-test fallback concern is moot (use
+  manual `app.update()`). Codec: `NetMsg` (6 variants incl.
+  `MatchStart.match_delay`), `PROTOCOL_ID`, `PROTOCOL_VERSION`,
+  `encode`/`decode` (bincode fixint encoding == `bincode::serialize`
+  defaults, **plus** `reject_trailing_bytes` for strictness),
+  `snapshot_hash` = FNV-1a-64 over bincode bytes. TDD: 7 unit tests written
+  first — RED (5 failed: todo! stubs + one genuine fixture finding:
+  `GameSnapshot` carries no timers, so N ticks vs N+1 at level 1 gravity is
+  the *same* snapshot — hash-equality there is correct; fixture switched to
+  action-driven divergence) → GREEN. All gates green: check/fmt/clippy
+  -D/`cargo test --workspace` (146 app + 136 core + 6 integration).
+- **files edited/created**: `Cargo.toml` (workspace deps), `Cargo.lock`,
+  `crates/tetris-app/Cargo.toml`, `crates/tetris-app/src/core_bridge/mod.rs`
+  (`mod net;`), `crates/tetris-app/src/core_bridge/net/mod.rs` (new — spike
+  notes), `crates/tetris-app/src/core_bridge/net/protocol.rs` (new — codec +
+  tests), `netplay-plan.md` (this entry)
 
 ### N2: Net session resource + plugin + connection lifecycle
 - **depends_on**: [N1]
