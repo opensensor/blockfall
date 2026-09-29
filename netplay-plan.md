@@ -675,10 +675,38 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
 - **validation**: locally: `cargo test -p tetris-app net::harness` green,
   fork-injection variant fails as designed; `TETRIS_NET` host+join on one
   machine via loopback complete 2 matches with identical `final_hash` and
-  exit 0; on two machines over the LAN the same holds (author runs).
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+   exit 0; on two machines over the LAN the same holds (author runs).
+- **status**: Completed
+- **log**: Commits `3581a62` + `668a530`. **CI E2E**: 2 non-ignored tests
+  (`harness.rs`) — two `MinimalPlugins` apps over **real renet/netcode UDP on
+  loopback, OS-assigned port 0** (no contention): bot-vs-bot Garbage to a
+  crowned winner with both peers' per-60-tick `SnapshotHash` streams equal
+  throughout + final snapshots equal; and fork injection
+  (`TETRIS_NET_FORK=guest:<tick>` hook) → `Desync{119}` on **both** peers +
+  `SimPaused` freeze + provably divergent independently-recorded streams
+  (non-vacuity). Rides existing `cargo test --workspace`; no ci.yml change
+  needed. **Desktop harness**: `TETRIS_NET=host:<port>` / `join:<ip>:<port>`
+  bot-vs-bot (Garbage → Race{40}), `NET match_start/match_done/final_hash/
+  complete/fail` logging, exit 1 on desync/stall/loss, exit 0 on success;
+  startup hook in `core_bridge/mod.rs` mirrors `ONE_V_ONE_ENV`. **LIVE
+  two-process X11+NVIDIA verification**: identical winner/ticks/final_hash on
+  both peers across 2 matches (clean, exit 0 both sides); fork run → "desync
+  detected at tick 119 — match frozen", both processes exit 1. Three harness
+  lifecycle bugs found only by running live: guest rematch counting re-keyed
+  by match seed; phantom 0-tick host rematch log; `std::process::exit`
+  mid-frame SEGFAULT on winit/GPU atexit → success uses `AppExit::Success`,
+  failure `libc::_exit(1)` on unix. Also landed the `pub(crate) mod net;`
+  enablement N5 needed. **Routed follow-ups** (beyond N6 ownership): (1) real
+  production bug — `guest_net_system` pre-match drain reads the whole reliable
+  channel on the `InMatch`-transition frame and discards `TickBatch`es queued
+  behind `MatchStart` → guest stalls at tick 0 under load; harness holds
+  `SimPaused` briefly after `MatchStart` as a workaround — root fix done as a
+  post-N6 fixup (see below); (2) systemic test flake: N2/N3/N4/N5 UDP tests
+  sharing `TETRIS_TEST_NET_PORT` contend in parallel (`--test-threads=1`
+  clean) — port-0 bind + read-back fixup. Desktop-harness
+  `MATCH_START_HOLD` revisited once the drain bug is fixed.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/harness.rs`,
+  `crates/tetris-app/src/core_bridge/mod.rs`
 
 ### N7: Netplay soak + protocol-robustness audit
 - **depends_on**: [N6]
