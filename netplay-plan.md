@@ -226,12 +226,63 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   client → host `Lost`. If MinimalPlugins proves insufficient for the renet
   plugin's system-set ordering, fall back to adding `TimePlugin` and note it
   in the mod doc. clippy/fmt clean; all existing tests green.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `NetPlugin` mounted next to `VersusBridgePlugin` in
+  `CoreBridgePlugin::build()`; it registers all four bevy_renet plugins
+  (N1 correction #7 applied), `NetSession`, `Messages<NetEvent>` and two
+  `Update` bridge systems (each `run_if` its transport resource exists) →
+  zero cost while `Idle`. FSM factored into the pure `next_status(role,
+  status, trigger)` + `NetSession::apply`. **TDD**: 16 tests written first —
+  RED (all panic on the `todo!()` stub) → table implemented → GREEN. 17
+  tests total: 10 pure transition-table tests (both roles, every state,
+  Stop-from-every-state, illegal-trigger ignores), a watchdog test, an
+  occupied-port `BindFailed`-no-panic test, a version-mismatch kick test
+  (via renet's `new_local_client` seam — no UDP), and the two-`App`
+  loopback connect/`Ready`/`Bye` + graceful-exit tests. The loopback test
+  is inherently GREEN-after-implementation (transport wiring can't fail
+  before it exists) — documented in the test header. **Observer
+  consumption (Bevy 0.19)**: `app.add_observer(fn ev: On<RenetServerEvent>)`,
+  patterns via `**event` (`On` → `RenetServerEvent` → `Deref` →
+  `renet::ServerEvent`); observers can't write `Messages`, so they buffer
+  into a private `NetSession::server_notes` queue that the host system
+  drains (same frame). `NetcodeErrorEvent` deliberately unobserved —
+  unobserved triggers are no-ops, and the post-disconnect error spam is
+  silenced by dropping transport resources the same frame. Client side
+  polls `is_connected`/`is_disconnected` +
+  `NetcodeClientTransport::disconnect_reason()` instead of the built-in
+  `client_just_*` predicates (their `Local<bool>` is one-shot per schedule
+  — edge detection done manually). **API surprises found**: (1) renet_netcode
+  re-exports the netcode reason under the alias itself — import
+  `bevy_renet::netcode::NetcodeDisconnectReason`, the base name fails; (2)
+  that enum has 7 variants (N1's notes omit `ConnectionResponseTimedOut` —
+  mapped to `Timeout`); (3) **host-side loss reasons are flattened**: renet's
+  `remove_connection` (`server.rs:129-134`) emits
+  `ClientDisconnected{reason: Transport}` for *any* netcode-originated loss
+  (clean disconnect packet and 15 s timeout alike), so the host sees
+  `Lost(Transport)` for "peer vanished" — the guest keeps full granularity
+  (`Denied`/`Timeout`/…); escape hatch if N5 wants the split host-side:
+  `NetcodeServerTransport::time_since_last_received_packet`; (4)
+  `RenetClient` constructs in `Connecting` — no false disconnect on join;
+  (5) dropping a peer `App` without `net_stop()` sends nothing (survivor
+  waits the full 15 s) — all exit paths must call `net_stop()` (graceful,
+  ~1 frame; loopback-tested). Guest FSM clarification: guest passes through
+  `Ready` (`Handshaking` = Hello queued, `Ready` = flushed/awaiting
+  `MatchStart`) so both peers read `Ready` after handshake and N5's
+  "waiting-for-host" line exists. **Handoff boundary for N3**: N2's systems
+  drain the renet channels only during the handshake window (host
+  `Handshaking`, guest `Handshaking|Ready`) — from `InMatch` on N3 owns
+  every message incl. `Bye` (documented at the top of `session.rs`). Test
+  port: `TETRIS_TEST_NET_PORT` (deterministic default 34857),
+  `TEST_NET_LOCK` static serializes all socket tests in-binary (N6 must
+  share it); foreign-collision caveat documented. Gates: fmt, clippy `-D`,
+  `cargo test --workspace` (163 app + 136 core + 6 integration).
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/session.rs`
+  (new — session FSM, plugin, free fns, bridge systems, tests),
+  `crates/tetris-app/src/core_bridge/net/mod.rs` (`mod session;` + re-export),
+  `crates/tetris-app/src/core_bridge/mod.rs` (`NetPlugin` mount),
+  `netplay-plan.md` (this entry)
 
 ### N3: Lockstep engine (tick clock, input delay, mirror stepping, desync check)
-- **depends_on**: [N2]
 - **location**: `core_bridge/net/mod.rs` (submodule decl),
   `core_bridge/net/lockstep.rs` (new)
 - **description**: The tick driver for `NetStatus::InMatch`, on `FixedUpdate`
