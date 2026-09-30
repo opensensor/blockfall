@@ -1210,8 +1210,11 @@ mod tests {
         let endpoint = rg.ctrl.to_string();
         let host_leg = Ipv4Addr::new(127, 0, 0, 2);
 
-        let mut host = peer_app(12.0);
-        let mut guest = peer_app(12.0);
+        // 4x (not the direct test's 12x): the gateway's 10 ms real poll is
+        // 2.5 SIM ticks per hop at this rate, so relay latency stays well
+        // inside the input delay below while the match still runs fast.
+        let mut host = peer_app(4.0);
+        let mut guest = peer_app(4.0);
         // Arm the G2 gateway driver on both peers (real driver systems; only
         // the endpoint and the host leg's bind differ from production).
         host.world_mut().insert_resource(
@@ -1311,7 +1314,12 @@ mod tests {
         // direct-UDP crown test, with the relay as the only path.
         let seed = 0xE2E5_E2E0_0000_00A5;
         let rule = AttackRule::Garbage;
-        let delay = 4;
+        // At 4x, one sim tick = 4.17 ms real, so D = 20 covers ~83 ms real:
+        // ample for the two 10 ms relay hops, yet assertive — a regression
+        // toward the v0.3.1 100 ms poll starts clipping it. A late drop here
+        // is a real assertion: the 1x field failure dropped 258/259 guest
+        // inputs with both boards agreeing on an inert guest.
+        let delay = 20;
         host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
         start_net_match_live(&mut host, rule, seed, delay);
 
@@ -1392,6 +1400,27 @@ mod tests {
             versus_snapshot(&host),
             versus_snapshot(&guest),
             "final snapshots must be equal over the relay"
+        );
+
+        // Non-vacuity (v0.3.1 field fix): hash-stream equality alone is
+        // satisfied by a match where every guest input arrived late — the
+        // host would then deterministically run the empty-input path and
+        // BOTH boards would agree on an inert guest. The guest's bot must
+        // have actually acted through the relay (applied remote actions),
+        // and no input may have been late enough to be dropped.
+        let host_ls = host
+            .world()
+            .resource::<crate::core_bridge::net::lockstep::NetLockstep>();
+        assert!(
+            host_ls.applied_remote_actions > 0,
+            "the guest side applied no actions at the host — the relayed \
+             match passed vacuously with an inert guest"
+        );
+        assert_eq!(
+            host_ls.dropped_late_inputs, 0,
+            "guest inputs were dropped as late through the relay — the \
+             path outlives the negotiated input delay (controls would \
+             feel dead on this path)"
         );
 
         // Teardown: net_stop must hand the room back to the gateway (`*D`) —

@@ -40,7 +40,9 @@ use tetris_core::versus::{AttackRule, Match, MatchEvent, Side, DEFAULT_RACE_LINE
 
 use super::net::lockstep::{self, NetLockstep, NetOut, RenetServerOut};
 use super::net::protocol::NetMsg;
-use super::net::session::{NetRole, NetSession, NetStatus, DEFAULT_INPUT_DELAY};
+use super::net::session::{
+    delay_ticks_for_rtt, NetRole, NetSession, NetStatus, DEFAULT_INPUT_DELAY,
+};
 use super::{bot_side_drive, env_seed, wall_clock_seed, BotState, SimPaused};
 use crate::input::VersusActions;
 use crate::state::AppState;
@@ -278,8 +280,34 @@ pub fn start_net_match(
 ) {
     let seed = env_seed().unwrap_or(seed);
     let role = world.resource::<NetSession>().role;
+    let mut delay = delay;
     if role == NetRole::Host {
         world.resource_mut::<NetSession>().enter_match();
+        // RTT-adaptive floor (v0.3.1 field fix): a relayed/WAN path needs a
+        // bigger `D` than the negotiated default, else every guest input
+        // lands after its target tick and the host deterministically runs
+        // the empty-input path (guest controls dead). The netcode RTT is
+        // measured game-socket-to-game-socket, so relay hops are included.
+        let rtt_secs = match (
+            world.resource::<NetSession>().peer,
+            world.get_resource::<RenetServer>(),
+        ) {
+            (Some(peer), Some(server)) => Some(server.rtt(peer)),
+            _ => None,
+        };
+        if let Some(rtt_secs) = rtt_secs {
+            let floor = delay_ticks_for_rtt(rtt_secs);
+            let mut session = world.resource_mut::<NetSession>();
+            let raised = session.input_delay.max(floor);
+            if raised != session.input_delay {
+                info!(
+                    "net: raising input delay to {raised} ticks (rtt {:.0} ms)",
+                    rtt_secs * 1000.0
+                );
+            }
+            session.input_delay = raised;
+            delay = delay.max(raised);
+        }
     }
     setup_net_mirror(world, seed, rule, delay, local_side);
     if role == NetRole::Host {

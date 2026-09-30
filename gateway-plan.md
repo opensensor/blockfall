@@ -675,3 +675,56 @@ per-60 s slot summaries) and `journalctl -u blockfall-update.service -f`
 (adopt decision). Old clients are unaffected by the new binary; games that
 have not updated still work against it (drop-unknown rule).
 
+
+---
+
+## Field fix #2 (v0.3.2): guest controls dead in relayed matches
+
+**Symptom (2026-09-30, first two-machine room-code test).** Connect and
+match start worked (host punch confirmed — the join completed in ~1 s), but
+only the host's controls did anything. Deterministic in both directions of
+the same failure: the host executed the empty-input path for every tick
+where the guest's `TickInput` had not arrived.
+
+**Diagnosis.** The guest *sent* everything (259 queued at its lockstep
+rings); the host *received* everything and dropped all of it as late
+(`dropped_late_inputs = 258`, logged only at `debug!`). `D = 8` ticks
+(≈133 ms) must cover guest-mirror lag (one host→guest hop) plus the
+guest→host hop; the gateway's 100 ms poll alone made that impossible off
+loopback. The loopback-only tests structurally could not see it — and the
+relay E2E asserted only hash-stream equality, which an inert guest still
+satisfies (the host's board is authoritative and the mirror follows).
+
+**Fix (three parts + a test-honesty part).**
+1. `netplay-gateway`: `POLL` 100 ms → 10 ms. Worst added latency per hop
+   drops 10×; the drain loop over nonblocking sockets is negligible.
+2. `tetris-app`: RTT-adaptive input delay. The host calls
+   `delay_ticks_for_rtt(server.rtt(peer))` at `start_net_match` —
+   one measured round trip + 4 ticks of jitter, clamped to the existing
+   2..=30 window — raises `NetSession::input_delay`, and the guest adopts
+   it via the existing `MatchStart.match_delay` channel (no wire change).
+   Netcode RTT is game-socket-to-game-socket, so relay hops are inside the
+   measurement. Zero/absent sample never lowers the negotiated delay.
+3. Visibility: late drops now `warn!` on the first five and then once per
+   `HASH_CHECK_PERIOD` (rate-limited), and `NetLockstep` gained
+   `applied_remote_actions` alongside `dropped_late_inputs`.
+4. Test honesty: the gateway-relay E2E now asserts `applied_remote_actions
+   > 0` **and** `dropped_late_inputs == 0` — a hash-equal inert-guest pass
+   is impossible. It also runs at 4× virtual speed (the old 12× turned the
+   relay's real-time 10 ms poll into ~12 sim ticks per hop and burned the
+   whole delay budget even on healthy code — that is exactly what it
+   caught on first run after the assertions landed: 258/259 late again at
+   12× before the speed/D pairing was corrected).
+
+**Production math after the fix.** LAN-through-relay: RTT ≈ 25 ms →
+floor 6 → D stays 8 (133 ms) vs ~2×(5–10 ms) path — ample. Cross-WAN
+RTT 150–250 ms → D ≈ 13–19 (217–317 ms) — inputs land, latency is
+absorbed by design. Hosts can still force a value with `TETRIS_NET_DELAY`
+(host side is enough; it propagates through `MatchStart`).
+
+**Operator note.** Deploying the 10 ms-poll gateway requires the CI release
+cycle as before (tag → musl asset gated by `--self-test` → pull agent).
+Old games work against the new gateway unchanged; new games also work
+against an old gateway, but a *new-game-vs-old-gateway* pair keeps the old
+100 ms latency — the adaptive delay covers it as long as the path RTT +
+2×100 ms stays under the raised D (it does: RTT includes the hops).

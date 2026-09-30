@@ -317,6 +317,13 @@ pub struct NetLockstep {
     /// Diagnostic: `TickInput` messages dropped because their target tick
     /// had already executed (late inputs; the empty-tick path ran instead).
     pub dropped_late_inputs: u64,
+    /// Diagnostic: remote actions that arrived in time and were applied at
+    /// their target tick. A relayed/WAN match where this stays 0 while the
+    /// guest is clearly playing means every input is arriving late (see the
+    /// v0.3.1 guest-controls-dead field bug); E2Es assert it is nonzero so
+    /// a relayed match can never pass with one side's inputs silently
+    /// discarded.
+    pub applied_remote_actions: u64,
     /// Diagnostic: fixed steps the guest spent stalled, waiting for a batch.
     pub stall_steps: u64,
     /// Recent own hash checks `(tick, full_match_hash)`.
@@ -337,6 +344,7 @@ impl Default for NetLockstep {
             staged_batches: VecDeque::new(),
             pending_start: None,
             dropped_late_inputs: 0,
+            applied_remote_actions: 0,
             stall_steps: 0,
             hashes_mine: VecDeque::new(),
             hashes_theirs: VecDeque::new(),
@@ -358,6 +366,7 @@ impl NetLockstep {
         self.staged_batches.clear();
         self.pending_start = None;
         self.dropped_late_inputs = 0;
+        self.applied_remote_actions = 0;
         self.stall_steps = 0;
         self.hashes_mine.clear();
         self.hashes_theirs.clear();
@@ -392,11 +401,7 @@ impl NetLockstep {
                 if actions.is_empty() {
                     // Nothing to merge; never counts as late.
                 } else if tick < self.tick {
-                    self.dropped_late_inputs += 1;
-                    debug!(
-                        "net lockstep: dropped late input for tick {tick} (executing {})",
-                        self.tick
-                    );
+                    self.note_late_input(tick);
                 } else {
                     self.remote_inputs.push_back((tick, actions));
                 }
@@ -527,17 +532,46 @@ impl NetLockstep {
 
     /// Pop the remote inputs scheduled for `tick`; drop/count stale ones.
     fn take_remote(&mut self, tick: u64) -> Vec<Action> {
-        while self.remote_inputs.front().is_some_and(|(t, _)| *t < tick) {
+        while let Some(&(stale, _)) = self.remote_inputs.front() {
+            if stale >= tick {
+                break;
+            }
             self.remote_inputs.pop_front();
-            self.dropped_late_inputs += 1;
+            self.note_late_input(stale);
         }
         let mut out = Vec::new();
         while self.remote_inputs.front().is_some_and(|(t, _)| *t == tick) {
             if let Some((_, actions)) = self.remote_inputs.pop_front() {
+                self.applied_remote_actions += actions.len() as u64;
                 out.extend(actions);
             }
         }
         out
+    }
+
+    /// Count a late `TickInput` — its target tick already executed, so the
+    /// deterministic empty-input path ran in its place. v0.3.1 shipped this
+    /// at `debug!`, so a path slower than the negotiated delay dropped every
+    /// guest input with no operator-visible signal (the "only the host can
+    /// play" field bug). Warn on the first few, then rate-limit to one per
+    /// [`HASH_CHECK_PERIOD`] so a systematically-late path is visible without
+    /// flooding the log.
+    fn note_late_input(&mut self, tick: u64) {
+        self.dropped_late_inputs += 1;
+        if self.dropped_late_inputs <= 5
+            || self.dropped_late_inputs.is_multiple_of(HASH_CHECK_PERIOD)
+        {
+            warn!(
+                "net lockstep: dropped late input for tick {tick} (executing {}, total {}) \u{2014} \
+                 input delay too small for this path",
+                self.tick, self.dropped_late_inputs
+            );
+        } else {
+            debug!(
+                "net lockstep: dropped late input for tick {tick} (executing {})",
+                self.tick
+            );
+        }
     }
 
     /// Periodic desync check after executing `executed` (see module docs).
@@ -1071,8 +1105,10 @@ mod tests {
         ls.remote_inputs.push_back((1, vec![Action::Hold]));
         ls.batch_buffer.push_back((1, Vec::new(), Vec::new()));
         ls.pending_start = Some((1, AttackRule::Garbage, 3));
+        ls.applied_remote_actions = 4;
         ls.reset_for_match(200);
         assert_eq!(ls.tick, 0);
+        assert_eq!(ls.applied_remote_actions, 0);
         assert_eq!(ls.delay, MAX_INPUT_DELAY);
         assert_eq!(ls.dropped_late_inputs, 0);
         assert_eq!(ls.stall_steps, 0);
@@ -1207,8 +1243,50 @@ mod tests {
             sim.tick(Vec::new(), Vec::new());
         }
         assert_eq!(sim.host.lockstep.dropped_late_inputs, 1);
+        assert_eq!(
+            sim.host.lockstep.applied_remote_actions, 0,
+            "a late action must never count as applied"
+        );
         // The late action reached no batch → mirrors never forked on it.
         assert!(sim.snapshots_match());
+    }
+
+    #[test]
+    fn remote_actions_applied_are_counted() {
+        let mut sim = NetSim::new(3, AttackRule::Garbage, 2);
+        for _ in 0..2 {
+            sim.tick(Vec::new(), Vec::new());
+        }
+        sim.tick(Vec::new(), vec![Action::HardDrop, Action::Hold]); // target 4
+        for _ in 0..6 {
+            sim.tick(Vec::new(), Vec::new());
+        }
+        assert_eq!(sim.host.lockstep.dropped_late_inputs, 0);
+        assert_eq!(
+            sim.host.lockstep.applied_remote_actions, 2,
+            "both on-time remote actions must be counted (E2E non-vacuity anchor)"
+        );
+    }
+
+    #[test]
+    fn stale_remote_input_in_take_remote_is_counted_as_late() {
+        // An input that queued for a tick that already executed must be
+        // counted through the take_remote path too (same diagnostic budget
+        // as the ingest path, no silent drops).
+        let mut ls = NetLockstep {
+            role: NetRole::Host,
+            ..Default::default()
+        };
+        ls.remote_inputs.push_back((5, vec![Action::HardDrop]));
+        for tick in 6..=7 {
+            assert!(ls.take_remote(tick).is_empty());
+        }
+        assert_eq!(ls.dropped_late_inputs, 1);
+        assert_eq!(ls.applied_remote_actions, 0);
+        // And a fresh on-time entry still applies normally afterwards.
+        ls.remote_inputs.push_back((8, vec![Action::Hold]));
+        assert_eq!(ls.take_remote(8), vec![Action::Hold]);
+        assert_eq!(ls.applied_remote_actions, 1);
     }
 
     #[test]

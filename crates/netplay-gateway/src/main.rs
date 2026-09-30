@@ -1,4 +1,4 @@
-//! Thin relay binary: nonblocking UDP sockets + a fixed 100 ms poll tick
+//! Thin relay binary: nonblocking UDP sockets + a fixed 10 ms poll tick
 //! feeding the pure [`Gateway`] state machine (gateway-plan.md G1).
 //!
 //! std has no `poll()`; the loop instead drains every live socket to
@@ -22,7 +22,12 @@ use netplay_gateway::wire;
 /// larger is truncated at read — the codec rejects it, never panics).
 const READ_BUF: usize = 2048;
 /// Poll period: max added latency per hop, and the GC tick granularity.
-const POLL: Duration = Duration::from_millis(100);
+/// 10 ms keeps worst-case relay latency (~2 hops ≈ 20 ms + wire) well under
+/// the netplay input delay; a v0.3.1 field bug shipped 100 ms, which pushed
+/// every guest input past its delayed tick on real paths (the host then
+/// deterministically ran the empty-input path — guest controls looked dead).
+/// The 10 ms wake-up draining a handful of nonblocking sockets is noise.
+const POLL: Duration = Duration::from_millis(10);
 /// Periodic summary cadence (keep logs sparse).
 const SUMMARY: Duration = Duration::from_secs(60);
 

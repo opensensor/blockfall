@@ -365,6 +365,35 @@ fn desired_local_delay() -> u8 {
         .clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY)
 }
 
+/// Jitter/relay margin added on top of one measured round trip when the
+/// RTT-adaptive floor computes the input delay.
+const RTT_DELAY_MARGIN_TICKS: u64 = 4;
+
+/// RTT-adaptive input-delay floor, in ticks: one measured netcode round
+/// trip (which already includes every relay hop between the two game
+/// sockets, since it is measured end-to-end) plus [`RTT_DELAY_MARGIN_TICKS`]
+/// of jitter margin, clamped to the negotiation window.
+///
+/// The v0.3.1 field bug: with the gateway's 100 ms relay poll and any real
+/// WAN path, a guest input for `tick + D` reached the host after the host
+/// had executed that tick — the host deterministically ran the empty-input
+/// path, so guest controls looked completely dead. The floor keeps `D`
+/// large enough that inputs land, and small enough to stay playable
+/// (`MAX_INPUT_DELAY` = 30 ticks ≈ 500 ms). A zero/absent sample (fresh
+/// connection, no ping exchanged yet) yields [`MIN_INPUT_DELAY`], so callers
+/// that take `max` with the negotiated delay never lower it.
+#[must_use]
+pub fn delay_ticks_for_rtt(rtt_secs: f64) -> u8 {
+    if !rtt_secs.is_finite() || rtt_secs <= 0.0 {
+        return MIN_INPUT_DELAY;
+    }
+    let ticks = (rtt_secs * 1000.0 / (1000.0 / crate::core_bridge::SIM_HZ)).ceil() as u64
+        + RTT_DELAY_MARGIN_TICKS;
+    u8::try_from(ticks)
+        .unwrap_or(MAX_INPUT_DELAY)
+        .clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY)
+}
+
 fn unix_now() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -951,6 +980,31 @@ mod tests {
             h(NetStatus::Handshaking, NetTrigger::HelloRejected),
             Some(NetStatus::Listening)
         );
+    }
+
+    #[test]
+    fn delay_ticks_for_rtt_floor() {
+        // No/absent sample → the floor must never lower a negotiated delay.
+        assert_eq!(delay_ticks_for_rtt(0.0), MIN_INPUT_DELAY);
+        assert_eq!(delay_ticks_for_rtt(-1.0), MIN_INPUT_DELAY);
+        assert_eq!(delay_ticks_for_rtt(f64::NAN), MIN_INPUT_DELAY);
+        assert_eq!(delay_ticks_for_rtt(f64::INFINITY), MIN_INPUT_DELAY);
+        // ~30 ms LAN-ish path: 2 ticks + 4 margin.
+        assert_eq!(delay_ticks_for_rtt(0.030), 6);
+        // v0.3.1 field scenario: gateway's old 100 ms poll made cross-NAT
+        // RTTs ~150–200 ms; 150 ms → ceil(9) + 4 = 13 (≈217 ms, inputs land).
+        assert_eq!(delay_ticks_for_rtt(0.150), 13);
+        assert_eq!(delay_ticks_for_rtt(0.200), 16);
+        // Pathological paths clamp at the negotiation window top.
+        assert_eq!(delay_ticks_for_rtt(10.0), MAX_INPUT_DELAY);
+        // Sanity: the floor at any positive RTT is playable at 60 Hz.
+        for ms in 1..=5000u32 {
+            let d = delay_ticks_for_rtt(f64::from(ms) / 1000.0);
+            assert!(
+                (MIN_INPUT_DELAY..=MAX_INPUT_DELAY).contains(&d),
+                "rtt {ms} ms → {d}"
+            );
+        }
     }
 
     #[test]
