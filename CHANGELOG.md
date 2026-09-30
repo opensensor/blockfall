@@ -3,6 +3,31 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.3.2] — 2026-09-30
+
+### Fixed
+
+- **Guest controls dead in relayed (room-code) matches (field fix)**: the
+  first real two-machine room-code match connected and started, but only
+  the host could play — every guest `TickInput` reached the host after its
+  target tick, and the deterministic empty-input fallback silently ran in
+  its place. Two compounding causes, two fixes: (1) the gateway's relay
+  poll loop ran every 100 ms, adding up to one full period per hop — now
+  10 ms (draining a handful of nonblocking sockets on a 10 ms wake is
+  negligible); (2) the negotiated input delay (default 8 ticks ≈ 133 ms)
+  was a fixed constant, too small for any path slower than LAN — the host
+  now raises it at match start from the measured netcode round trip
+  (one RTT + 4 ticks of jitter, clamped 2..=30; the RTT is measured
+  game-socket-to-game-socket, so relay hops count), and the guest adopts
+  it through the existing `MatchStart.match_delay` channel. Late drops are
+  no longer invisible: the first five warn on the host log, then
+  rate-limit, and the gateway-relay E2E now asserts both directions — the
+  guest side must apply actions at the host, and nothing may be late — so
+  an inert-guest relay match can never pass again (before this, hash-
+  stream equality alone let it: 258/259 guest inputs late, test green).
+  The E2E's relay match also moved to 4x virtual speed so the real-time
+  relay latency no longer eclipses the delay budget outright.
+
 ## [0.3.1] — 2026-09-30
 
 ### Fixed
