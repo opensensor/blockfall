@@ -1,0 +1,8 @@
+[package]
+name = "netplay-gateway"
+description = "Introduce + port-paired UDP relay for Blockfall cross-WAN 1v1 (std only, zero dependencies)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
