@@ -1,0 +1,11 @@
+[Unit]
+Description=Blockfall gateway CI pull-agent (every 6 h, and soon after boot)
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

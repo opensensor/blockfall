@@ -1,0 +1,14 @@
+[Unit]
+Description=Blockfall gateway DNS keeper (DynamicDNS A-record updater)
+# Skipped (not failed) until /etc/blockfall-dns.env provides the token:
+ConditionEnvironment=DO_DNS_TOKEN
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/blockfall/gateway-dns.py --once
+EnvironmentFile=/etc/blockfall-dns.env
+TimeoutStartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

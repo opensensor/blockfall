@@ -1,0 +1,32 @@
+[Unit]
+Description=Blockfall netplay gateway (UDP introduce + port-paired relay)
+Documentation=https://github.com/opensensor/blockfall/tree/main/crates/netplay-gateway
+After=network-online.target
+Wants=network-online.target
+
+# Host-network by design: the relay owns UDP 27016 (control) + a data range.
+# This is a kind/podman host — putting the relay inside the kind cluster would
+# need 200 extraPortMappings (cluster recreation) and double netavark NAT.
+# As a host-namespace sibling container the router's port-forward lands
+# directly on it. Managed like every other service: one quadlet unit.
+
+[Container]
+Image=localhost/blockfall-gateway:local
+ContainerName=blockfall-gateway
+Network=host
+# 200 relay slots: control 27016 + data 27017-27216 (router forwards exactly
+# this range; --data-count on the opensensor box, plan default is 983).
+# NOTE: quadlet Exec= passes ARGUMENTS — the image ENTRYPOINT (/blockfall-
+# gateway) stays, so do not repeat the binary path here.
+Exec=--data-start 27017 --data-count 200 --idle-secs 15
+ReadOnly=true
+# cap-drop/pids-limit via PodmanArgs: this host's quadlet build rejects the
+# dedicated keys; passthrough works everywhere.
+PodmanArgs=--cap-drop=all --pids-limit=64
+
+[Service]
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

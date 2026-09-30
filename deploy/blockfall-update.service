@@ -1,0 +1,9 @@
+[Unit]
+Description=Blockfall gateway CI pull-agent (fetch musl release, self-test, swap image)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/blockfall/gateway-update.sh
+TimeoutStartSec=300
+# rootful podman + systemctl: no sandboxing here; the payload is verified by
+# the binary's own --self-test before anything is restarted.

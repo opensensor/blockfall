@@ -45,7 +45,7 @@
 //! explicitly set to a non-empty value. Rationale: the plan's own testing
 //! mandate is "no network", and this plugin mounts inside `NetPlugin`, which
 //! every existing headless net test builds and drives to `Listening`. A
-//! default-on endpoint (`netplay.opensensor.xyz`) would make those tests spawn
+//! default-on endpoint (`blockfall.opensensor.io`) would make those tests spawn
 //! DNS threads and send live UDP to the production gateway. The always-on,
 //! user-facing default is a product decision that lands with G3's
 //! `NetProfile::gateway_enabled` toggle, which composes with the endpoint
@@ -70,7 +70,7 @@ pub const GATEWAY_ENV: &str = "TETRIS_GATEWAY";
 
 /// The endpoint used when the gateway is armed by default (G3 applies this
 /// through `NetProfile::gateway_enabled`); never contacted automatically.
-pub const DEFAULT_GATEWAY_ENDPOINT: &str = "netplay.opensensor.xyz:27016";
+pub const DEFAULT_GATEWAY_ENDPOINT: &str = "blockfall.opensensor.io:27016";
 
 /// Host keepalive cadence: re-`*R` this often while `Listening` (spec: every
 /// 2 s; the gateway refreshes the room's GC clock on each).
