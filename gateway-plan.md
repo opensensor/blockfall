@@ -109,7 +109,7 @@ reply already carries the pieces), hole punching.
 
 ```
 G1 ── G2 ── G3 ──┐
- └──────────── G4 ┴─ wave 3: G3 ∥ G4
+ └──────────── G4 ┴─ actual: G2 ∥ G4 (wave 2), then G3, then G5
 Wave: 1    2    3
 ```
 
@@ -428,9 +428,18 @@ Wave: 1    2    3
   (`systemd-analyze verify` if present); release.yml YAML validated
   (python yaml.safe_load — a colon in a step name is a known footgun);
   workflow change must not alter the existing game-asset job behavior.
-- **status**: Not Completed
+- **status**: Completed (2026-09-29, shipped as `7c34186` — run alongside G2;
+  the status row here drifted and is corrected by G5)
 - **log**:
-- **files edited/created**:
+  - Delivered per plan: musl static gateway build job in
+    `.github/workflows/release.yml` (release asset `blockfall-gateway-*`),
+    scratch `Dockerfile` (+`.dockerignore`), hardened
+    `blockfall-gateway.service`, `scripts/gateway-smoke.sh` (uses the binary's
+    `--self-test`), ops README, and the root README "Running a netplay
+    gateway" pointer.
+- **files edited/created**: (see commit `7c34186`: release.yml,
+  crates/netplay-gateway/{Dockerfile,Dockerfile.dockerignore,blockfall-gateway.service,README.md},
+  scripts/gateway-smoke.sh, README.md)
 
 ### G5: E2E over gateway + docs wrap
 - **depends_on**: [G3, G4]
@@ -449,17 +458,97 @@ Wave: 1    2    3
   (target: rides normal CI like the N6 E2Es). Docs rewrite as listed.
 - **acceptance**: E2E green in `cargo test --workspace`; docs review; all
   gates green.
-- **status**: Not Completed
+- **status**: Completed (2026-09-30) — the gateway ships with G5; all of
+  G1–G5 are shipped (see Final Status below).
 - **log**:
+  - **Crown test**: `e2e_bot_vs_bot_garbage_match_through_gateway_relay`
+    (`harness.rs`) — two production-stack `MinimalPlugins` apps
+    (bot-vs-bot Garbage) joined through a real in-process
+    `netplay_gateway::room::Gateway` (G3's `testutil::spawn_real_gateway`
+    fixture, real `RealAlloc` data sockets on port-0-allocated loopback):
+    host registers via the real G2 driver (`Listening` edge → `*R` → `*A`,
+    random room code), guest runs the real join-by-code path (`join_room` →
+    `*G` → `*F` → driver hands `gateway_ip:vport` to the production
+    `net_join`), full match to a crowned winner with the per-60-tick
+    `SnapshotHash` streams compared on their whole common prefix (≥ 3
+    boundaries, plus equal final snapshots and a no-`Desync` scan), and
+    teardown proven end-to-end: `net_stop` → `*D` → fresh `*G` answers `*E`
+    seconds after the match (the room demonstrably released, not GC-coasted).
+    **~1.2 s, rides normal `cargo test --workspace` — no `#[ignore]`.**
+  - **Per-IP leg distinction** (G1's constraint): both apps share one
+    process, and every `0.0.0.0`-bound socket sources `127.0.0.1`, which
+    would blind the relay's per-IP attribution. The host legs therefore pin
+    `127.0.0.2` via two small **test seams** (recorded prominently, G2
+    precedent): `session::net_host_on(world, bind, port)` (a `net_host`
+    bind-address parameterization — production `net_host` unchanged, still
+    `0.0.0.0`) and `NetGateway::with_leg_bind(ip)` (the control socket's
+    bind, `None` in production). Guest legs stay fully production-shaped
+    (`0.0.0.0` → `127.0.0.1`). Nothing bypasses the relay: the client
+    transport accepts packets only from the exact `*F` endpoint
+    (`127.0.0.1:vport`), and the host's socket on `127.0.0.2` speaks only to
+    it — a relayed connection is the only possible path.
+  - **Crown-test catch (production bug, fixed here)**: the G2 control system
+    sent `*D` on **every** edge off `Listening` — including the routine
+    `Listening → Handshaking` peer-connect edge — closing the room's virtual
+    data port *mid-handshake* (and again mid-match on the Ready edge).
+    Red evidence: with the fix reverted the crown test deadlocks the relay
+    and reports `host Lost(Transport), guest Lost(Timeout)`. Fix: the
+    peer-connect edge now hands the room over (announcement clears, code
+    kept) while the netcode session itself keeps it alive (`room.rs` treats
+    host data as keepalive — that GC design was always the intent); `*D`
+    moved to the true stop edge (any hosting phase → `Idle`), which matches
+    the spec's "on net_stop/teardown sends `*D`" more faithfully than the
+    old code (a `net_stop` from `InMatch` previously sent nothing). Neither
+    G2's nor G3's tests could see this — they never connected a real pair
+    through the relay.
+  - **Degradation paths** (same fixture family, all riding normal CI):
+    `gateway_down_surfaces_offline_line_and_stays_retryable`:
+    closed endpoint → `LOOKUP_TIMEOUT` surfaces `GuestLookupState::Timeout`
+    mapping to the shipped `gateway offline — check connection or join by IP`
+    line (asserted inside the JoinTimeout window), session never reaches
+    netcode, no crash, and a follow-up `join_room` takes the sticky terminal
+    state back in flight (retryable).
+    `gateway_busy_room_surfaces_match_full_before_join_timeout`: registered +
+    guest-pinned room (raw legs per G1) → client `*B` →
+    `GuestLookupState::Busy` → `match full`, observed in ≪ 5 s (vs the 10 s
+    JoinTimeout it replaces), session stays `Idle`, no `JoinTimeout` event.
+  - **Flake note**: one run of `state::smoke_tests::
+    app_with_all_plugin_stubs_runs_frames_without_a_window` failed once
+    among 10+ full `cargo test --workspace` runs and 5 full-binary runs
+    after the change, never reproduced (isolated, 4 targeted-concurrency
+    stress runs, oversubscribed runs); that test exercises no gateway code
+    (driver disabled-by-default zero cost, neither seam used) — consistent
+    with the N6-documented systemic parallel-flake family (board_730571a0).
+  - Gates: `cargo test --workspace` green twice-plus — **331 app** (328 +
+    3 new) **+ 28 gateway + 1 gateway integration + 136 core + 6 + 0
+    doc-tests**, 1 soak ignored as before; repeated full runs (incl. 2×
+    oversubscribed) green; `cargo clippy --all-targets -- -D warnings`
+    clean; `cargo fmt --all --check` clean.
+  - Docs wrap: README "Playing online" rewritten (room codes primary,
+    UPnP/direct-IP/NAT as advanced paths, `TETRIS_GATEWAY` documented with
+    its default + empty-disables semantics, short-sessions warning kept);
+    "Running a netplay gateway" gained the `TETRIS_GATEWAY` + `--self-test`
+    pointer; CHANGELOG Unreleased gained the feature block; netplay-plan
+    WAN addendum gained a one-line shipped pointer.
 - **files edited/created**:
+  - `crates/tetris-app/src/core_bridge/net/harness.rs` (+3 tests, ~400
+    lines)
+  - `crates/tetris-app/src/core_bridge/net/gateway.rs` (`leg_bind` test
+    seam, `with_leg_bind`, peer-connect takeover fix + stop-edge `*D`)
+  - `crates/tetris-app/src/core_bridge/net/session.rs` (`net_host_on` bind
+    seam — 10-line refactor of `net_host`, production behavior identical)
+  - `gateway-plan.md` (this log + G4 status correction + wave table + Final
+    Status), `netplay-plan.md` (one-line addendum pointer), `README.md`
+    ("Playing online" rewrite, Features line, gateway section pointer),
+    `CHANGELOG.md` (Unreleased gateway feature block)
 
 ## Parallel Execution Groups
 
 | Wave | Tasks | Can Start When |
 | --- | --- | --- |
 | 1 | G1 | Immediately |
-| 2 | G2 | G1 |
-| 3 | G3 ∥ G4 | G2 / G1 |
+| 2 | G2 ∥ G4 (as run — G4 shipped as `7c34186` alongside G2, not after G3; the original plan's wave-3 pairing drifted) | G1 |
+| 3 | G3 | G2 |
 | 4 | G5 | G3, G4 |
 
 ## Testing Strategy
@@ -492,3 +581,12 @@ Wave: 1    2    3
   register/lookup rooms (same posture as Unsecure netcode auth v1);
   rate limits cap scan/DoS noise; codes are the secret; payloads stay
   encrypted. Documented, accepted for v1 like the game's auth stance.
+
+## Final Status
+
+**All G1–G5 shipped (2026-09-30).** Room codes are the primary cross-WAN
+path (`Room ABCDE — share with a friend`), the relay rides its own
+zero-dependency crate (`crates/netplay-gateway`) with packaging and CI, the
+client surfaces every failure mode in words, and the whole stack is pinned by
+an E2E that crowns a full Garbage match through the real relay with per-60-tick
+hash-stream equality — all riding `cargo test --workspace`.

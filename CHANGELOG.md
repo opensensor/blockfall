@@ -7,6 +7,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ### Added
 
+- **Netplay gateway & room codes** (gateway-plan.md G1–G5): cross-WAN play
+  with zero setup on both sides.
+  - **Gateway** (`crates/netplay-gateway`, new zero-dependency crate):
+    introduce + dumb port-paired relay — one UDP control port, one virtual
+    data port per room, netcode packets stay opaque ciphertext; pure
+    virtual-time room state machine (register/busy/collision/GC/rate limit)
+    with unit + loopback integration tests and a `--self-test` flag that
+    verifies any build end-to-end in one command.
+  - **Room codes**: hosting shows `Room ABCDE — share with a friend`
+    (5 chars, `I L O 0 1` excluded from the alphabet); the Join screen opens
+    in **Code** mode (toggle to IP), with per-step status — `resolving…` /
+    `joining room…` / `no such room` / **`match full`** / `gateway full —
+    retry later` / `gateway offline — check connection or join by IP`. Busy
+    and not-found answer in milliseconds instead of the old silent 10 s
+    JoinTimeout. Guests need only outbound UDP; hosts need no port forward at
+    all (UPnP becomes the no-gateway fallback).
+  - **Config**: `TETRIS_GATEWAY=<host:port>` selects the relay (default
+    `netplay.opensensor.xyz:27016`; empty disables the feature entirely),
+    plus a persisted `gateway_enabled` toggle in `net_profile.json`. A down
+    gateway never blocks a match — one Host-screen line, and the direct-IP /
+    UPnP paths continue untouched.
+  - **Packaging / ops**: CI builds a static musl gateway binary attached to
+    releases; scratch Dockerfile (UDP 27016–27999), hardened systemd unit,
+    `scripts/gateway-smoke.sh`, and an ops README in the crate.
+  - **E2E**: a full bot-vs-bot Garbage match relayed end-to-end through the
+    real in-process gateway over loopback UDP with per-60-tick snapshot-hash
+    stream equality and `*D` room-release verification at teardown, plus
+    gateway-down and busy-room tests — all riding normal
+    `cargo test --workspace`. The crown test also caught and fixed a client
+    edge: the room is no longer released on the peer-connect transition,
+    which would have torn the relay out from under the first match.
 - **UPnP IGD auto port mapping for cross-WAN hosting** (netplay-plan.md
   addendum): hosting now asks the home router to forward the UDP port via
   SSDP discovery + SOAP `AddPortMapping` (no new dependencies — hand-rolled

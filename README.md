@@ -28,7 +28,8 @@ greedy bot playing seeded runs.
 
 - **Arcade marathon mode** — levels, escalating gravity, guideline-style scoring
 - **1v1 versus** — local (shared keyboard, human or bot) and **online lockstep
-  netplay** over direct IP join, delay-based input sync (default ≈ 133 ms)
+  netplay** over room codes (relayed, zero-config) or direct IP join,
+  delay-based input sync (default ≈ 133 ms)
 - **Modern controls feel** — DAS/ARR, hard drop, lock delay, ghost piece, hold
 - **SRS rotation** with wall kicks, including basic T-spin detection
 - **7-bag randomizer** with seeded, reproducible runs (`TETRIS_SEED=<u64>`)
@@ -59,14 +60,34 @@ greedy bot playing seeded runs.
 ## Playing online
 
 From the title screen: **Online** → **Host** or **Join**. The host listens on
-UDP port **27015** (the Host screen shows it with an `ip:port` connect hint);
-the guest types `ip:port` at the Join screen
-(keyboard-only entry: digits, dots, colon — Bevy 0.19 has no clipboard paste).
-Both peers then run the identical deterministic match from a shared seed; inputs
-land with a negotiated delay D = max(host, guest), 8 ticks ≈ 133 ms by default
+UDP port **27015**. Two ways to reach each other: **room codes** — share a
+5-character code, no IP, no router config (the primary path, works across any
+NAT) — or **direct IP** for LAN and advanced setups. Both peers then run the
+identical deterministic match from a shared seed; inputs land with a
+negotiated delay D = max(host, guest), 8 ticks ≈ 133 ms by default
 (`TETRIS_NET_DELAY`). Host and guest both see both boards rendered locally —
 there is no video/state streaming, only inputs.
 
+- **Room codes (the way to play with a friend across the internet).** When you
+  Host, the Host screen shows **`Room ABCDE — share with a friend`** below the
+  connect hint. Your friend opens **Online → Join** (it opens in **Code**
+  mode), types the five characters, and the netplay gateway introduces them
+  and relays the match — neither side needs a public IP, a port forward, or
+  even to know the other's address. The relay only ever sees the game's
+  encrypted netcode traffic; the code is the only secret. Failures name
+  themselves while you are still looking at the screen: **`no such room`**,
+  **`match full`** (someone else already joined), **`gateway offline — check
+  connection or join by IP`**. The entry toggles to **IP** mode with the mode
+  button when you would rather type an address. The gateway is configured with
+  **`TETRIS_GATEWAY=<host:port>`** (default **`netplay.opensensor.xyz:27016`**;
+  set it to **empty** to disable the whole feature and go direct-IP only — you
+  can also run [your own gateway](#running-a-netplay-gateway) and point it
+  there). Hosting never fails because the gateway is down: the room line just
+  says `gateway offline` and LAN/direct play proceeds.
+- **Direct IP (advanced / no gateway).** Type `ip:port` in the Join screen's
+  IP mode (keyboard-only entry: digits, dots, colon — Bevy 0.19 has no
+  clipboard paste). This is the whole story on LAN (plus the host firewall);
+  over the internet you need one of the two mapping paths below.
 - **Automatic router port mapping (UPnP).** When you Host, Blockfall asks
   your router (UPnP IGD) to forward UDP 27015 to your machine, then shows
   **`Friends join at <public-ip>:<port>`** — hand that to your guest and play
@@ -74,27 +95,29 @@ there is no video/state streaming, only inputs.
   every 30 min while you host) and is deleted when you stop hosting (Esc). If
   the Host screen instead shows **`UPnP unavailable — forward UDP 27015
   manually (see below)`**, that is normal: the router has UPnP disabled, your
-  ISP controls the edge device, or the network blocks SSDP — LAN play is
-  unaffected. Press **U** on the Host screen to retry or disable the attempt
-  (remembered in the net profile).
-- **NAT / manual port-forwarding.** If UPnP is unavailable, connections are
-  still direct IP: for internet play **port-forward UDP 27015** to your
-  machine (and allow it through any host firewall); the Host screen shows the
-  host's LAN IPv4 when one exists — over the internet, share your public IP
-  (or the address your router's status page shows) instead. LAN play works
-  with no setup beyond the firewall.
-- **Hosted UDP tunnels no longer work (2026).** Quick tunnels are not an
-  option for this game: **ngrok 3.39 removed the `udp` command entirely**
-  (only http/tcp/tls remain) and **cloudflared 2026.9 rejects UDP origins**
+  ISP controls the edge device, or the network blocks SSDP — LAN play and room
+  codes are unaffected. Press **U** on the Host screen to retry or disable the
+  attempt (remembered in the net profile).
+- **NAT / manual port-forwarding.** If UPnP is unavailable and you would
+  rather not use the gateway: for internet play **port-forward UDP 27015** to
+  your machine (and allow it through any host firewall); the Host screen shows
+  the host's LAN IPv4 when one exists — over the internet, share your public
+  IP (or the address your router's status page shows) instead.
+- **Hosted UDP tunnels do not work (2026).** Quick tunnels are not an option
+  for this game: **ngrok 3.39 removed the `udp` command entirely** (only
+  http/tcp/tls remain) and **cloudflared 2026.9 rejects UDP origins**
   (`Currently Cloudflare Tunnel does not support udp protocol`). Netplay is
-  raw UDP (netcode), so UPnP/router mapping is the no-infrastructure path.
+  raw UDP (netcode) — hence the built-in gateway, which needs only outbound
+  UDP from the guests.
 - **The port is open while listening.** v1 uses unauthenticated netcode
   (protocol-ID check only): anyone who can reach the port with a matching
   protocol version can join while you are listening. Keep sessions short and
   press Esc on the Host screen (`net_stop`) when you are done.
-- **No matchmaking.** There is no lobby, relay, LAN discovery or session token
-  (all post-v1). A join failure (≈10 s timeout) reads "host offline or match
-  full" — netcode cannot tell the two apart with one seat.
+- **No lobby, no accounts.** Room codes are introduction-only — nothing is
+  persisted, and an unhosted room expires in ~15 s. A direct-IP join failure
+  (≈10 s timeout) still reads "host offline or match full" — netcode cannot
+  tell the two apart with one seat (the room-code path *can* tell you
+  instantly: see the failure lines above).
 - **Mismatched builds** are refused by the version handshake — both sides need
   the same game version.
 - Mid-match, Esc opens a confirm ("Leave match?"); leaving sends a graceful bye
@@ -109,9 +132,13 @@ guest and forwards their encrypted match traffic — guests only need the
 5-character room code, no public IP or router config on either side. Run it
 via Docker or the hardened systemd unit, both documented in
 [crates/netplay-gateway/README.md](crates/netplay-gateway/README.md); the
-box needs inbound UDP **27016–27999** open. With the gateway down, clients
+box needs inbound UDP **27016–27999** open. Point your game at it with
+`TETRIS_GATEWAY=<host:port>` (the shipped default is the public relay; empty
+disables room codes). With the gateway down, clients
 fall back to today's direct IP join and UPnP unchanged — hosting never
-depends on it.
+depends on it. `cargo run -p netplay-gateway -- --self-test` verifies a build
+end-to-end (register, lookup, relay both directions, busy, teardown) on
+loopback with zero setup.
 
 ## Build & run
 

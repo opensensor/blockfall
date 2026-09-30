@@ -1000,3 +1000,5 @@ the full client's wire format. No unit test sends real SSDP multicast — the
 real client is behind an injectable runner seam. Live probe on the dev
 machine (2026-09-29): no gateway answered SSDP on that network (documented,
 not gate-blocking); the UPnP-enabled-router sign-off stays with the author.
+
+2026-09-30 follow-on: UPnP turned out to be the minority path — the hosted introduce/relay **netplay gateway** with 5-character room codes now carries cross-WAN play and is shipped; see `gateway-plan.md` (G1–G5).
