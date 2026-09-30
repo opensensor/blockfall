@@ -925,12 +925,69 @@ fn startup_goto_title_system(mut state: ResMut<AppState>) {
 // Startup UI construction
 // ---------------------------------------------------------------------------
 
-fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor) {
+fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor, Pickable) {
     (
         Text::new(text),
         TextFont::from_font_size(size),
         TextColor::WHITE,
+        // Labels never own a click — the button underneath them does.
+        Pickable::IGNORE,
     )
+}
+
+/// Marks `Pickable::IGNORE` auto-applied by [`sync_hidden_ui_unpickable`] so
+/// it can be lifted when the node becomes visible again; user-authored
+/// `IGNORE` (labels, menu roots) survives untouched.
+#[derive(Component)]
+struct AutoUnpickable;
+
+/// Third picking incident (after the T26 `ZIndex(1)` submenu-root fix in
+/// `build_menu_ui` and the click-through regression): Bevy 0.19 UI picking
+/// derives hit depth from **query-iteration order** and ignores `ZIndex`
+/// entirely (`bevy_ui-0.19.1/src/picking_backend.rs:251-269`), and
+/// resources *are* entities in 0.19 ECS — inserting ANY new resource shifts
+/// entity indices and re-randomises which (possibly hidden) widget wins an
+/// equal-depth tie (a unit `insert_resource` in an empty plugin was enough
+/// to flip the 1v1 submenu click test). Root fix: **hidden UI never
+/// participates in picking.** Every hidden `Node` gets `Pickable::IGNORE`
+/// (hover, press and click all honor it) and it is lifted when the node
+/// becomes visible again; `add_menu_root` roots and `label_node` labels
+/// carry `Pickable::IGNORE` permanently so containers and text can never
+/// swallow or steal a click. A click resolves to the topmost *visible*
+/// button by construction — never to entity-iteration order.
+///
+/// **G3:** no wiring needed — join-by-code buttons and panels inherit this
+/// automatically through `Visibility`; still spawn buttons with
+/// [`menu_button`], labels with [`label_node`] and full-screen panels via
+/// `add_menu_root` to keep the container rule uniform. Runs in `PreUpdate`:
+/// picking's hover pass runs later the same frame, and
+/// `InheritedVisibility` was computed in the previous frame's `PostUpdate`.
+#[allow(clippy::type_complexity)]
+fn sync_hidden_ui_unpickable(
+    mut commands: Commands,
+    ui: Query<
+        (
+            Entity,
+            &InheritedVisibility,
+            Option<&AutoUnpickable>,
+            Option<&Pickable>,
+        ),
+        With<Node>,
+    >,
+) {
+    for (entity, inherited, auto, pickable) in &ui {
+        if !inherited.get() {
+            if !pickable.is_some_and(|p| *p == Pickable::IGNORE) {
+                commands
+                    .entity(entity)
+                    .insert((AutoUnpickable, Pickable::IGNORE));
+            }
+        } else if auto.is_some() {
+            commands
+                .entity(entity)
+                .remove::<(AutoUnpickable, Pickable)>();
+        }
+    }
 }
 
 fn menu_button(parent: &mut ChildSpawnerCommands, text: &str, marker: impl Bundle) {
@@ -962,6 +1019,9 @@ fn add_menu_root(
         .spawn((
             marker,
             Visibility::Hidden,
+            // Containers are inert: a click must resolve to a visible
+            // button only (see `MenuPickTarget` docs).
+            Pickable::IGNORE,
             BackgroundColor(background),
             Node {
                 display: Display::Flex,
@@ -995,12 +1055,13 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         menu_button(root, "Quit", QuitButton);
     });
 
-    // The submenu roots render and pick *over* the title (their `ZIndex`
-    // is load-bearing: top-level UI roots stack-sort by z only, and z-0
-    // ties fall back to the unordered UI-root set, which put them *under*
-    // the title at random. The title itself is hidden while a submenu is
-    // open (see `sync_root_visibility`) so its buttons can never be
-    // clicked through the panel.
+    // The submenu roots render *over* the title (their `ZIndex(1)` controls
+    // draw order; it is NOT load-bearing for picking — 0.19 picking ignores
+    // ZIndex and sorts by iteration order, see `MenuPickTarget` docs). The
+    // title hides while a submenu is open (see `sync_root_visibility`) and
+    // `sync_menu_button_pickability` makes the hidden title buttons
+    // un-pick-able, so real pointer input can only ever reach the visible
+    // panel.
     add_menu_root(
         &mut commands,
         (VersusRulesRoot, ZIndex(1)),
@@ -1087,6 +1148,7 @@ impl Plugin for MenuScreensPlugin {
         // spawned in `build_menu_ui`); the plugin is mount-guarded so adding
         // it here is the single canonical mount point.
         app.add_plugins(OnlineUiPlugin);
+        app.add_systems(PreUpdate, sync_hidden_ui_unpickable);
         #[cfg(not(test))]
         app.add_systems(Startup, startup_goto_title_system);
         app.add_systems(Startup, build_menu_ui).add_systems(
@@ -2094,14 +2156,14 @@ mod tests {
         app.update();
     }
 
-    /// Regression (real window): top-level menu roots share one UI camera
-    /// at `ZIndex(0)`, and Bevy's UI stack sorts sibling roots by z only —
-    /// z-0 ties fall back to the unordered UI-root set, which placed the
-    /// submenu roots *below* the title. Clicking "1 v 1" then "opened" a
-    /// submenu under the (opaque) title, so the title kept swallowing every
-    /// click and a 1v1 could never be configured. The submenu roots now
-    /// carry `ZIndex(1)` and the title hides while a submenu is open, so
-    /// real pointer input can only ever reach the visible panel.
+    /// Regression (real window): top-level menu roots share one UI camera.
+    /// Clicking "1 v 1" then "opened" a submenu under the (opaque) title,
+    /// so the title kept swallowing every click and a 1v1 could never be
+    /// configured. The submenu roots carry `ZIndex(1)` for draw order, the
+    /// title hides while a submenu is open, and hidden widgets are excluded
+    /// from picking entirely (`sync_hidden_ui_unpickable` — 0.19 picking
+    /// ranks by iteration order, not ZIndex), so real pointer input can
+    /// only ever reach the visible panel.
 
     #[test]
     fn one_v_one_submenu_clicks_reach_the_submenu_not_the_title() {
@@ -2145,6 +2207,45 @@ mod tests {
         assert_eq!((p1, p2), (Controller::Human, Controller::Bot));
         assert_eq!(app_state(&app), AppState::Playing);
         assert_eq!(flow(&app).stage, VersusStage::Title);
+    }
+
+    /// Regression (G2 resource-shift incident): in Bevy 0.19 every
+    /// resource is an entity and UI picking ranks equal-depth hits by
+    /// iteration order, so adding *any* new resource type to the app used
+    /// to silently reroute the submenu click tests above. Inserting dummy
+    /// resources must now change nothing: the same click sequence still
+    /// configures and launches the 1v1 exactly once, through the submenu.
+    #[test]
+    fn dummy_resources_cannot_reroute_submenu_clicks() {
+        #[derive(Resource)]
+        struct DummyA;
+        #[derive(Resource)]
+        struct DummyB(u32);
+
+        let mut app = menu_ui_test_app();
+        app.insert_resource(DummyA);
+        app.insert_resource(DummyB(7));
+        set_state(&mut app, AppState::Title);
+        app.update();
+
+        let one = rect_of(&mut app, "1v1");
+        let title_settings = rect_of(&mut app, "settings");
+        let garbage = rect_of(&mut app, "garbage");
+        let bot = rect_of(&mut app, "bot");
+
+        tap_fast(&mut app, one);
+        assert_eq!(flow(&app).stage, VersusStage::Rules, "1v1 opens rules");
+        tap(&mut app, title_settings);
+        assert_eq!(app_state(&app), AppState::Title, "no click-through");
+        assert_eq!(flow(&app).stage, VersusStage::Rules);
+        tap_fast(&mut app, garbage);
+        assert_eq!(flow(&app).stage, VersusStage::Opponent);
+        tap_fast(&mut app, bot);
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active, "match launches through real input");
+        assert_eq!(rule, AttackRule::Garbage);
+        assert_eq!((p1, p2), (Controller::Human, Controller::Bot));
+        assert_eq!(app_state(&app), AppState::Playing);
     }
 
     /// Walking the flow with the submenu's Back button (which overlaps the
