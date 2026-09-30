@@ -326,9 +326,85 @@ Wave: 1    2    3
   gateway-disabled config hides Code mode; overlay/teardown contracts
   unchanged (NET_OVERLAY_ZINDEX etc. untouched); existing 29 screens_menu
   + 31 online_ui tests untouched and green; fmt/clippy/test gates.
-- **status**: Not Completed
+- **status**: Completed (2026-09-30)
 - **log**:
+  - TDD: 22 pure/unit tests written first against the not-yet-existing API
+    (RED = 96 compile errors: `code_char`, `code_push`, `key_to_code_char`,
+    `parse_room_code`, `CodeEntry`, `JoinMode`, `host_room_text`,
+    `lookup_status_text`, `join_status_text`, `ROOM_CODE_ALPHABET`,
+    `NetProfile.gateway_enabled`), then implemented, then 11 headless-App
+    flow tests against the REAL in-process `netplay_gateway::Gateway` over
+    loopback (legs on 127.0.0.1/.2/.3 per G1's distinct-loopback rule).
+  - Pure layer: `ROOM_CODE_LEN=5` + the wire crate's 31-char alphabet (no
+    `I L O 0 1`); `code_push` normalizes lowercase, rejects the 6th char;
+    `key_to_code_char` maps letters + digits/numpad `2..=9` only;
+    `parse_room_code` strict 5-char; `CodeEntry` request/one-shot-submit
+    latch mirrors `JoinEntry`; `JoinMode::{Code,IP}` with
+    `effective_join_mode` (Code only when gateway endpoint AND
+    `gateway_enabled` profile bit — toggle button inert, labeled
+    `gateway off — join by IP`, when unavailable).
+  - Shipped strings: Host share line `Room {CODE} — share with a friend`
+    (Announced) / `Room {CODE} — announcing…` (Advertising) / `gateway
+    offline — {reason}` (Offline), else empty — its own `RoomStatusText`
+    label so the UPnP line renders independently (G2's "room code wins"
+    read as priority-of-attention, both lines coexist; room line is simply
+    the code's only home). Lookup status: `resolving…` / `joining room…` /
+    `no such room` / `match full` / `gateway full — retry later` /
+    `gateway offline — check connection or join by IP` (Timeout +
+    GatewayUnreachable share the offline copy); `Found`/`Idle` yield "" so
+    the existing session line takes over — code mode feeds the
+    Connecting→…FSM through G2's `join_room` glue, IP mode untouched.
+    Invalid-code echo `{text}▌  want 5 room-code chars`.
+  - **`Esc` from Join stays Closed + `net_stop`** (spec's "Esc walks back"
+    satisfied by the in-panel Code⇄IP toggle button): the frozen N5
+    contracts `online_flow_back_walks_every_stage_to_closed` and
+    `joining_prefills_the_last_address_types_and_submits` pin the stage
+    walk; changing it would have broken them.
+  - `NetProfile.gateway_enabled`: additive `#[serde(default = …)]` true +
+    round-trip tests. Runtime arming: production
+    `#[cfg(not(test))] gateway_compose_system` (precedent:
+    `startup_goto_title_system`) sets `enabled = profile.gateway_enabled
+    && parse_gateway_env(TETRIS_GATEWAY).is_some()` — G2's opt-in env
+    deviation intact (unset ⇒ disabled; no headless test can leak `*R` to
+    the internet), tests arm via `NetGateway::test_with_endpoint`. Code
+    path never touches `NetProfile.last_join_addr`. Entering Join clears
+    `CodeEntry` + resets guest lookup + recomputes the mode.
+  - **PRE-EXISTING latent test-harness bug found & fixed (surfaced by G3,
+    reproduced at HEAD `49248ac`)**: `online_app()` mounts
+    `InputPlugin` but never initialized `Settings`, so the fixed-step
+    `gameplay_input_system` (`Res<Settings>`) panicked with
+    `Parameter …::settings failed validation: Resource does not exist`
+    the moment any test polled across real seconds (fixed timestep
+    finally runs). Invisible until now because no earlier test spun the
+    tree with wall-clock sleeps. Fixed by mirroring production `main.rs`
+    (and the N6 harness `peer_app`): `init_resource::<Settings>()` in the
+    helper; production untouched.
+  - Real-relay fixture extracted from gateway.rs tests into
+    `#[cfg(test)] mod testutil` (`spawn_real_gateway`, `raw_socket`,
+    `recv_frame`, `reg`) so online_ui flow tests reuse it; gateway tests
+    unchanged (27 green).
+  - Picking: no wiring per G2's note — all widgets built through the menu
+    helpers; Host room label + Join toggle carry `Pickable::IGNORE` per
+    the d2fc708 convention; hidden-stage behavior rides
+    `sync_hidden_ui_unpickable`. screens_menu NOT touched (no stage
+    transition forced it; 30 picking/screen tests green untouched).
+  - Gates: online_ui 57 green (35 pre-existing + 22 new);
+    `cargo test --workspace` green (328 app + 28 gateway + 136 core + 6,
+    1 doc-ignored); clippy `--all-targets -D warnings` clean (two
+    `too_many_arguments` allows on the entry-input/label-sync systems,
+    established convention per screens_menu.rs:520); `cargo fmt --all`
+    clean. NOTE for G5: flow tests bind real loopback UDP — keep them off
+    the `--test-threads`-tight runs (N6-documented contention).
 - **files edited/created**:
+  - `crates/tetris-app/src/core_bridge/net/online_ui.rs` (pure layer,
+    mode toggle, Host room line, entry widget, mode-aware
+    input/click/label-sync systems, `gateway_compose_system`, +22 tests,
+    `Settings` init in `online_app()`)
+  - `crates/tetris-app/src/settings_persist.rs` (`gateway_enabled` + 2
+    tests)
+  - `crates/tetris-app/src/core_bridge/net/gateway.rs` (test-relay fixture
+    → `pub(crate) mod testutil`; production code untouched)
+  - `gateway-plan.md` (this log)
 
 ### G4: Packaging, CI, ops
 - **depends_on**: [G1]
