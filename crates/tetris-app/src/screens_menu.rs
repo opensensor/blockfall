@@ -79,7 +79,7 @@ use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
 use crate::settings_persist::PersistedBestScore;
-use crate::state::{AppState, RebindingCapture};
+use crate::state::{AppState, CaptureOrder, RebindingCapture};
 
 /// App version shown on the title screen (PRD §7 "extras").
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1052,6 +1052,10 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         menu_button(root, "1 v 1", OneVOneButton);
         menu_button(root, "Online", OnlineButton);
         menu_button(root, "Settings", OpenSettingsButton);
+        // Android: "Quit" would AppExit with the process still alive behind
+        // a destroyed NativeActivity (a headless zombie winit loop); phone
+        // exits go through the system back gesture.
+        #[cfg(not(target_os = "android"))]
         menu_button(root, "Quit", QuitButton);
     });
 
@@ -1098,6 +1102,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         menu_button(root, "Restart", RestartButton);
         menu_button(root, "Settings", OpenSettingsButton);
         menu_button(root, "Quit to title", QuitToTitleButton);
+        #[cfg(not(target_os = "android"))]
         menu_button(root, "Quit", QuitButton);
     });
 
@@ -1113,6 +1118,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
         ));
         menu_button(root, "Play again", PlayAgainButton);
         menu_button(root, "Menu", QuitToTitleButton);
+        #[cfg(not(target_os = "android"))]
         menu_button(root, "Quit", QuitButton);
     });
 }
@@ -1148,6 +1154,7 @@ impl Plugin for MenuScreensPlugin {
         // spawned in `build_menu_ui`); the plugin is mount-guarded so adding
         // it here is the single canonical mount point.
         app.add_plugins(OnlineUiPlugin);
+        app.configure_sets(Update, CaptureOrder::Chord);
         app.add_systems(PreUpdate, sync_hidden_ui_unpickable);
         #[cfg(not(test))]
         app.add_systems(Startup, startup_goto_title_system);
@@ -1155,8 +1162,10 @@ impl Plugin for MenuScreensPlugin {
             Update,
             // Input first: a chord/button transition shows its overlay in the
             // same frame, and the label/visibility sync then sees the change.
+            // The chord pins to [`CaptureOrder::Chord`] so it reads the
+            // capture flag before the settings screen's cleanup runs.
             (
-                pause_chord_system,
+                pause_chord_system.in_set(CaptureOrder::Chord),
                 versus_flow_esc_system,
                 menu_button_clicks,
                 versus_button_clicks,

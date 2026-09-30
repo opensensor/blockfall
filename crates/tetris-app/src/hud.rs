@@ -74,15 +74,27 @@ pub struct HudAnchor {
     pub field_top: f32,
     /// World y of the playfield bottom edge.
     pub field_bottom: f32,
-    /// World x of the left panel center line.
+    /// World x of the left panel center line (landscape) / hold column
+    /// (portrait top strip).
     pub left_panel_x: f32,
-    /// World x of the right panel center line.
+    /// World x of the right panel center line (landscape; unused in
+    /// portrait).
     pub right_panel_x: f32,
+    /// `true` for the portrait-native layout (Android / `TETRIS_PORTRAIT=1`
+    /// with a taller-than-wide window): HUD slots form a strip above the
+    /// field instead of side panels.
+    pub portrait: bool,
+    /// Full window width in world units.
+    pub window_w: f32,
+    /// Full window height in world units.
+    pub window_h: f32,
 }
 
 /// Compute the current HUD anchor set for a window size (resize aware).
 pub fn hud_anchor(window_w: f32, window_h: f32) -> HudAnchor {
-    let (cell, _, _) = render::letterbox(window_w, window_h);
+    let portrait = render::portrait_layout(window_w, window_h);
+    let (view_w, view_h, center_y) = render::playfield_view(window_w, window_h);
+    let (cell, _, _) = render::letterbox(view_w, view_h);
     let half_w = cell * COLS as f32 * 0.5;
     let half_h = cell * VISIBLE_ROWS as f32 * 0.5;
     let panel = half_w + (PANEL_GAP + PANEL_HALF) * cell;
@@ -90,10 +102,17 @@ pub fn hud_anchor(window_w: f32, window_h: f32) -> HudAnchor {
         cell,
         field_left: -half_w,
         field_right: half_w,
-        field_top: half_h,
-        field_bottom: -half_h,
-        left_panel_x: -panel,
-        right_panel_x: panel,
+        field_top: center_y + half_h,
+        field_bottom: center_y - half_h,
+        left_panel_x: if portrait {
+            -window_w * 0.5 + 1.9 * cell
+        } else {
+            -panel
+        },
+        right_panel_x: if portrait { window_w * 0.5 - 2.3 * cell } else { panel },
+        portrait,
+        window_w,
+        window_h,
     }
 }
 
@@ -114,9 +133,25 @@ pub enum HudTextSlot {
     PauseHint,
 }
 
-/// World-space center of a text slot inside the left panel.
+/// World-space center of a text slot: left panel column (landscape) or the
+/// top strip / bottom combo row (portrait-native — `LEVEL | SCORE | LINES`
+/// across the strip, `COMBO`/`B2B` in a row just under the field).
 pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
     let c = anchor.cell;
+    if anchor.portrait {
+        let hw = anchor.window_w * 0.5;
+        let strip_y = anchor.field_top + 3.6 * c;
+        let deck_y = anchor.field_bottom - 1.0 * c;
+        return match slot {
+            HudTextSlot::Score => Vec2::new(0.0, strip_y),
+            HudTextSlot::Level => Vec2::new(-hw + 2.3 * c, strip_y),
+            // `LINES` sits left of the pause disc's top-right corner zone.
+            HudTextSlot::Lines => Vec2::new(hw - 5.2 * c, strip_y),
+            HudTextSlot::Combo => Vec2::new(-3.4 * c, deck_y),
+            HudTextSlot::B2B => Vec2::new(3.4 * c, deck_y),
+            HudTextSlot::PauseHint => Vec2::new(0.0, deck_y - 2.6 * c),
+        };
+    }
     let y = match slot {
         HudTextSlot::Score => anchor.field_top - 4.0 * c,
         HudTextSlot::Level => anchor.field_top - 7.0 * c,
@@ -130,16 +165,29 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
 
 /// World-space center of the hold box.
 pub fn hold_center(anchor: &HudAnchor) -> Vec2 {
-    Vec2::new(anchor.left_panel_x, anchor.field_top - 1.25 * anchor.cell)
+    let c = anchor.cell;
+    if anchor.portrait {
+        Vec2::new(anchor.left_panel_x, anchor.field_top + 1.9 * c)
+    } else {
+        Vec2::new(anchor.left_panel_x, anchor.field_top - 1.25 * c)
+    }
 }
 
 /// World-space center of next-queue slot `index` (0 = first preview).
+/// Landscape stacks down the right panel; portrait-native lays the queue
+/// out horizontally to the right of the hold box inside the top strip.
 pub fn next_center(anchor: &HudAnchor, index: usize) -> Vec2 {
     let c = anchor.cell;
-    Vec2::new(
-        anchor.right_panel_x,
-        anchor.field_top - 1.25 * c - 3.0 * c * index as f32,
-    )
+    if anchor.portrait {
+        let hw = anchor.window_w * 0.5;
+        let x = (-hw + 4.7 * c + 2.25 * c * index as f32).min(hw - 1.2 * c);
+        Vec2::new(x, anchor.field_top + 1.9 * c)
+    } else {
+        Vec2::new(
+            anchor.right_panel_x,
+            anchor.field_top - 1.25 * c - 3.0 * c * index as f32,
+        )
+    }
 }
 
 /// Normalized spawn-rotation footprint of a piece: cells shifted so the
@@ -426,11 +474,18 @@ fn sync_hud_texts(
         let slot_ref = slot_entity(&mut entities, slot);
         sync_text_slot(&mut commands, slot, want, slot_ref, &anchor, &mut texts);
     }
+    // Portrait-native has a visible pause button; the keyboard-chord hint
+    // would just add clutter to the touch deck.
+    let pause_hint = if anchor.portrait {
+        None
+    } else {
+        Some(pause_hint_text(&pause_binds))
+    };
     let slot_ref = slot_entity(&mut entities, HudTextSlot::PauseHint);
     sync_text_slot(
         &mut commands,
         HudTextSlot::PauseHint,
-        Some(pause_hint_text(&pause_binds)),
+        pause_hint,
         slot_ref,
         &anchor,
         &mut texts,
@@ -703,10 +758,28 @@ pub struct VersusPanelAnchor {
     pub field_top: f32,
 }
 
-/// `[left, right]` versus panel anchors for a window size.
+/// `[left, right]` versus panel anchors for a window size. Landscape puts
+/// the compact panel in the outer margin of each half; portrait-native has
+/// no side margin, so the panel centers over each field (the stack starts
+/// just below the top of the spawn buffer and stays readable over the
+/// normally-empty rows).
 pub fn versus_panel_anchors(window_w: f32, window_h: f32) -> [VersusPanelAnchor; 2] {
     let [left, right] = render::versus_layouts(window_w, window_h);
     let cell = left.cell;
+    if render::portrait_layout(window_w, window_h) {
+        return [
+            VersusPanelAnchor {
+                cell,
+                panel_x: left.origin.x + cell * COLS as f32 * 0.5,
+                field_top: left.origin.y,
+            },
+            VersusPanelAnchor {
+                cell,
+                panel_x: right.origin.x + cell * COLS as f32 * 0.5,
+                field_top: right.origin.y,
+            },
+        ];
+    }
     let gap = (PANEL_GAP + PANEL_HALF) * cell;
     [
         VersusPanelAnchor {
@@ -1298,6 +1371,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Portrait-native anchors: hold + horizontal next queue + stat row
+    /// inside the reserved top strip, combo/B2B in a deck row under the
+    /// field, nothing off-screen.
+    #[test]
+    fn portrait_anchors_form_top_strip_and_deck_row() {
+        render::set_portrait_override(Some(true));
+        let (w, h) = (1080.0, 2404.0);
+        let anchor = hud_anchor(w, h);
+        assert!(anchor.portrait);
+        let c = anchor.cell;
+
+        let hold = hold_center(&anchor);
+        let next0 = next_center(&anchor, 0);
+        let next5 = next_center(&anchor, 5);
+        let score = hud_text_center(&anchor, HudTextSlot::Score);
+        let level = hud_text_center(&anchor, HudTextSlot::Level);
+        let lines = hud_text_center(&anchor, HudTextSlot::Lines);
+        let combo = hud_text_center(&anchor, HudTextSlot::Combo);
+        let b2b = hud_text_center(&anchor, HudTextSlot::B2B);
+
+        // Top strip (above the field), score row highest, then hold/next.
+        assert!(hold.y > anchor.field_top && score.y > hold.y);
+        assert!(next0.x > hold.x && next5.x > next0.x);
+        assert!(level.x < score.x && lines.x > score.x);
+        assert!(
+            score.y + 0.8 * c < h * 0.5 - 50.0 + EPS,
+            "score row intrudes on the status/cutout zone"
+        );
+        assert!(
+            hold.y - 1.15 * c >= anchor.field_top - EPS,
+            "hold box sinks into the field"
+        );
+        // Queue stays fully on screen even at 6 slots.
+        assert!(next5.x + 1.15 * c <= w * 0.5 + EPS);
+        assert!(next_center(&anchor, 11).x + 1.15 * c <= w * 0.5 + EPS);
+        // Deck row: under the field, above the button deck.
+        assert!(combo.y < anchor.field_bottom && b2b.y < anchor.field_bottom);
+        assert!(combo.y > anchor.field_bottom - render::PORTRAIT_BOTTOM_FRAC * h * 0.5);
+        assert!(b2b.x > combo.x);
+
+        // Landscape windows keep the classic side-panel layout.
+        let landscape = hud_anchor(1280.0, 720.0);
+        assert!(!landscape.portrait);
+        assert_eq!(landscape.field_top, landscape.window_h * 0.5);
     }
 
     #[test]

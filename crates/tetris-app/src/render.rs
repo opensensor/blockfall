@@ -189,6 +189,62 @@ pub fn letterbox(window_w: f32, window_h: f32) -> (f32, f32, f32) {
     (cell, offset_x, offset_y)
 }
 
+/// Fraction of window height reserved above the field for the portrait HUD
+/// strip (score / hold / next queue) in [`playfield_view`].
+pub const PORTRAIT_TOP_FRAC: f32 = 0.19;
+/// Fraction of window height reserved below the field for the portrait
+/// touch deck (buttons + combo/B2B strip) in [`playfield_view`].
+pub const PORTRAIT_BOTTOM_FRAC: f32 = 0.19;
+
+/// Thread-local portrait force for unit tests (each cargo test thread is
+/// isolated, unlike a process env var). Production code never sets it.
+#[cfg(test)]
+thread_local! {
+    static PORTRAIT_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Test hook: force the portrait-native decision for this thread
+/// (`Some(true)` / `Some(false)`) or restore environment-driven behavior
+/// (`None`).
+#[cfg(test)]
+pub fn set_portrait_override(enabled: Option<bool>) {
+    PORTRAIT_OVERRIDE.with(|slot| slot.set(enabled));
+}
+
+/// Portrait-native layout active? The Android build runs portrait-locked;
+/// desktop opts in per-run with `TETRIS_PORTRAIT=1` for dev/testing. Only
+/// ever active for windows taller than wide.
+pub fn portrait_layout(window_w: f32, window_h: f32) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = PORTRAIT_OVERRIDE.with(|slot| slot.get()) {
+        return forced && window_h > window_w;
+    }
+    let enabled = cfg!(target_os = "android")
+        || std::env::var_os("TETRIS_PORTRAIT").is_some_and(|value| value == "1");
+    enabled && window_h > window_w
+}
+
+/// Viewport the playfield fits into plus the world-space `y` offset of that
+/// viewport's center: `(view_w, view_h, center_y)`. Desktop (and any
+/// landscape window) is the plain full window `(w, h, 0)`; portrait-native
+/// mode reserves [`PORTRAIT_TOP_FRAC`] / [`PORTRAIT_BOTTOM_FRAC`] strips for
+/// HUD and touch controls, so the field letterboxes inside the remainder,
+/// centered in it.
+pub fn playfield_view(window_w: f32, window_h: f32) -> (f32, f32, f32) {
+    if !portrait_layout(window_w, window_h) {
+        return (window_w, window_h, 0.0);
+    }
+    let top = window_h * PORTRAIT_TOP_FRAC;
+    let bottom = window_h * PORTRAIT_BOTTOM_FRAC;
+    (
+        window_w,
+        (window_h - top - bottom).max(1.0),
+        (bottom - top) * 0.5,
+    )
+}
+
 /// Cell size + top-left anchor of one drawn field inside a viewport (T26).
 /// [`FieldLayout::fit`] is exactly the [`letterbox`] math, so the solo
 /// full-window draw stays pixel-identical to T11.
@@ -209,6 +265,16 @@ impl FieldLayout {
             cell,
             origin: Vec2::new(-view_w * 0.5 + offset_x, view_h * 0.5 - offset_y),
         }
+    }
+
+    /// Letterbox fit for a window size, honoring the portrait-native
+    /// viewport insets and center shift from [`playfield_view`] (identity
+    /// for landscape/desktop windows).
+    pub fn fit_window(window_w: f32, window_h: f32) -> Self {
+        let (view_w, view_h, center_y) = playfield_view(window_w, window_h);
+        let mut layout = Self::fit(view_w, view_h);
+        layout.origin.y += center_y;
+        layout
     }
 
     /// Place a field of a fixed `cell` size with its own center at `center`
@@ -238,11 +304,12 @@ impl FieldLayout {
 /// fits — the halves are equal by construction, so each half fits exactly)
 /// with every field centered in its own half of the window.
 pub fn versus_layouts(window_w: f32, window_h: f32) -> [FieldLayout; 2] {
-    let half_w = window_w * 0.5;
-    let cell = FieldLayout::fit(half_w, window_h).cell;
+    let (view_w, view_h, center_y) = playfield_view(window_w, window_h);
+    let half_w = view_w * 0.5;
+    let cell = FieldLayout::fit(half_w, view_h).cell;
     [
-        FieldLayout::centered(cell, Vec2::new(-half_w * 0.5, 0.0)),
-        FieldLayout::centered(cell, Vec2::new(half_w * 0.5, 0.0)),
+        FieldLayout::centered(cell, Vec2::new(-half_w * 0.5, center_y)),
+        FieldLayout::centered(cell, Vec2::new(half_w * 0.5, center_y)),
     ]
 }
 
@@ -524,7 +591,7 @@ fn render_playfield(
     clear_pool(&mut commands, &mut frames.versus_left);
     clear_pool(&mut commands, &mut frames.versus_right);
     let Some(core) = core else { return };
-    let layout = FieldLayout::fit(size.x, size.y);
+    let layout = FieldLayout::fit_window(size.x, size.y);
     sync_frame(&mut commands, &mut frames.solo, &layout, None);
     let cells = frame_cells(&core.game.snapshot());
     sync_pool(&mut commands, &mut pool.entities, &cells, &layout, None);
@@ -571,6 +638,49 @@ mod tests {
                 "garbage must not share a tetromino palette color"
             );
         }
+    }
+
+    /// Portrait-native viewport: HUD strip + touch deck reserved, field
+    /// inside the remainder, versus boards share it; landscape windows stay
+    /// plain full-window.
+    #[test]
+    fn playfield_view_reserves_portrait_strips() {
+        set_portrait_override(Some(true));
+        let (w, h) = (1080.0, 2404.0);
+        let (view_w, view_h, center_y) = playfield_view(w, h);
+        assert_eq!(view_w, w);
+        assert!(
+            (view_h - h * (1.0 - PORTRAIT_TOP_FRAC - PORTRAIT_BOTTOM_FRAC)).abs() < EPS,
+            "view_h {view_h} does not match the strip remainder"
+        );
+        assert!(
+            (center_y - h * (PORTRAIT_BOTTOM_FRAC - PORTRAIT_TOP_FRAC) * 0.5).abs() < EPS,
+            "viewport center shift {center_y}"
+        );
+
+        let layout = FieldLayout::fit_window(w, h);
+        assert!(layout.cell * COLS as f32 <= w + EPS);
+        assert!(layout.cell * VISIBLE_ROWS as f32 <= view_h + EPS);
+        assert!(layout.origin.y <= h * 0.5 - h * PORTRAIT_TOP_FRAC + EPS);
+        assert!(
+            layout.origin.y - layout.cell * VISIBLE_ROWS as f32
+                >= -h * 0.5 + h * PORTRAIT_BOTTOM_FRAC - EPS
+        );
+
+        let [left, right] = versus_layouts(w, h);
+        for layout in [left, right] {
+            assert!(layout.origin.x >= -w * 0.5 - EPS);
+            assert!(layout.origin.x + layout.cell * COLS as f32 <= w * 0.5 + EPS);
+            assert!(
+                layout.origin.y - layout.cell * VISIBLE_ROWS as f32
+                    >= -h * 0.5 + h * PORTRAIT_BOTTOM_FRAC - EPS,
+                "versus field sinks into the bottom deck"
+            );
+        }
+
+        // Landscape windows ignore the override entirely.
+        assert_eq!(playfield_view(2404.0, 1080.0), (2404.0, 1080.0, 0.0));
+        assert!(!portrait_layout(2404.0, 1080.0));
     }
 
     /// Letterbox math: square cells on both axes, centered, field aspect

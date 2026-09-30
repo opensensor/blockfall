@@ -5,3 +5,7 @@
 cargo-timing-*.html
 .qwen/
 dist/
+
+# Android build artifacts (scripts/build-android.sh outputs)
+crates/tetris-app/android/
+android/debug.keystore

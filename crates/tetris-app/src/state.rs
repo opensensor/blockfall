@@ -82,6 +82,19 @@ pub struct RebindingCapture {
     pub capturing: bool,
 }
 
+/// Cross-plugin schedule anchor: the pause-chord consumer must evaluate the
+/// capture flag before the settings screen clears a capture that went stale
+/// outside Settings. Both plugins configure the set, so either plugin may be
+/// used standalone in headless tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SystemSet)]
+pub enum CaptureOrder {
+    /// Pause-chord consumer (`screens_menu`); observes a pre-cleanup
+    /// [`RebindingCapture`].
+    Chord,
+    /// Capture cleanup (`screens_settings`); runs after [`Self::Chord`].
+    Cleanup,
+}
+
 /// Headless smoke tests for the T1 scaffold. They live in this file because it
 /// is the one app module permanently owned by T1; later tasks must not delete
 /// them.

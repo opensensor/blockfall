@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.blockfall.app">
+
+    <!-- targetSdk 34: Android 15+ stops honoring system-bar *hiding* for
+         apps targeting 35, which would leave the nav pill burned into the
+         screen. Staying at 34 keeps sticky-immersive fullscreen working. -->
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <!-- Netplay (renet UDP) and gateway room codes. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- The game is playable without a gamepad (touch overlay). -->
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
+
+    <application
+        android:label="Blockfall"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:debuggable="true"
+        android:extractNativeLibs="false"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <!-- winit/`android-activity` native-activity entry: `android_main`
+             is exported from libblockfall_app.so (#[bevy_main], lib.rs).
+             Subclassed by dev.blockfall.app.Main (android/java/...) purely
+             for immersive-fullscreen enforcement. Portrait-native: the field
+             fills a vertical column with HUD strip above and the touch deck
+             below (see the mobile layout notes in the port). -->
+        <activity
+            android:name="dev.blockfall.app.Main"
+            android:label="Blockfall"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|keyboard|navigation|uiMode"
+            android:launchMode="singleTask"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="blockfall_app" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

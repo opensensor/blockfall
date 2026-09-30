@@ -1069,6 +1069,30 @@ pub fn online_entry_input_system(
     }
 }
 
+/// Android soft-keyboard bridge: the system IME is shown exactly while the
+/// online flow waits on typed input — the Join stage, where either the room
+/// code ([`CodeEntry`]) or the direct `IP:port` address ([`JoinEntry`]) is
+/// focused. winit shows/hides it via `InputMethodManager` (bevy_winit maps
+/// [`bevy::window::Window::ime_enabled`]); soft-keyboard taps on a
+/// NativeActivity arrive back as ordinary `KeyboardInput` events, which
+/// [`online_entry_input_system`] consumes unchanged, so no IME commit
+/// plumbing is needed. Desktop never opts in (a real keyboard is present).
+pub fn online_ime_system(
+    state: Res<AppState>,
+    flow: Res<OnlineFlow>,
+    mut windows: Query<&mut bevy::window::Window>,
+) {
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    let want = cfg!(target_os = "android")
+        && *state == AppState::Title
+        && flow.stage == OnlineStage::Join;
+    if window.ime_enabled != want {
+        window.ime_enabled = want;
+    }
+}
+
 /// `U` on the Host screen toggles the router port mapping (WAN play
 /// addendum): off → best-effort `DeletePortMapping` + [`UpnpState::Off`];
 /// on → retry `AddPortMapping` immediately when still `Listening`. The
@@ -1754,7 +1778,12 @@ impl Plugin for OnlineUiPlugin {
         // WAN play addendum: the UPnP driver lives with the Host screen that
         // renders its status line and owns the `U` toggle; mounting here
         // (not in NetPlugin) keeps `session.rs` untouched and lets tests
-        // swap the runner before any Host click.
+        // swap the runner before any Host click. Mounted on Android too:
+        // SSDP discovery can't receive without a WifiManager multicast lock
+        // (Java glue this native-activity build lacks), and the driver's
+        // `Failed` state — rendered as "unavailable" on the Host screen —
+        // is what the Host UI already absorbs; the `UpnpState`/`UpnpDriver`
+        // resources must exist for `start_mapping`.
         app.add_plugins(UpnpPlugin);
         if !app.world().contains_resource::<NetSession>() {
             app.init_resource::<NetSession>();
@@ -1771,6 +1800,7 @@ impl Plugin for OnlineUiPlugin {
                 (
                     online_esc_system,
                     online_entry_input_system,
+                    online_ime_system,
                     upnp_toggle_system,
                     online_click_system,
                 )

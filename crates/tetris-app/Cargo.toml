@@ -11,9 +11,17 @@ license.workspace = true
 name = "blockfall"
 path = "src/main.rs"
 
+# Android packaging: the app lives in this lib so cargo-ndk can build the
+# `cdylib` (`libblockfall_app.so`) whose `android_main` (from `#[bevy_main]`)
+# the `NativeActivity` in `android/AndroidManifest.xml` loads. Desktop keeps
+# using the `blockfall` binary, which forwards to the same `main()`.
+[lib]
+name = "blockfall_app"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 tetris-core = { workspace = true }
-bevy = { workspace = true, features = ["serialize", "bevy_text", "default_font"] }
+bevy = { workspace = true, features = ["serialize", "bevy_text", "default_font", "android-native-activity"] }
 bevy_kira_audio = { workspace = true }
 bevy_renet = { workspace = true }
 bincode = { workspace = true }

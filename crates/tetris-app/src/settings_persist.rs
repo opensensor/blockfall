@@ -67,6 +67,15 @@ pub fn config_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
+    // Android has no `dirs` home/config; use the app's private internal
+    // storage dir (`/data/data/<pkg>/files/tetris`), the only writable
+    // location without runtime permissions.
+    #[cfg(target_os = "android")]
+    if let Some(app) = bevy::android::ANDROID_APP.get() {
+        if let Some(data) = app.internal_data_path() {
+            return data.join(APP_DIR_NAME);
+        }
+    }
     let base = dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));

@@ -47,7 +47,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::input::{pressed_key_to_bind, Bind, BindSlot, KeyBindings};
-use crate::state::{AppState, EffectsQuality, RebindingCapture, Settings};
+use crate::state::{AppState, CaptureOrder, EffectsQuality, RebindingCapture, Settings};
 
 /// DAS slider bounds, milliseconds (PRD §6.5 default 150).
 pub const DAS_RANGE: (f32, f32) = (0.0, 500.0);
@@ -933,6 +933,7 @@ impl Plugin for SettingsScreenPlugin {
             .add_message::<Pointer<Release>>()
             .add_message::<Pointer<DragEnd>>()
             .add_systems(Startup, build_settings_ui)
+            .configure_sets(Update, CaptureOrder::Cleanup.after(CaptureOrder::Chord))
             .add_systems(
                 Update,
                 (
@@ -940,7 +941,7 @@ impl Plugin for SettingsScreenPlugin {
                     track_settings_entry,
                     button_clicks,
                     slider_pointer,
-                    apply_capture_system,
+                    apply_capture_system.in_set(CaptureOrder::Cleanup),
                     sync_labels,
                 )
                     .chain(),
