@@ -82,7 +82,7 @@
 //!   kick path; `process_local_client` shuttles the reliable channels).
 
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
@@ -403,8 +403,23 @@ fn map_renet_reason(reason: RenetDisconnectReason) -> NetLossReason {
 /// [`NetEvent::BindFailed`] — never a panic. Any previous session is torn
 /// down first, so re-hosting is safe.
 pub fn net_host(world: &mut World, port: u16) {
+    net_host_at(world, Ipv4Addr::UNSPECIFIED, port);
+}
+
+/// Same as [`net_host`] but bound to an explicit local IPv4. **Test seam**
+/// for the gateway-relay E2E (`harness.rs`): the relay attributes data-plane
+/// legs by source IP (gateway-plan.md G1), so a host and a guest sharing one
+/// test process must source their legs from **distinct 127.0.0.x** addresses
+/// (the pinned host leg is `127.0.0.2`, the production-shaped guest legs
+/// stay on the default `0.0.0.0` → `127.0.0.1`). Production always calls
+/// [`net_host`] — nothing but a test passes a non-unspecified bind.
+pub(crate) fn net_host_on(world: &mut World, bind: Ipv4Addr, port: u16) {
+    net_host_at(world, bind, port);
+}
+
+fn net_host_at(world: &mut World, bind: Ipv4Addr, port: u16) {
     net_stop(world);
-    match bind_host(port) {
+    match bind_host(bind, port) {
         Ok((transport, addr)) => {
             {
                 let mut session = world.resource_mut::<NetSession>();
@@ -433,8 +448,8 @@ pub fn net_host(world: &mut World, port: u16) {
 
 /// Bind the UDP socket *before* handing it to the transport — the transport
 /// exposes no `local_addr()` (port-0 strategy from the Verified API notes).
-fn bind_host(port: u16) -> Result<(NetcodeServerTransport, SocketAddr), String> {
-    let socket = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
+fn bind_host(bind: Ipv4Addr, port: u16) -> Result<(NetcodeServerTransport, SocketAddr), String> {
+    let socket = UdpSocket::bind((bind, port)).map_err(|e| e.to_string())?;
     let addr = socket.local_addr().map_err(|e| e.to_string())?;
     let config = ServerConfig {
         current_time: unix_now(),

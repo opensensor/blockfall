@@ -52,7 +52,7 @@
 //! (and `DEFAULT_GATEWAY_ENDPOINT`) via the public `enabled` field.
 
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -408,6 +408,9 @@ pub struct NetGateway {
     pub guest: GuestLookupState,
     /// Resolved gateway control address (populated once resolved; diagnostic).
     pub gateway_addr: Option<SocketAddr>,
+    /// Optional explicit local bind for the control socket — **test seam**,
+    /// see [`Self::with_leg_bind`]. `None` (production) → `0.0.0.0`.
+    leg_bind: Option<IpAddr>,
 
     dns: ResolveRunner,
     tx: Sender<GatewayTask>,
@@ -448,6 +451,7 @@ impl NetGateway {
             host: HostRoomState::Idle,
             guest: GuestLookupState::Idle,
             gateway_addr: None,
+            leg_bind: None,
             dns: default_resolve_runner,
             tx,
             rx: Mutex::new(rx),
@@ -496,13 +500,31 @@ impl NetGateway {
         gw
     }
 
+    /// Test seam: bind the control socket to an explicit local address
+    /// instead of `0.0.0.0`. The gateway-relay E2E (`harness.rs`) runs host
+    /// and guest in **one process**, and the relay attributes data-plane legs
+    /// per source IP (gateway-plan.md G1 — on the WAN they always differ), so
+    /// the host leg pins its control socket to `127.0.0.2` while the
+    /// production-shaped guest legs keep the default (`127.0.0.1`). The game
+    /// socket gets the matching bind through [`super::session::net_host_on`].
+    /// Production never sets this.
+    #[must_use]
+    pub fn with_leg_bind(mut self, ip: IpAddr) -> Self {
+        self.leg_bind = Some(ip);
+        self
+    }
+
     // -- sockets + resolution ------------------------------------------------
 
     fn ensure_socket(&mut self) -> bool {
         if self.socket.is_some() {
             return true;
         }
-        match UdpSocket::bind("0.0.0.0:0") {
+        let bind = SocketAddr::new(
+            self.leg_bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            0,
+        );
+        match UdpSocket::bind(bind) {
             Ok(sock) => {
                 let _ = sock.set_nonblocking(true);
                 self.socket = Some(sock);
@@ -894,6 +916,29 @@ fn gateway_control_system(
         .and_then(|s| s.listen_addr.map(|a| a.port()));
 
     if was_listening && !listening {
+        match status {
+            // A peer connected: hand the room to the live session instead of
+            // releasing it. The netcode traffic itself keeps the relay room
+            // alive from here on (host packets refresh the room's GC clock in
+            // `room.rs`), and a `*D` on this edge would close the room's
+            // virtual data port *mid-handshake* — pulling the relay out from
+            // under the match about to be played (found by the G5 crown
+            // test, gateway-plan.md). The announcement clears (the code is no
+            // longer shareable) but `self.code` survives so a later stop
+            // still sends the `*D` the spec asks for.
+            Some(NetStatus::Handshaking | NetStatus::Ready | NetStatus::InMatch) => {
+                gateway.host = HostRoomState::Idle;
+            }
+            // Listening → Idle/BindFailed/no session: hosting really ended.
+            _ => gateway.teardown_host(),
+        }
+    } else if gateway.code.is_some()
+        && matches!(status, None | Some(NetStatus::Idle))
+        && !matches!(gateway.prev_status, None | Some(NetStatus::Idle))
+    {
+        // Stop edge from any hosting phase (a match that started while the
+        // room was already handed over above): `net_stop`/exit releases the
+        // room — "on net_stop/teardown sends `*D`" per the plan.
         gateway.teardown_host();
     }
     if listening

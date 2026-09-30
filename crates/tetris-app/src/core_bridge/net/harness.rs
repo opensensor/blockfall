@@ -1161,6 +1161,410 @@ mod tests {
     }
 
     // =========================================================================
+    // G5 — crown E2E through the gateway relay (gateway-plan.md G5).
+    //
+    // The N6 pair above joins directly (`net_join(host_ip:port)`); this one
+    // joins **through a real in-process `netplay_gateway` relay**: the host
+    // registers a room over the real control channel (`*R` → `*A`, G2 driver,
+    // 2 s keepalives), the guest runs the real join-by-code path (`*G` →
+    // `*F` → the G2 driver hands `gateway_ip:vport` to the unchanged
+    // `net_join`), and the whole match rides the relay's virtual data port —
+    // real control handshake, real virtual-port data plane, real netcode.
+    //
+    // Per-IP leg distinction (G1 constraint): both apps live in **one**
+    // process, so their sockets would all source `127.0.0.1` and the relay
+    // (which attributes data-plane legs by source IP — on the WAN they always
+    // differ) could not tell them apart. The host legs therefore pin to
+    // `127.0.0.2` (game socket via `net_host_on`, control socket via
+    // `NetGateway::with_leg_bind`), while the guest keeps production-shaped
+    // default binds (`0.0.0.0` → sources `127.0.0.1`). Nothing can bypass the
+    // relay: the client transport only ever accepts packets from exactly the
+    // `*F` endpoint (`127.0.0.1:vport`), and the host's server socket on
+    // `127.0.0.2` speaks only to that socket's address — a crowned winner
+    // with equal hash streams is itself the proof the data plane went
+    // through the relay.
+    // =========================================================================
+
+    /// Drain one app's gateway event stream.
+    fn drain_gateway_events(
+        app: &mut App,
+    ) -> Vec<crate::core_bridge::net::gateway::NetGatewayEvent> {
+        app.world_mut()
+            .resource_mut::<Messages<crate::core_bridge::net::gateway::NetGatewayEvent>>()
+            .drain()
+            .collect()
+    }
+
+    /// The crown test: two bots play a full Garbage match with every packet
+    /// relayed by the real gateway, and the per-60-tick SnapshotHash streams
+    /// stay equal throughout — plus the `*D`-on-stop lifecycle at teardown.
+    #[test]
+    fn e2e_bot_vs_bot_garbage_match_through_gateway_relay() {
+        use crate::core_bridge::net::gateway::testutil::{
+            raw_socket, recv_frame, spawn_real_gateway,
+        };
+        use crate::core_bridge::net::gateway::{join_room, NetGateway, NetGatewayEvent};
+        use netplay_gateway::wire::{self, Frame};
+
+        let rg = spawn_real_gateway(4);
+        let endpoint = rg.ctrl.to_string();
+        let host_leg = Ipv4Addr::new(127, 0, 0, 2);
+
+        let mut host = peer_app(12.0);
+        let mut guest = peer_app(12.0);
+        // Arm the G2 gateway driver on both peers (real driver systems; only
+        // the endpoint and the host leg's bind differ from production).
+        host.world_mut().insert_resource(
+            NetGateway::test_with_endpoint(&endpoint).with_leg_bind(host_leg.into()),
+        );
+        guest
+            .world_mut()
+            .insert_resource(NetGateway::test_with_endpoint(&endpoint));
+
+        // Host up on the pinned loopback leg.
+        crate::core_bridge::net::session::net_host_on(host.world_mut(), host_leg, 0);
+        let listen = host
+            .world()
+            .resource::<NetSession>()
+            .listen_addr
+            .expect("host must publish its bound address");
+        assert_eq!(
+            listen.ip().to_string(),
+            "127.0.0.2",
+            "the host game leg must pin the relay-distinct loopback IP"
+        );
+
+        // Real control handshake: Listening edge -> *R -> *A -> announced code.
+        let mut host_gw = Vec::new();
+        let code = {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                host.update();
+                guest.update();
+                host_gw.extend(drain_gateway_events(&mut host));
+                if let Some(code) = host_gw.iter().find_map(|e| match e {
+                    NetGatewayEvent::RoomAnnounced(code) => Some(*code),
+                    _ => None,
+                }) {
+                    break code;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "host room never announced: {host_gw:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(
+            !host_gw
+                .iter()
+                .any(|e| matches!(e, NetGatewayEvent::RoomOffline(_))),
+            "registration must not go offline: {host_gw:?}"
+        );
+
+        // Real join-by-code path: *G -> *F -> G2 hands the relay address to
+        // the production net_join.
+        join_room(guest.world_mut(), code);
+        let relay_addr = {
+            let mut guest_gw = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                host.update();
+                guest.update();
+                guest_gw.extend(drain_gateway_events(&mut guest));
+                if let Some(addr) = guest_gw.iter().find_map(|e| match e {
+                    NetGatewayEvent::Found { addr, .. } => Some(*addr),
+                    _ => None,
+                }) {
+                    break addr;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "room {code:?} never surfaced to the guest: {guest_gw:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert_eq!(
+            relay_addr.ip().to_string(),
+            "127.0.0.1",
+            "*F must point at the gateway, never the *F-carried host_ip"
+        );
+        assert_ne!(
+            relay_addr.port(),
+            rg.ctrl.port(),
+            "the guest connects to the relay's virtual data port, not the control port"
+        );
+
+        // Real netcode connect + app handshake, entirely through the relay.
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "relay handshake (both Ready)",
+            |h, g| session_status(h) == NetStatus::Ready && session_status(g) == NetStatus::Ready,
+        );
+        drain_events(&mut host);
+        drain_events(&mut guest);
+
+        // Full Garbage match, bot-vs-bot — identical assertions to the
+        // direct-UDP crown test, with the relay as the only path.
+        let seed = 0xE2E5_E2E0_0000_00A5;
+        let rule = AttackRule::Garbage;
+        let delay = 4;
+        host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
+        start_net_match_live(&mut host, rule, seed, delay);
+
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "guest mirror active (via relay)",
+            |_, g| {
+                session_status(g) == NetStatus::InMatch
+                    && g.world().non_send::<VersusMatch>().active
+            },
+        );
+        guest.world_mut().non_send_mut::<VersusMatch>().p2 = Controller::Bot;
+        assert_eq!(
+            guest.world().non_send::<VersusMatch>().seed,
+            seed,
+            "the guest must mirror the wire seed through the relay"
+        );
+
+        let mut saw_desync = Vec::new();
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(120),
+            "crowned winner (via relay)",
+            |h, g| {
+                for event in drain_events(h).into_iter().chain(drain_events(g)) {
+                    if matches!(event, NetEvent::Desync { .. }) {
+                        saw_desync.push(event);
+                    }
+                }
+                crowned(h).is_some() && crowned(g).is_some()
+            },
+        );
+        assert!(
+            saw_desync.is_empty(),
+            "a clean relayed match must never desync: {saw_desync:?}"
+        );
+        assert!(
+            lockstep_tick(&host) > 120 && lockstep_tick(&guest) > 120,
+            "match too short: host tick {}, guest tick {}",
+            lockstep_tick(&host),
+            lockstep_tick(&guest),
+        );
+        let (hw, gw) = (crowned(&host), crowned(&guest));
+        assert_eq!(hw, gw, "both relayed peers must crown the same winner");
+        let dead = match hw {
+            Some(Side::Left) => versus_snapshot(&guest).right.game_over,
+            _ => versus_snapshot(&guest).left.game_over,
+        };
+        assert!(dead, "the loser's board is topped out");
+
+        // Per-60-tick hash streams equal on their whole common prefix (>= 3
+        // boundaries), and the final snapshots match — same quantities the
+        // wire desync check exchanges.
+        drive_until(
+            &mut host,
+            &mut guest,
+            Duration::from_secs(30),
+            "hash streams >= 3 on both peers",
+            |h, g| stream(h).len() >= 3 && stream(g).len() >= 3,
+        );
+        let (mut hs, gs) = (stream(&host), stream(&guest));
+        let common = hs.len().min(gs.len());
+        hs.truncate(common);
+        let common = &gs[..gs.len().min(common)];
+        assert!(
+            hs.len() >= 3,
+            "expected several hash boundaries over a full relayed match, got {hs:?}"
+        );
+        assert_eq!(
+            hs, common,
+            "per-{}-tick SnapshotHash streams diverged over the relay",
+            HASH_CHECK_PERIOD
+        );
+        assert_eq!(
+            versus_snapshot(&host),
+            versus_snapshot(&guest),
+            "final snapshots must be equal over the relay"
+        );
+
+        // Teardown: net_stop must hand the room back to the gateway (`*D`) —
+        // verified by a fresh lookup answering `*E` well before the 15 s GC
+        // could have expired the room.
+        net_stop(host.world_mut());
+        net_stop(guest.world_mut());
+        assert_eq!(session_status(&host), NetStatus::Idle);
+        assert_eq!(session_status(&guest), NetStatus::Idle);
+        let mut released = false;
+        let probe = raw_socket("127.0.0.4");
+        for _ in 0..5 {
+            // Drive frames so the G2 driver sends `*D` on the stop edge,
+            // then probe once (≤ 5 control frames — inside the rate bucket).
+            host.update();
+            std::thread::sleep(Duration::from_millis(80));
+            probe
+                .send_to(&wire::encode(&Frame::Lookup { code }), rg.ctrl)
+                .expect("probe lookup");
+            if matches!(recv_frame(&probe), Some(Frame::NotFound { .. })) {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "net_stop must release the room (*D): lookups kept answering, or the room outlived its *D window"
+        );
+    }
+
+    /// Degradation path (G5): a dead gateway endpoint surfaces the shipped
+    /// offline line on the guest, never crashes, and stays retryable — and
+    /// the session layer never even touches netcode (so the 10 s JoinTimeout
+    /// is structurally unreachable behind it).
+    #[test]
+    fn gateway_down_surfaces_offline_line_and_stays_retryable() {
+        use crate::core_bridge::net::gateway::{join_room, GuestLookupState, NetGateway};
+        use crate::core_bridge::net::online_ui::lookup_status_text;
+
+        // Reserve a port and drop it: nothing listens, the `*G` goes
+        // unanswered — exactly a downed gateway (same shape G3 pins at the
+        // UI layer; this pins it on the client state machine + copy).
+        let dead = UdpSocket::bind("127.0.0.1:0")
+            .expect("dead-port probe")
+            .local_addr()
+            .expect("probe addr");
+
+        let mut guest = peer_app(1.0);
+        guest
+            .world_mut()
+            .insert_resource(NetGateway::test_with_endpoint(&dead.to_string()));
+
+        join_room(guest.world_mut(), *b"ABCDE");
+        let started = Instant::now();
+        loop {
+            guest.update();
+            let state = guest.world().resource::<NetGateway>().guest.clone();
+            if matches!(state, GuestLookupState::Timeout) {
+                assert!(
+                    started.elapsed() < crate::core_bridge::net::session::JOIN_TIMEOUT,
+                    "offline line must surface ({} s) before the JoinTimeout would",
+                    started.elapsed().as_secs_f32()
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "lookup never timed out against a dead gateway: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let state = guest.world().resource::<NetGateway>().guest.clone();
+        assert_eq!(
+            lookup_status_text(&state),
+            "gateway offline — check connection or join by IP",
+            "the offline copy the Join screen renders"
+        );
+        assert_eq!(
+            session_status(&guest),
+            NetStatus::Idle,
+            "a downed gateway never reaches netcode — JoinTimeout cannot fire behind it"
+        );
+
+        // Retryable: the terminal Timeout is not sticky across a fresh
+        // join_room — the lookup goes back in flight with no crash.
+        join_room(guest.world_mut(), *b"ABCDE");
+        let mut retried = false;
+        for _ in 0..50 {
+            guest.update();
+            let state = guest.world().resource::<NetGateway>().guest.clone();
+            if matches!(
+                state,
+                GuestLookupState::LookingUp(_) | GuestLookupState::Resolving(_)
+            ) {
+                retried = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(retried, "join_room after a timeout must restart the lookup");
+    }
+
+    /// Degradation path (G5): a room already paired to another guest answers
+    /// `*B` and the guest surfaces `match full` in well under the 10 s
+    /// JoinTimeout — the busy signal arrives while the player is still
+    /// looking at "joining room…", never as a silent timeout.
+    #[test]
+    fn gateway_busy_room_surfaces_match_full_before_join_timeout() {
+        use crate::core_bridge::net::gateway::testutil::{
+            raw_socket, recv_frame, reg, spawn_real_gateway,
+        };
+        use crate::core_bridge::net::gateway::{join_room, GuestLookupState, NetGateway};
+        use crate::core_bridge::net::online_ui::lookup_status_text;
+        use netplay_gateway::wire::{self, Frame};
+
+        let rg = spawn_real_gateway(4);
+        // Host leg registers ABCDE (from 127.0.0.2 per the G1 rule), and a
+        // first game-data packet from a third loopback IP pins its guest
+        // slot — the room is now busy.
+        let host = raw_socket("127.0.0.2");
+        host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
+        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
+        host.send_to(&wire::encode(&Frame::Lookup { code: *b"ABCDE" }), rg.ctrl)
+            .unwrap();
+        let vport = match recv_frame(&host) {
+            Some(Frame::Found { vport, .. }) => vport,
+            other => panic!("expected *F, got {other:?}"),
+        };
+        let pinned = raw_socket("127.0.0.3");
+        pinned
+            .send_to(b"\x00pin", SocketAddr::from(([127, 0, 0, 1], vport)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+
+        // The guest app (on the default 127.0.0.1 leg) looks up the paired
+        // room: *B -> Busy -> "match full".
+        let mut guest = peer_app(1.0);
+        guest
+            .world_mut()
+            .insert_resource(NetGateway::test_with_endpoint(&rg.ctrl.to_string()));
+        let started = Instant::now();
+        join_room(guest.world_mut(), *b"ABCDE");
+        loop {
+            guest.update();
+            let state = guest.world().resource::<NetGateway>().guest.clone();
+            if state == GuestLookupState::Busy(*b"ABCDE") {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "*B must arrive long before the JoinTimeout ({} s)",
+                    started.elapsed().as_secs_f32()
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "*B never surfaced to the guest app: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let state = guest.world().resource::<NetGateway>().guest.clone();
+        assert_eq!(lookup_status_text(&state), "match full");
+        assert_eq!(
+            session_status(&guest),
+            NetStatus::Idle,
+            "a busy room must not enter netcode (no JoinTimeout behind the message)"
+        );
+        assert!(
+            !drain_events(&mut guest).contains(&NetEvent::JoinTimeout),
+            "JoinTimeout must not fire behind the busy reply"
+        );
+    }
+
+    // =========================================================================
     // N7 — 20-match netplay soak (netplay-plan.md N7a).
     //
     // Chains [`SOAK_MATCHES`] matches over **one** connected pair on real
