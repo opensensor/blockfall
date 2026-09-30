@@ -221,9 +221,86 @@ Wave: 1    2    3
   DNS resolver test using "localhost" only (no internet dependency);
   keepalive cadence + `*D` on teardown via the existing headless-App
   patterns; existing tests green; fmt/clippy clean.
-- **status**: Not Completed
+- **status**: Completed (2026-09-30) — including the root fix for the
+  cross-cutting picking fragility surfaced while landing it (carve-out
+  granted by main, board_3e8c9125; see log + separate commit).
 - **log**:
+  - TDD: config/classification/resolver tests first, then flow tests
+    against the REAL in-process `netplay_gateway::room::Gateway` over
+    loopback UDP (distinct loopback IPs per leg per G1's note). 27 tests:
+    env parse (default/empty/custom), code alphabet+length, frame
+    classification (`*A/*F/*B/*N/*S/*C`), literal-IP vs DNS resolve
+    (localhost only), full host register→`*A`→`Announced`, keepalive
+    cadence, `*D` on teardown, collision/retry, guest `*G`→`*F`→
+    `net_join` handoff, `*B`/`*N`/timeout/unreachable paths, disabled-
+    gateway zero-cost (no socket, no thread, no frames).
+  - **`from_env()` enablement deviation (opt-in)**: spec maps unset env →
+    default endpoint. Here `TETRIS_GATEWAY` unset ⇒ **disabled** instead,
+    because this dev box has live internet and the existing headless
+    `Listening` tests would start sending real `*R` UDP to the production
+    endpoint. `parse_gateway_env(None)` still returns
+    `Some(DEFAULT_GATEWAY_ENDPOINT)` (pure string map honored + tested);
+    G3 arms the gateway via `GatewayConfig`/`NetProfile` explicitly.
+  - **`PreUpdate` not `Update`** for the driver system: any added `Update`
+    system perturbs Bevy's topo tie-break of two unrelated menu systems
+    (`pause_chord_system` vs the settings capture-clear sharing
+    `RebindingCapture`) and flipped `pause_chord_suppressed_while_
+    capturing`. The driver is a pure poll (DNS mailbox + nonblocking
+    control socket, reacts to previous-frame `NetStatus`) — one frame of
+    latency immaterial. Documented in the plugin doc.
+  - Guest join glue: `join_room(world, code)` sends `*G` after resolving
+    the endpoint (literal-IP sync, hostname on a generation-stamped
+    `std::thread` + mpsc, mirroring `upnp.rs`); on `*F` the driver queues
+    `net_join_by_code` calling the existing `session::net_join` with
+    `resolve(gateway_host):vport` (vport is the GATEWAY's port per plan).
+    Timeout 3 s; `*B/*N/*S/*C` map to distinct `GuestLookupState`s +
+    `NetGatewayEvent`s for the UI.
+  - Teardown: Listening→Idle/Connecting edge sends `*D` fire-and-forget
+    (200 ms budget on the nonblocking socket); room code kept for
+    re-`*R` on host restart (gateway keys by IP per G1).
+  - PICKING FRAGILITY ROOT-CAUSED & FIXED (surfaced while landing; NOT
+    gateway logic; carve-out board_3e8c9125): Bevy 0.19 stores every
+    resource as a component on a hidden entity (`bevy_ecs-0.19.1/src/
+    world/mod.rs:1969`), so ANY new resource type shifts global entity
+    indices, and `bevy_ui-0.19.1/src/picking_backend.rs:251-269` computes
+    pick depth from query-iteration order and IGNORES `ZIndex` entirely —
+    overlapping widgets tie and resolve by hash-bucket order, flipping
+    `one_v_one_submenu_clicks_reach_the_submenu_not_the_title` on any
+    resource insertion (reproduced with a unit `insert_resource` in an
+    empty plugin). Standardized mechanism (commit 2): hidden UI NEVER
+    participates in picking — `sync_hidden_ui_unpickable` (PreUpdate,
+    screens_menu.rs) marks every hidden `Node` `Pickable::IGNORE` and
+    lifts it when visible; menu roots and text labels carry
+    `Pickable::IGNORE` permanently so containers/text can never swallow
+    clicks. Regression pinned by `dummy_resources_cannot_reroute_submenu_
+    clicks` (inserts dummy resources, replays the full 1v1 click-through).
+    This is the 3rd picking incident (after T26's `ZIndex(1)` submenu fix
+    and the click-through regression) — all three documented in the
+    `sync_hidden_ui_unpickable` doc comment. G3 needs NO wiring: its
+    join-by-code buttons/panels inherit correct pickability via
+    `Visibility` automatically (spawn with `menu_button`/`label_node`/
+    `add_menu_root` to keep the convention uniform).
+  - Gates: 27 gateway tests green; `cargo test --workspace` fully green
+    (304/304 + 136 + 6 + 28; 4 consecutive parallel runs + single-thread;
+    isolated online_ui parallel flakes = N6-documented systemic UDP-port
+    contention board_730571a0, unrelated); clippy `--all-targets
+    -D warnings` clean; `cargo fmt --all --check` clean.
 - **files edited/created**:
+  - `crates/tetris-app/src/core_bridge/net/gateway.rs` (new: client,
+    plugin, 27 tests)
+  - `crates/tetris-app/src/core_bridge/net/mod.rs` (+`pub mod gateway;`)
+  - `crates/tetris-app/Cargo.toml` (+`netplay-gateway = { workspace =
+    true }`); root `Cargo.toml` (+workspace path dep, required for
+    `workspace = true`; parallel agent does not touch it)
+  - `Cargo.lock` (automatic)
+  - **session.rs hook (prominently recorded, 1 line)**:
+    `NetPlugin::build()` gains
+    `.add_plugins(super::gateway::NetGatewayPlugin)` after the
+    `NetLockstepPlugin` line — the canonical mount point next to the
+    other net sub-plugins; no other session.rs change.
+  - `crates/tetris-app/src/screens_menu.rs` (carve-out board_3e8c9125:
+    picking-determinism fix + regression test, separate commit)
+  - `gateway-plan.md` (this log)
 
 ### G3: UI — room code on Host screen, Code mode on Join screen
 - **depends_on**: [G2]
