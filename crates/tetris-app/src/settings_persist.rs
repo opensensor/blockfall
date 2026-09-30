@@ -102,6 +102,21 @@ pub struct NetProfile {
     /// matching [`default_upnp_enabled`]).
     #[serde(default = "default_upnp_enabled")]
     pub upnp_enabled: bool,
+    /// Gateway room codes (gateway-plan.md G3): arm the introduce+relay
+    /// gateway (Host share line, Join → Code mode). Additive serde default
+    /// like [`Self::upnp_enabled`] — pre-G3 profiles load with the gateway
+    /// on ([`default_gateway_enabled`]); a `false` here overrides even an
+    /// explicit `TETRIS_GATEWAY` endpoint at startup.
+    #[serde(default = "default_gateway_enabled")]
+    pub gateway_enabled: bool,
+}
+
+/// Gateway room codes ship on: a missing/unreachable gateway degrades to
+/// today's LAN/UPnP behavior (the driver is zero-cost when it never
+/// reaches an endpoint).
+#[must_use]
+pub fn default_gateway_enabled() -> bool {
+    true
 }
 
 /// UPnP auto-mapping ships on: routers without UPnP answer with a clean
@@ -116,6 +131,7 @@ impl Default for NetProfile {
         Self {
             last_join_addr: String::new(),
             upnp_enabled: default_upnp_enabled(),
+            gateway_enabled: default_gateway_enabled(),
         }
     }
 }
@@ -914,6 +930,7 @@ mod tests {
         let profile = NetProfile {
             last_join_addr: "192.168.1.42:27015".to_string(),
             upnp_enabled: true,
+            gateway_enabled: false,
         };
         net_profile_save_to(dir.path(), &profile).expect("save net profile");
         assert_eq!(net_profile_load_from(dir.path()), profile);
@@ -922,6 +939,7 @@ mod tests {
         let updated = NetProfile {
             last_join_addr: "10.0.0.9:40000".to_string(),
             upnp_enabled: false,
+            gateway_enabled: true,
         };
         net_profile_save_to(dir.path(), &updated).expect("re-save net profile");
         assert_eq!(net_profile_load_from(dir.path()), updated);
@@ -935,6 +953,43 @@ mod tests {
             NetProfile::default().upnp_enabled,
             "UPnP auto-mapping ships enabled"
         );
+        assert!(
+            NetProfile::default().gateway_enabled,
+            "gateway room codes ship enabled (G3)"
+        );
+    }
+
+    #[test]
+    fn gateway_enabled_defaults_true_when_absent_from_json() {
+        // A pre-G3 net_profile.json (written before room codes existed) must
+        // load with the gateway on — additive serde default, no rewrites.
+        let dir = TempDir::new("gateway-default");
+        fs::write(
+            dir.path().join(NET_PROFILE_FILE),
+            br#"{"last_join_addr":"192.168.1.9:27015","upnp_enabled":true}"#,
+        )
+        .unwrap();
+        let loaded = net_profile_load_from(dir.path());
+        assert!(
+            loaded.gateway_enabled,
+            "old profiles load with the gateway on"
+        );
+        assert_eq!(loaded.last_join_addr, "192.168.1.9:27015");
+        assert!(loaded.upnp_enabled);
+    }
+
+    #[test]
+    fn gateway_enabled_false_round_trips_and_stays_false() {
+        let dir = TempDir::new("gateway-off");
+        let profile = NetProfile {
+            last_join_addr: String::new(),
+            upnp_enabled: true,
+            gateway_enabled: false,
+        };
+        net_profile_save_to(dir.path(), &profile).expect("save");
+        let loaded = net_profile_load_from(dir.path());
+        assert!(!loaded.gateway_enabled);
+        assert_eq!(loaded, profile);
     }
 
     // ---- WAN play addendum: additive upnp_enabled field ----
@@ -960,6 +1015,7 @@ mod tests {
         let profile = NetProfile {
             last_join_addr: String::new(),
             upnp_enabled: false,
+            gateway_enabled: true,
         };
         net_profile_save_to(dir.path(), &profile).expect("save");
         assert!(!net_profile_load_from(dir.path()).upnp_enabled);
@@ -998,6 +1054,7 @@ mod tests {
             &NetProfile {
                 last_join_addr: "127.0.0.1:27015".to_string(),
                 upnp_enabled: true,
+                gateway_enabled: true,
             },
         )
         .unwrap();

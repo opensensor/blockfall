@@ -63,8 +63,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use bevy::prelude::*;
 use bevy_renet::{RenetClient, RenetServer};
 
+use netplay_gateway::wire;
+
 use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
 
+use super::gateway::{self, format_code, GuestLookupState, HostRoomState, NetGateway};
 use super::lockstep::{
     local_side, net_leave_to_title, NetOut, RenetClientOut, RenetServerOut, NET_OVERLAY_ZINDEX,
 };
@@ -159,6 +162,102 @@ pub fn parse_join_addr(text: &str) -> Option<SocketAddr> {
         return None;
     }
     Some(SocketAddr::new(IpAddr::V4(ip), port))
+}
+
+// ---------------------------------------------------------------------------
+// Pure room-code entry (gateway-plan.md G3) — same keyboard-only shape as
+// the IP entry above, over the gateway's confusion-free alphabet
+// ---------------------------------------------------------------------------
+
+/// A room code is exactly this many characters (`*R`/`*G` codes on the wire).
+pub const ROOM_CODE_LEN: usize = 5;
+
+/// The join-by-code charset as a display string: the wire crate's
+/// confusion-free alphabet (no `I L O 0 1`), uppercase-normalized.
+pub const ROOM_CODE_ALPHABET: &str = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+/// `true` when `c` is a member of the room-code alphabet — lowercase
+/// keystrokes are members too (they normalize to uppercase on push).
+#[must_use]
+pub fn code_char(c: char) -> bool {
+    c.is_ascii() && wire::is_code_byte(c as u8)
+}
+
+/// Append the normalized `c` to `text` while it is in the alphabet and the
+/// entry has room. A 6th character is rejected. Returns whether it changed.
+pub fn code_push(text: &mut String, c: char) -> bool {
+    if text.len() >= ROOM_CODE_LEN || !code_char(c) {
+        return false;
+    }
+    text.push(c.to_ascii_uppercase());
+    true
+}
+
+/// Map a freshly pressed key to its room-code character. Letters and digits
+/// `2..=9` (main row + numpad) map; everything else — including `I L O 0 1`,
+/// which are outside the confusion-free alphabet — maps to `None`.
+#[must_use]
+pub fn key_to_code_char(key: KeyCode) -> Option<char> {
+    let base = match key {
+        KeyCode::KeyA => 'A',
+        KeyCode::KeyB => 'B',
+        KeyCode::KeyC => 'C',
+        KeyCode::KeyD => 'D',
+        KeyCode::KeyE => 'E',
+        KeyCode::KeyF => 'F',
+        KeyCode::KeyG => 'G',
+        KeyCode::KeyH => 'H',
+        KeyCode::KeyI => 'I',
+        KeyCode::KeyJ => 'J',
+        KeyCode::KeyK => 'K',
+        KeyCode::KeyL => 'L',
+        KeyCode::KeyM => 'M',
+        KeyCode::KeyN => 'N',
+        KeyCode::KeyO => 'O',
+        KeyCode::KeyP => 'P',
+        KeyCode::KeyQ => 'Q',
+        KeyCode::KeyR => 'R',
+        KeyCode::KeyS => 'S',
+        KeyCode::KeyT => 'T',
+        KeyCode::KeyU => 'U',
+        KeyCode::KeyV => 'V',
+        KeyCode::KeyW => 'W',
+        KeyCode::KeyX => 'X',
+        KeyCode::KeyY => 'Y',
+        KeyCode::KeyZ => 'Z',
+        KeyCode::Digit2 | KeyCode::Numpad2 => '2',
+        KeyCode::Digit3 | KeyCode::Numpad3 => '3',
+        KeyCode::Digit4 | KeyCode::Numpad4 => '4',
+        KeyCode::Digit5 | KeyCode::Numpad5 => '5',
+        KeyCode::Digit6 | KeyCode::Numpad6 => '6',
+        KeyCode::Digit7 | KeyCode::Numpad7 => '7',
+        KeyCode::Digit8 | KeyCode::Numpad8 => '8',
+        KeyCode::Digit9 | KeyCode::Numpad9 => '9',
+        _ => return None,
+    };
+    if code_char(base) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// Parse a submitted entry into a [`RoomCode`]: exactly [`ROOM_CODE_LEN`]
+/// alphabet characters (case-normalized), anything else rejected.
+#[must_use]
+pub fn parse_room_code(text: &str) -> Option<wire::RoomCode> {
+    let bytes = text.as_bytes();
+    if bytes.len() != ROOM_CODE_LEN {
+        return None;
+    }
+    let mut code = [0u8; ROOM_CODE_LEN];
+    for (dst, &src) in code.iter_mut().zip(bytes) {
+        if !wire::is_code_byte(src) {
+            return None;
+        }
+        *dst = src.to_ascii_uppercase();
+    }
+    Some(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +386,76 @@ pub fn upnp_status_text(state: &UpnpState, enabled: bool, hosting: bool, port: u
 }
 
 // ---------------------------------------------------------------------------
+// Gateway status lines (gateway-plan.md G3)
+// ---------------------------------------------------------------------------
+
+/// One-line copy for a [`GuestLookupState`] (Join screen, Code mode). In and
+/// out of flight the line narrates the lookup; `Idle`/`Found` return empty
+/// so the session status (connecting/handshaking/…) shows instead — the
+/// `*F` handoff must not blank out the existing FSM's copy. The shipped
+/// strings: `resolving…` / `joining room…` / `no such room` / `match full` /
+/// `gateway full — retry later` / `gateway offline — check connection or
+/// join by IP`.
+#[must_use]
+pub fn lookup_status_text(state: &GuestLookupState) -> String {
+    match state {
+        GuestLookupState::Idle | GuestLookupState::Found { .. } => String::new(),
+        GuestLookupState::Resolving(_) => "resolving…".to_string(),
+        GuestLookupState::LookingUp(_) => "joining room…".to_string(),
+        GuestLookupState::NotFound(_) => "no such room".to_string(),
+        GuestLookupState::Busy(_) => "match full".to_string(),
+        GuestLookupState::SlotExhausted(_) => "gateway full — retry later".to_string(),
+        GuestLookupState::Timeout | GuestLookupState::GatewayUnreachable(_) => {
+            "gateway offline — check connection or join by IP".to_string()
+        }
+    }
+}
+
+/// The Host screen's single extra line (gateway-plan.md G3): the live room
+/// code wins (`Room XXXXX — share with a friend`), an in-flight registration
+/// shows the same code while announcing, and the offline fallback names the
+/// reason. Empty when the gateway is disabled or idle — the line never
+/// competes with LAN play, and the UPnP line renders independently below
+/// (design decision recorded in the plan: room code > offline reason on
+/// this label; the UPnP line stays its own line).
+#[must_use]
+pub fn host_room_text(state: &HostRoomState, gateway_enabled: bool) -> String {
+    if !gateway_enabled {
+        return String::new();
+    }
+    match state {
+        HostRoomState::Idle => String::new(),
+        HostRoomState::Advertising(code) => {
+            format!("Room {} — announcing…", format_code(code))
+        }
+        HostRoomState::Announced(code) => {
+            format!("Room {} — share with a friend", format_code(code))
+        }
+        HostRoomState::Offline(reason) => format!("gateway offline — {reason}"),
+    }
+}
+
+/// The Join screen status line: in Code mode a live/terminal lookup owns
+/// the line; otherwise (IP mode, or Code with no lookup in flight) it is the
+/// existing role-aware session status.
+#[must_use]
+pub fn join_status_text(
+    mode: JoinMode,
+    gateway: Option<&NetGateway>,
+    status: &NetStatus,
+) -> String {
+    if mode == JoinMode::Code {
+        if let Some(gateway) = gateway {
+            let line = lookup_status_text(&gateway.guest);
+            if !line.is_empty() {
+                return line;
+            }
+        }
+    }
+    status_text(NetRole::Guest, status)
+}
+
+// ---------------------------------------------------------------------------
 // Online flow stage machine — the Online sibling of `VersusFlow`
 // ---------------------------------------------------------------------------
 
@@ -313,6 +482,11 @@ pub struct OnlineFlow {
     pub stage: OnlineStage,
     /// Rule picked on the Host screen (reset when the flow closes).
     pub rule: AttackRule,
+    /// Which Join entry is active (G3). Set on entering `Join` from the
+    /// gateway availability: Code whenever the gateway is enabled and the
+    /// profile allows it, IP otherwise; the toggle flips it in-panel while
+    /// available.
+    pub join_mode: JoinMode,
 }
 
 impl OnlineFlow {
@@ -337,6 +511,62 @@ pub fn online_flow_back(stage: OnlineStage) -> OnlineStage {
 #[must_use]
 pub fn online_stage_requires_stop(stage: OnlineStage) -> bool {
     matches!(stage, OnlineStage::Host | OnlineStage::Join)
+}
+
+// ---------------------------------------------------------------------------
+// Join mode (G3): the Join panel offers Code (gateway room code) and IP
+// (manual address) — one toggle, two entries, one status line
+// ---------------------------------------------------------------------------
+
+/// How the player addresses the host from the Join panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JoinMode {
+    /// Gateway room code (the default whenever the gateway is available —
+    /// plan G3: "default Code when gateway enabled").
+    #[default]
+    Code,
+    /// Manual `IPv4:port` (the pre-G3 path, always available).
+    Ip,
+}
+
+/// The other mode (Code ⇄ IP toggle).
+#[must_use]
+pub fn next_join_mode(mode: JoinMode) -> JoinMode {
+    match mode {
+        JoinMode::Code => JoinMode::Ip,
+        JoinMode::Ip => JoinMode::Code,
+    }
+}
+
+/// Code mode exists only when the gateway is both enabled (endpoint known)
+/// *and* not explicitly disabled in the [`NetProfile`]; an unavailable Code
+/// mode hides the entry and renders the toggle inert ("looks disabled").
+#[must_use]
+pub fn join_mode_available(gateway_enabled: bool, profile_enabled: bool) -> bool {
+    gateway_enabled && profile_enabled
+}
+
+/// The mode the Join panel actually runs: `Code` when available, else IP.
+#[must_use]
+pub fn effective_join_mode(requested: JoinMode, available: bool) -> JoinMode {
+    if available {
+        requested
+    } else {
+        JoinMode::Ip
+    }
+}
+
+/// Toggle label copy: the disabled state reads as a hint (join by IP is all
+/// the gateway-off build can offer) rather than an interactive control.
+#[must_use]
+pub fn join_mode_label(mode: JoinMode, available: bool) -> String {
+    if !available {
+        return "gateway off — join by IP".to_string();
+    }
+    match mode {
+        JoinMode::Code => "Mode: Code".to_string(),
+        JoinMode::Ip => "Mode: IP".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +600,42 @@ impl JoinEntry {
     pub fn take_submit(&mut self) -> bool {
         std::mem::take(&mut self.submit)
     }
+}
+
+/// The room-code entry widget state (G3; keyboard-only, same discipline as
+/// [`JoinEntry`] — the two entries are independent, so switching modes
+/// preserves each one's text).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Resource)]
+pub struct CodeEntry {
+    /// Current text (normalized to uppercase, at most [`ROOM_CODE_LEN`]).
+    pub text: String,
+    /// Last submit was rejected (label hint).
+    pub invalid: bool,
+    /// Enter was pressed this frame; the exclusive click system performs the
+    /// actual gateway lookup (a normal system cannot take `&mut World`).
+    submit: bool,
+}
+
+impl CodeEntry {
+    /// Flag a submit request (called by the entry input system).
+    pub fn request_submit(&mut self) {
+        self.submit = true;
+    }
+
+    /// Take a pending submit request.
+    pub fn take_submit(&mut self) -> bool {
+        std::mem::take(&mut self.submit)
+    }
+}
+
+/// Whether Code mode is on offer: gateway enabled **and** the (persisted)
+/// profile toggle on. Absent resources read as "no gateway" / "default on".
+#[must_use]
+pub fn gateway_available(gateway: Option<&NetGateway>, profile: Option<&NetProfile>) -> bool {
+    join_mode_available(
+        gateway.is_some_and(|g| g.enabled),
+        profile.is_none_or(|p| p.gateway_enabled),
+    )
 }
 
 /// Cached connect hint shown on the Host screen (computed when entering the
@@ -416,6 +682,7 @@ struct ClickFlags {
     garbage: bool,
     race: bool,
     submit: bool,
+    mode: bool,
     error_back: bool,
     leave_yes: bool,
     leave_no: bool,
@@ -467,6 +734,10 @@ pub struct LeaveYesButton;
 /// Leave-confirm "Stay" button.
 #[derive(Component)]
 pub struct LeaveNoButton;
+/// Join panel mode toggle (G3): flips Code ⇄ IP while the gateway is
+/// available; inert (and labeled "gateway off") when it is not.
+#[derive(Component)]
+pub struct JoinModeButton;
 
 /// Dynamic connect-hint label on the Host panel.
 #[derive(Component)]
@@ -478,9 +749,18 @@ pub struct HostStatusText;
 /// addendum, net/upnp.rs).
 #[derive(Component)]
 pub struct UpnpStatusText;
-/// Dynamic entry echo on the Join panel.
+/// Dynamic gateway room-code line on the Host panel (G3): the share line
+/// when a room is live, the offline fallback otherwise, empty when the
+/// gateway is off.
+#[derive(Component)]
+pub struct RoomStatusText;
+/// Dynamic entry echo on the Join panel (renders the active entry: IP or
+/// room code, per [`OnlineFlow::join_mode`]).
 #[derive(Component)]
 pub struct JoinEntryText;
+/// Dynamic label inside the Join panel's mode toggle (G3).
+#[derive(Component)]
+pub struct JoinModeText;
 /// Dynamic status label on the Join panel.
 #[derive(Component)]
 pub struct JoinStatusText;
@@ -524,20 +804,36 @@ fn send_bye(world: &mut World) {
     }
 }
 
-/// Submit the Join entry: valid → remember the address in the [`NetProfile`]
-/// and `net_join`; invalid → flag the label.
-fn join_submit(world: &mut World) {
-    let text = world.resource::<JoinEntry>().text.clone();
-    let Some(addr) = parse_join_addr(&text) else {
-        world.resource_mut::<JoinEntry>().invalid = true;
-        return;
-    };
-    world.resource_mut::<JoinEntry>().invalid = false;
-    {
-        let mut profile = world.get_resource_or_insert_with(NetProfile::default);
-        profile.last_join_addr = addr.to_string();
+/// Submit the Join entry, per the active [`JoinMode`]. IP mode: valid
+/// `IPv4:port` → remember it in the [`NetProfile`] and `net_join`; invalid →
+/// flag the label. Code mode: a full 5-char room code hands off to
+/// [`gateway::join_room`] (the G2 driver resolves, sends `*G` and calls the
+/// same `net_join` on `*F` — the client FSM is never forked).
+fn join_submit(world: &mut World, mode: JoinMode) {
+    match mode {
+        JoinMode::Ip => {
+            let text = world.resource::<JoinEntry>().text.clone();
+            let Some(addr) = parse_join_addr(&text) else {
+                world.resource_mut::<JoinEntry>().invalid = true;
+                return;
+            };
+            world.resource_mut::<JoinEntry>().invalid = false;
+            {
+                let mut profile = world.get_resource_or_insert_with(NetProfile::default);
+                profile.last_join_addr = addr.to_string();
+            }
+            net_join(world, addr);
+        }
+        JoinMode::Code => {
+            let text = world.resource::<CodeEntry>().text.clone();
+            let Some(code) = parse_room_code(&text) else {
+                world.resource_mut::<CodeEntry>().invalid = true;
+                return;
+            };
+            world.resource_mut::<CodeEntry>().invalid = false;
+            gateway::join_room(world, code);
+        }
     }
-    net_join(world, addr);
 }
 
 /// Host rule pick on `Ready` (the right side is forced `Controller::Net` by
@@ -632,23 +928,103 @@ pub fn online_esc_system(world: &mut World) {
     }
 }
 
+/// Every key that can produce a room-code character (letters plus digits
+/// `2..=9` on the main row and the numpad); each press still passes the
+/// alphabet filter inside [`key_to_code_char`], so `I L O` stay inert.
+const CODE_KEYS: [KeyCode; 42] = [
+    KeyCode::KeyA,
+    KeyCode::KeyB,
+    KeyCode::KeyC,
+    KeyCode::KeyD,
+    KeyCode::KeyE,
+    KeyCode::KeyF,
+    KeyCode::KeyG,
+    KeyCode::KeyH,
+    KeyCode::KeyI,
+    KeyCode::KeyJ,
+    KeyCode::KeyK,
+    KeyCode::KeyL,
+    KeyCode::KeyM,
+    KeyCode::KeyN,
+    KeyCode::KeyO,
+    KeyCode::KeyP,
+    KeyCode::KeyQ,
+    KeyCode::KeyR,
+    KeyCode::KeyS,
+    KeyCode::KeyT,
+    KeyCode::KeyU,
+    KeyCode::KeyV,
+    KeyCode::KeyW,
+    KeyCode::KeyX,
+    KeyCode::KeyY,
+    KeyCode::KeyZ,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+    KeyCode::Numpad2,
+    KeyCode::Numpad3,
+    KeyCode::Numpad4,
+    KeyCode::Numpad5,
+    KeyCode::Numpad6,
+    KeyCode::Numpad7,
+    KeyCode::Numpad8,
+    KeyCode::Numpad9,
+];
+
 /// Character input for the Join entry: charset keys append, Backspace edits,
-/// Enter flags a submit (the exclusive click system performs `net_join`).
+/// Enter flags a submit (the exclusive click system performs the action).
+/// Code mode (G3) drives [`CodeEntry`] through the room-code alphabet;
+/// otherwise the IP entry keeps its digit/dot/colon behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn online_entry_input_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     capture: Res<RebindingCapture>,
     state: Res<AppState>,
     flow: Res<OnlineFlow>,
+    gateway: Option<Res<NetGateway>>,
+    profile: Option<Res<NetProfile>>,
     mut entry: ResMut<JoinEntry>,
+    mut code: ResMut<CodeEntry>,
 ) {
     if capture.capturing
         || flow.stage != OnlineStage::Join
         || *state != AppState::Title
         || entry.submit
+        || code.submit
     {
         return;
     }
     let Some(keys) = keys else { return };
+    let mode = effective_join_mode(
+        flow.join_mode,
+        gateway_available(gateway.as_deref(), profile.as_deref()),
+    );
+    if mode == JoinMode::Code {
+        if keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete) {
+            if entry_backspace(&mut code.text) {
+                code.invalid = false;
+            }
+            return;
+        }
+        for &key in &CODE_KEYS {
+            if keys.just_pressed(key) {
+                if let Some(c) = key_to_code_char(key) {
+                    if code_push(&mut code.text, c) {
+                        code.invalid = false;
+                    }
+                }
+            }
+        }
+        if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
+            code.request_submit();
+        }
+        return;
+    }
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     if keys.just_pressed(KeyCode::Backspace) || keys.just_pressed(KeyCode::Delete) {
         if entry_backspace(&mut entry.text) {
@@ -750,6 +1126,7 @@ pub fn online_click_system(world: &mut World) {
             Has<OnlineRuleGarbageButton>,
             Has<OnlineRuleRaceButton>,
             Has<OnlineSubmitButton>,
+            Has<JoinModeButton>,
             Has<NetErrorBackButton>,
             Has<LeaveYesButton>,
             Has<LeaveNoButton>,
@@ -767,6 +1144,7 @@ pub fn online_click_system(world: &mut World) {
             garbage,
             race,
             submit,
+            mode,
             error_back,
             yes,
             no,
@@ -785,6 +1163,7 @@ pub fn online_click_system(world: &mut World) {
                 || garbage
                 || race
                 || submit
+                || mode
                 || error_back
                 || yes
                 || no
@@ -800,6 +1179,7 @@ pub fn online_click_system(world: &mut World) {
                     garbage,
                     race,
                     submit,
+                    mode,
                     error_back,
                     leave_yes: yes,
                     leave_no: no,
@@ -813,9 +1193,24 @@ pub fn online_click_system(world: &mut World) {
         latch.pressed = currently_pressed;
     }
 
-    // Enter-key submit rides the same frame as the clicks.
+    // Enter-key submits ride the same frame as the clicks — the entry that
+    // flagged one belongs to the effective mode (Code or IP).
+    let current_mode = |w: &World| {
+        effective_join_mode(
+            w.resource::<OnlineFlow>().join_mode,
+            gateway_available(
+                w.get_resource::<NetGateway>(),
+                w.get_resource::<NetProfile>(),
+            ),
+        )
+    };
     if world.resource_mut::<JoinEntry>().take_submit() {
-        join_submit(world);
+        let mode = current_mode(world);
+        join_submit(world, mode);
+    }
+    if world.resource_mut::<CodeEntry>().take_submit() {
+        let mode = current_mode(world);
+        join_submit(world, mode);
     }
 
     if fresh.is_empty() {
@@ -842,6 +1237,27 @@ pub fn online_click_system(world: &mut World) {
             world.resource_mut::<HostHint>().share = format_host_hint(local_ipv4(), port);
         } else if flags.join {
             world.resource_mut::<OnlineFlow>().stage = OnlineStage::Join;
+            // G3: entering Join arms the mode — Code by default whenever the
+            // gateway is enabled and the profile allows it, IP otherwise.
+            let available = gateway_available(
+                world.get_resource::<NetGateway>(),
+                world.get_resource::<NetProfile>(),
+            );
+            world.resource_mut::<OnlineFlow>().join_mode =
+                effective_join_mode(JoinMode::Code, available);
+            // A fresh panel starts clean: empty code, no stale terminal
+            // lookup line lingering from a previous attempt.
+            {
+                let mut code = world.resource_mut::<CodeEntry>();
+                code.text.clear();
+                code.invalid = false;
+                code.submit = false;
+            }
+            if let Some(mut gateway) = world.get_resource_mut::<NetGateway>() {
+                if gateway.enabled {
+                    gateway.guest = GuestLookupState::Idle;
+                }
+            }
             let prefill = world
                 .get_resource::<NetProfile>()
                 .map(|profile| profile.last_join_addr.clone())
@@ -852,6 +1268,19 @@ pub fn online_click_system(world: &mut World) {
             }
             entry.invalid = false;
             entry.submit = false;
+        } else if flags.mode {
+            // Code ⇄ IP toggle — inert (visibly "gateway off") when Code
+            // mode is unavailable.
+            if gateway_available(
+                world.get_resource::<NetGateway>(),
+                world.get_resource::<NetProfile>(),
+            ) {
+                let next = next_join_mode(world.resource::<OnlineFlow>().join_mode);
+                world.resource_mut::<OnlineFlow>().join_mode = next;
+                // Reject hints belong to the mode that produced them.
+                world.resource_mut::<CodeEntry>().invalid = false;
+                world.resource_mut::<JoinEntry>().invalid = false;
+            }
         } else if flags.back {
             let stage = world.resource::<OnlineFlow>().stage;
             world.resource_mut::<OnlineFlow>().stage = online_flow_back(stage);
@@ -868,7 +1297,8 @@ pub fn online_click_system(world: &mut World) {
                 },
             );
         } else if flags.submit {
-            join_submit(world);
+            let mode = current_mode(world);
+            join_submit(world, mode);
         } else if flags.error_back {
             error_back_to_title(world);
         } else if flags.leave_yes {
@@ -920,19 +1350,25 @@ pub fn online_session_watch_system(
 
 /// Rewrite the dynamic online labels.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn sync_online_labels(
     session: Option<Res<NetSession>>,
     hint: Res<HostHint>,
     entry: Res<JoinEntry>,
+    code: Res<CodeEntry>,
     overlay: Res<NetOverlay>,
     upnp: Option<Res<UpnpState>>,
     profile: Option<Res<NetProfile>>,
+    flow: Res<OnlineFlow>,
+    gateway: Option<Res<NetGateway>>,
     mut labels: Query<
         (
             Has<HostHintText>,
             Has<HostStatusText>,
             Has<UpnpStatusText>,
+            Has<RoomStatusText>,
             Has<JoinEntryText>,
+            Has<JoinModeText>,
             Has<JoinStatusText>,
             Has<NetErrorText>,
             &mut Text,
@@ -941,7 +1377,9 @@ pub fn sync_online_labels(
             With<HostHintText>,
             With<HostStatusText>,
             With<UpnpStatusText>,
+            With<RoomStatusText>,
             With<JoinEntryText>,
+            With<JoinModeText>,
             With<JoinStatusText>,
             With<NetErrorText>,
         )>,
@@ -971,15 +1409,43 @@ pub fn sync_online_labels(
             .is_some_and(|s| mapping_held(&s.status, s.role));
         upnp_status_text(state, enabled, hosting, port)
     });
-    let echo = if entry.invalid {
+    // G3: one line per gateway leg — the Host share line wins the room code
+    // (offline reason is the fallback), and the Join echo renders whichever
+    // entry the mode has active.
+    let available = gateway_available(gateway.as_deref(), profile.as_deref());
+    let mode = effective_join_mode(flow.join_mode, available);
+    let room_line = gateway
+        .as_deref()
+        .map_or_else(String::new, |g| host_room_text(&g.host, g.enabled));
+    let ip_echo = if entry.invalid {
         format!("{}▌  want IPv4 address:port", entry.text)
     } else {
         format!("{}▌", entry.text)
     };
-    let join_line = status_text(NetRole::Guest, &status);
+    let code_echo = if code.invalid {
+        format!("{}▌  want 5 room-code chars", code.text)
+    } else {
+        format!("{}▌", code.text)
+    };
+    let echo = if mode == JoinMode::Code {
+        code_echo
+    } else {
+        ip_echo
+    };
+    let mode_line = join_mode_label(mode, available);
+    let join_line = join_status_text(mode, gateway.as_deref(), &status);
     let headline = overlay.text.clone().unwrap_or_default();
-    for (is_hint, is_host, is_upnp, is_join_entry, is_join_status, is_error, mut text) in
-        labels.iter_mut()
+    for (
+        is_hint,
+        is_host,
+        is_upnp,
+        is_room,
+        is_join_entry,
+        is_mode,
+        is_join_status,
+        is_error,
+        mut text,
+    ) in labels.iter_mut()
     {
         let wanted = if is_hint {
             &hint_line
@@ -987,8 +1453,12 @@ pub fn sync_online_labels(
             &host_line
         } else if is_upnp {
             &upnp_line
+        } else if is_room {
+            &room_line
         } else if is_join_entry {
             &echo
+        } else if is_mode {
+            &mode_line
         } else if is_join_status {
             &join_line
         } else if is_error {
@@ -1075,11 +1545,14 @@ pub fn sync_net_winner_gate(
 // Startup UI construction
 // ---------------------------------------------------------------------------
 
-fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor) {
+fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor, Pickable) {
     (
         Text::new(text),
         TextFont::from_font_size(size),
         TextColor::WHITE,
+        // Labels never own a click — the button underneath them does
+        // (same standardized mechanism as `screens_menu::label_node`).
+        Pickable::IGNORE,
     )
 }
 
@@ -1102,6 +1575,28 @@ fn online_button(parent: &mut ChildSpawnerCommands, text: &str, marker: impl Bun
         });
 }
 
+/// The Join panel's Code ⇄ IP toggle with its dynamic label (G3). Built
+/// locally (the panel's label is rewritten every frame) but with exactly
+/// the picking shape of [`online_button`].
+fn join_mode_button(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn((
+            Button,
+            JoinModeButton,
+            BackgroundColor(BUTTON_BG),
+            Node {
+                width: Val::Px(260.0),
+                height: Val::Px(36.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_children(|button| {
+            button.spawn((JoinModeText, label_node("Mode: Code".to_string(), 18.0)));
+        });
+}
+
 fn online_root(
     commands: &mut Commands,
     marker: impl Bundle,
@@ -1112,6 +1607,11 @@ fn online_root(
         .spawn((
             marker,
             Visibility::Hidden,
+            // Full-screen containers are inert — same rule as
+            // `screens_menu::add_menu_root` (clicks resolve to visible
+            // buttons only; hidden UI is additionally excluded by
+            // `sync_hidden_ui_unpickable`).
+            Pickable::IGNORE,
             BackgroundColor(background),
             Node {
                 display: Display::Flex,
@@ -1151,6 +1651,7 @@ fn build_online_ui(mut commands: Commands) {
             root.spawn(label_node("HOST".to_string(), 40.0));
             root.spawn((HostHintText, label_node(String::new(), 22.0)));
             root.spawn((HostStatusText, label_node(String::new(), 22.0)));
+            root.spawn((RoomStatusText, label_node(String::new(), 20.0)));
             root.spawn((UpnpStatusText, label_node(String::new(), 18.0)));
             root.spawn(label_node(
                 "pick a rule when your challenger joins — U toggles router mapping".to_string(),
@@ -1168,6 +1669,7 @@ fn build_online_ui(mut commands: Commands) {
         PANEL_BG,
         |root| {
             root.spawn(label_node("JOIN".to_string(), 40.0));
+            join_mode_button(root);
             root.spawn((JoinEntryText, label_node(String::new(), 26.0)));
             root.spawn((JoinStatusText, label_node(String::new(), 20.0)));
             online_button(root, "Join match", OnlineSubmitButton);
@@ -1206,6 +1708,31 @@ fn build_online_ui(mut commands: Commands) {
 /// headless apps. Systems self-chain input/clicks → watch → visibility.
 pub struct OnlineUiPlugin;
 
+/// Production gateway arming (G3): the user-facing default is **on**. The
+/// endpoint comes from `TETRIS_GATEWAY` via [`gateway::parse_gateway_env`]
+/// (unset → [`gateway::DEFAULT_GATEWAY_ENDPOINT`], explicitly empty → off),
+/// and [`NetProfile::gateway_enabled`] is the persisted kill switch (a
+/// saved `false` wins even over an explicit endpoint).
+///
+/// **Never mounted in test builds**: the headless suites' safety rests on
+/// G2's policy (`TETRIS_GATEWAY` unset ⇒ disabled, see the gateway module
+/// docs), and tests arm the gateway explicitly via
+/// [`NetGateway::test_with_endpoint`]. Mounting this under `cfg(test)` would
+/// make the existing `Listening` tests send live `*R` UDP to production.
+#[cfg(not(test))]
+fn gateway_compose_system(
+    profile: Option<Res<NetProfile>>,
+    mut gateway: Option<ResMut<NetGateway>>,
+) {
+    let Some(gateway) = gateway.as_mut() else {
+        return;
+    };
+    let endpoint = gateway::parse_gateway_env(std::env::var(gateway::GATEWAY_ENV).ok().as_deref());
+    let profile_on = profile.is_none_or(|profile| profile.gateway_enabled);
+    gateway.enabled = profile_on && endpoint.is_some();
+    gateway.endpoint = endpoint.unwrap_or_default();
+}
+
 impl Plugin for OnlineUiPlugin {
     fn build(&self, app: &mut App) {
         if app.world().contains_resource::<OnlineUiMounted>() {
@@ -1214,11 +1741,16 @@ impl Plugin for OnlineUiPlugin {
         app.insert_resource(OnlineUiMounted)
             .init_resource::<OnlineFlow>()
             .init_resource::<JoinEntry>()
+            .init_resource::<CodeEntry>()
             .init_resource::<HostHint>()
             .init_resource::<NetOverlay>()
             .init_resource::<LeaveConfirm>()
             .init_resource::<PressedLatch>()
             .init_resource::<NetProfile>();
+        // The always-on gateway default is a product decision (G2 module
+        // docs); it lands here, compiled out of test binaries.
+        #[cfg(not(test))]
+        app.add_systems(Startup, gateway_compose_system);
         // WAN play addendum: the UPnP driver lives with the Host screen that
         // renders its status line and owns the `U` toggle; mounting here
         // (not in NetPlugin) keeps `session.rs` untouched and lets tests
@@ -1360,6 +1892,215 @@ mod tests {
         ] {
             assert_eq!(parse_join_addr(bad), None, "{bad:?} must be rejected");
         }
+    }
+
+    // ---- G3: room-code entry (join-by-code) — pure widget logic ----
+
+    #[test]
+    fn code_charset_accepts_only_the_gateway_alphabet() {
+        assert_eq!(
+            ROOM_CODE_ALPHABET, "ABCDEFGHJKMNPQRSTUVWXYZ23456789",
+            "alphabet is the wire crate's confusion-free set"
+        );
+        for c in ROOM_CODE_ALPHABET.chars() {
+            assert!(code_char(c), "{c} must be accepted");
+        }
+        for c in ROOM_CODE_ALPHABET.to_lowercase().chars() {
+            assert!(code_char(c), "lowercase {c} is a member (normalizes)");
+        }
+        for c in "ILO01-. _:+!?".chars() {
+            assert!(!code_char(c), "{c} must be rejected");
+        }
+    }
+
+    #[test]
+    fn code_push_normalizes_and_rejects_the_sixth_char() {
+        let mut text = String::new();
+        assert!(code_push(&mut text, 'a'), "lowercase normalizes on push");
+        assert_eq!(text, "A");
+        for c in "bcd".chars() {
+            assert!(code_push(&mut text, c));
+        }
+        assert_eq!(text, "ABCD");
+        assert!(
+            !code_push(&mut text, 'I'),
+            "ambiguous glyph outside the alphabet is a no-op"
+        );
+        assert_eq!(text, "ABCD");
+        assert!(code_push(&mut text, 'E'));
+        assert_eq!(text, "ABCDE");
+        assert!(!code_push(&mut text, 'F'), "6th char is rejected");
+        assert_eq!(text, "ABCDE");
+        assert!(entry_backspace(&mut text));
+        assert_eq!(text, "ABCD");
+        assert!(!entry_backspace(&mut String::new()));
+    }
+
+    #[test]
+    fn key_to_code_char_maps_only_alphabet_keys() {
+        use KeyCode::*;
+        assert_eq!(key_to_code_char(KeyA), Some('A'));
+        assert_eq!(key_to_code_char(KeyZ), Some('Z'));
+        assert_eq!(key_to_code_char(KeyH), Some('H'));
+        assert_eq!(key_to_code_char(KeyI), None, "I is outside the alphabet");
+        assert_eq!(key_to_code_char(KeyL), None);
+        assert_eq!(key_to_code_char(KeyO), None);
+        assert_eq!(key_to_code_char(Digit2), Some('2'));
+        assert_eq!(key_to_code_char(Digit9), Some('9'));
+        assert_eq!(key_to_code_char(Numpad2), Some('2'));
+        assert_eq!(key_to_code_char(Numpad9), Some('9'));
+        assert_eq!(key_to_code_char(Digit0), None);
+        assert_eq!(key_to_code_char(Digit1), None);
+        assert_eq!(key_to_code_char(Period), None);
+        assert_eq!(key_to_code_char(Space), None);
+    }
+
+    #[test]
+    fn parse_room_code_accepts_exactly_five_alphabet_chars() {
+        assert_eq!(parse_room_code("ABCDE"), Some(*b"ABCDE"));
+        assert_eq!(
+            parse_room_code("abcde"),
+            Some(*b"ABCDE"),
+            "lowercase normalizes"
+        );
+        assert_eq!(parse_room_code("AB234"), Some(*b"AB234"));
+        assert_eq!(parse_room_code("ABCD"), None, "4 chars");
+        assert_eq!(parse_room_code("ABCDEF"), None, "6 chars");
+        assert_eq!(parse_room_code("ABCDI"), None, "I is not a member");
+        assert_eq!(parse_room_code("ABCD0"), None, "0 is not a member");
+        assert_eq!(parse_room_code(""), None);
+    }
+
+    #[test]
+    fn code_entry_submit_is_a_one_shot_latch() {
+        let mut entry = CodeEntry::default();
+        assert!(!entry.take_submit());
+        entry.request_submit();
+        assert!(entry.take_submit());
+        assert!(!entry.take_submit(), "submit is consumed once");
+    }
+
+    // ---- G3: status copy (Host share line, guest lookup lines) ----
+
+    #[test]
+    fn lookup_status_text_exact_copy() {
+        use GuestLookupState as G;
+        assert_eq!(lookup_status_text(&G::Idle), "");
+        assert_eq!(lookup_status_text(&G::Resolving(*b"ABCDE")), "resolving…");
+        assert_eq!(
+            lookup_status_text(&G::LookingUp(*b"ABCDE")),
+            "joining room…"
+        );
+        assert_eq!(lookup_status_text(&G::NotFound(*b"ABCDE")), "no such room");
+        assert_eq!(lookup_status_text(&G::Busy(*b"ABCDE")), "match full");
+        assert_eq!(
+            lookup_status_text(&G::SlotExhausted(*b"ABCDE")),
+            "gateway full — retry later"
+        );
+        assert_eq!(
+            lookup_status_text(&G::Timeout),
+            "gateway offline — check connection or join by IP"
+        );
+        assert_eq!(
+            lookup_status_text(&G::GatewayUnreachable("dns died".into())),
+            "gateway offline — check connection or join by IP"
+        );
+        assert_eq!(
+            lookup_status_text(&G::Found {
+                code: *b"ABCDE",
+                addr: "1.2.3.4:5".parse().expect("addr"),
+            }),
+            "",
+            "Found hands the line over to the session status"
+        );
+    }
+
+    #[test]
+    fn host_room_text_ships_the_share_line() {
+        assert_eq!(
+            host_room_text(&HostRoomState::Announced(*b"ABCDE"), true),
+            "Room ABCDE — share with a friend"
+        );
+        let announcing = host_room_text(&HostRoomState::Advertising(*b"ABCDE"), true);
+        assert!(announcing.contains("ABCDE"), "{announcing}");
+        assert_eq!(
+            host_room_text(&HostRoomState::Offline("no route".into()), true),
+            "gateway offline — no route"
+        );
+        assert_eq!(host_room_text(&HostRoomState::Idle, true), "");
+        assert_eq!(
+            host_room_text(&HostRoomState::Announced(*b"ABCDE"), false),
+            "",
+            "a disabled gateway never shows a room line"
+        );
+    }
+
+    // ---- G3: join mode (Code ⇄ IP) gating ----
+
+    #[test]
+    fn join_mode_defaults_to_code() {
+        assert_eq!(JoinMode::default(), JoinMode::Code);
+        assert_eq!(next_join_mode(JoinMode::Code), JoinMode::Ip);
+        assert_eq!(next_join_mode(JoinMode::Ip), JoinMode::Code);
+    }
+
+    #[test]
+    fn code_mode_needs_an_enabled_gateway_and_profile() {
+        assert!(join_mode_available(true, true));
+        assert!(
+            !join_mode_available(false, true),
+            "gateway off hides Code mode"
+        );
+        assert!(
+            !join_mode_available(true, false),
+            "explicitly disabled profile keeps Code away"
+        );
+        assert!(!join_mode_available(false, false));
+        assert_eq!(
+            effective_join_mode(JoinMode::Code, false),
+            JoinMode::Ip,
+            "unavailable Code falls back to IP"
+        );
+        assert_eq!(effective_join_mode(JoinMode::Code, true), JoinMode::Code);
+    }
+
+    #[test]
+    fn join_mode_label_exact_copy() {
+        assert_eq!(join_mode_label(JoinMode::Code, true), "Mode: Code");
+        assert_eq!(join_mode_label(JoinMode::Ip, true), "Mode: IP");
+        assert_eq!(
+            join_mode_label(JoinMode::Ip, false),
+            "gateway off — join by IP",
+            "the toggle looks disabled when the gateway is off"
+        );
+    }
+
+    #[test]
+    fn join_status_text_prefers_lookup_copy_in_code_mode() {
+        use GuestLookupState as G;
+        let mut gw = NetGateway::disabled();
+        gw.enabled = true;
+        gw.guest = G::LookingUp(*b"ABCDE");
+        assert_eq!(
+            join_status_text(JoinMode::Code, Some(&gw), &NetStatus::Idle),
+            "joining room…"
+        );
+        gw.guest = G::Idle;
+        assert_eq!(
+            join_status_text(JoinMode::Code, Some(&gw), &NetStatus::Connecting),
+            "connecting…",
+            "no lookup in flight → the session line takes over"
+        );
+        assert_eq!(
+            join_status_text(JoinMode::Ip, Some(&gw), &NetStatus::Listening),
+            status_text(NetRole::Guest, &NetStatus::Listening),
+            "IP mode never shows lookup copy"
+        );
+        assert_eq!(
+            join_status_text(JoinMode::Code, None, &NetStatus::Idle),
+            "",
+            "no gateway resource → session line only"
+        );
     }
 
     // ---- status/overlay copy ----
@@ -1523,6 +2264,12 @@ mod tests {
             crate::input::InputPlugin,
             MenuScreensPlugin,
         ));
+        // Production `main.rs` initializes `Settings` ahead of the plugin
+        // tree; G3 flow tests poll across real seconds, which finally lets
+        // the fixed-step `gameplay_input_system` run in this tree, so the
+        // resource it reads has to be present here too (same convention as
+        // the N6 harness `peer_app`).
+        app.init_resource::<crate::state::Settings>();
         // `MenuScreensPlugin` mounts this plugin once the screens wiring is
         // committed; until then (and in minimal trees) mount it here. The
         // resource check keeps us clear of Bevy's App-level duplicate-plugin
@@ -1655,7 +2402,6 @@ mod tests {
             .get::<crate::screens_menu::VersusOverRoot>(e)
             .is_some()
     }
-
     #[test]
     fn mode_panel_shows_and_back_closes() {
         let mut app = online_app();
@@ -2310,5 +3056,436 @@ mod tests {
             UpnpState::Off,
             "the net_stop teardown edge resets UPnP"
         );
+    }
+
+    // ---- G3: room-code flow (headless App over the real in-process relay) --
+    //
+    // Same fixture the G2 suite uses: the REAL `netplay_gateway::Gateway`
+    // on loopback UDP (legs on distinct loopback IPs per the relay's
+    // per-IP leg model). The Listening edge is set through the session
+    // resource directly (mirroring the UPnP host-screen tests): `net_host`'s
+    // fixed default port could land on `BindFailed` on the dev box, which
+    // the `Listening | BindFailed` tolerance convention would accept — yet
+    // the gateway must actually register for the share line to exist.
+
+    use crate::core_bridge::net::gateway::testutil::{
+        raw_socket, recv_frame, reg, spawn_real_gateway,
+    };
+    use netplay_gateway::wire::Frame;
+
+    fn online_app_with_gateway(endpoint: &str) -> App {
+        let mut app = online_app();
+        *app.world_mut().resource_mut::<NetGateway>() = NetGateway::test_with_endpoint(endpoint);
+        app
+    }
+
+    fn room_label(app: &mut App) -> String {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<&Text, With<RoomStatusText>>();
+        query.single(world).expect("room label").0.clone()
+    }
+
+    fn mode_label(app: &mut App) -> String {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<&Text, With<JoinModeText>>();
+        query.single(world).expect("mode label").0.clone()
+    }
+
+    fn join_status_label(app: &mut App) -> String {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<&Text, With<JoinStatusText>>();
+        query.single(world).expect("join status label").0.clone()
+    }
+
+    fn code_text(app: &App) -> String {
+        app.world().resource::<CodeEntry>().text.clone()
+    }
+
+    fn enter_join(app: &mut App) {
+        enter_online(app);
+        click_button(app, mode_root, |world, e| {
+            world.get::<OnlineJoinButton>(e).is_some()
+        });
+    }
+
+    fn type_code(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press_key(app, key_for_code_char(c));
+        }
+    }
+
+    fn key_for_code_char(c: char) -> KeyCode {
+        use KeyCode::*;
+        match c.to_ascii_uppercase() {
+            'A' => KeyA,
+            'B' => KeyB,
+            'C' => KeyC,
+            'D' => KeyD,
+            'E' => KeyE,
+            'F' => KeyF,
+            'G' => KeyG,
+            'H' => KeyH,
+            'I' => KeyI,
+            'J' => KeyJ,
+            'K' => KeyK,
+            'L' => KeyL,
+            'M' => KeyM,
+            'N' => KeyN,
+            'P' => KeyP,
+            'Q' => KeyQ,
+            'R' => KeyR,
+            'S' => KeyS,
+            'T' => KeyT,
+            'U' => KeyU,
+            'V' => KeyV,
+            'W' => KeyW,
+            'X' => KeyX,
+            'Y' => KeyY,
+            'Z' => KeyZ,
+            '2' => Digit2,
+            '3' => Digit3,
+            '4' => Digit4,
+            '5' => Digit5,
+            '6' => Digit6,
+            '7' => Digit7,
+            '8' => Digit8,
+            '9' => Digit9,
+            other => panic!("not a room-code character: {other}"),
+        }
+    }
+
+    #[test]
+    fn host_screen_shares_the_room_code_when_the_gateway_announces() {
+        let rg = spawn_real_gateway(4);
+        let mut app = online_app_with_gateway(&rg.ctrl.to_string());
+        enter_online(&mut app);
+        click_button(&mut app, mode_root, |world, e| {
+            world.get::<OnlineHostButton>(e).is_some()
+        });
+        assert_eq!(flow(&app).stage, OnlineStage::Host);
+        {
+            let mut session = app.world_mut().resource_mut::<NetSession>();
+            session.role = NetRole::Host;
+            session.status = NetStatus::Listening;
+            session.listen_addr = Some("0.0.0.0:27015".parse().expect("addr"));
+        }
+        let mut code = None;
+        for _ in 0..100 {
+            app.update();
+            if let HostRoomState::Announced(c) = app.world().resource::<NetGateway>().host {
+                code = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let code = code.expect("the real gateway must ack *R with *A");
+        assert_eq!(
+            room_label(&mut app),
+            format!("Room {} — share with a friend", format_code(&code)),
+            "the share line carries the announced room code"
+        );
+
+        // Esc un-listens (existing N5 edge) → the driver's teardown edge
+        // sends *D → the room is released for good (*G → *E on the relay).
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(status(&app), NetStatus::Idle, "Esc on Listening un-listens");
+        let guest = raw_socket("127.0.0.2");
+        let mut released = false;
+        for _ in 0..40 {
+            app.update();
+            guest
+                .send_to(&wire::encode(&Frame::Lookup { code }), rg.ctrl)
+                .expect("lookup send");
+            if matches!(recv_frame(&guest), Some(Frame::NotFound { .. })) {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(released, "teardown must release the room (*D ⇒ later *E)");
+        assert!(
+            matches!(
+                app.world().resource::<NetGateway>().host,
+                HostRoomState::Idle
+            ),
+            "room state returns to Idle"
+        );
+        assert!(room_label(&mut app).is_empty(), "the share line clears");
+    }
+
+    #[test]
+    fn join_defaults_to_code_mode_when_gateway_enabled() {
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        assert_eq!(
+            flow(&app).join_mode,
+            JoinMode::Code,
+            "Code is the default whenever the gateway is enabled"
+        );
+        assert_eq!(mode_label(&mut app), "Mode: Code");
+
+        // A profile that explicitly disabled the gateway gets IP, not Code.
+        let mut off = online_app_with_gateway("127.0.0.1:9");
+        off.world_mut().resource_mut::<NetProfile>().gateway_enabled = false;
+        enter_join(&mut off);
+        assert_eq!(flow(&off).join_mode, JoinMode::Ip);
+        assert_eq!(mode_label(&mut off), "gateway off — join by IP");
+    }
+
+    #[test]
+    fn gateway_disabled_hides_code_mode_and_holds_nothing() {
+        let mut app = online_app(); // env unset ⇒ disabled (G2 headless policy)
+        enter_join(&mut app);
+        assert_eq!(flow(&app).join_mode, JoinMode::Ip, "no gateway ⇒ IP only");
+        assert_eq!(mode_label(&mut app), "gateway off — join by IP");
+        click_button(&mut app, join_root, |world, e| {
+            world.get::<JoinModeButton>(e).is_some()
+        });
+        assert_eq!(flow(&app).join_mode, JoinMode::Ip, "the toggle is inert");
+        press_key(&mut app, KeyCode::KeyA);
+        assert!(
+            app.world().resource::<CodeEntry>().text.is_empty(),
+            "Code mode is unreachable, so keystrokes never reach it"
+        );
+        assert!(
+            app.world().resource::<JoinEntry>().text.is_empty(),
+            "letters are outside the IP charset too"
+        );
+        let gw = app.world().resource::<NetGateway>();
+        assert!(!gw.enabled);
+        assert_eq!(gw.host, HostRoomState::Idle, "no room was ever registered");
+        assert_eq!(gw.guest, GuestLookupState::Idle);
+    }
+
+    #[test]
+    fn join_mode_toggle_switches_code_and_ip() {
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        press_key(&mut app, KeyCode::KeyA);
+        press_key(&mut app, KeyCode::KeyB);
+        assert_eq!(code_text(&app), "AB");
+        assert_eq!(app.world().resource::<JoinEntry>().text, "");
+
+        click_button(&mut app, join_root, |world, e| {
+            world.get::<JoinModeButton>(e).is_some()
+        });
+        assert_eq!(flow(&app).join_mode, JoinMode::Ip);
+        assert_eq!(mode_label(&mut app), "Mode: IP");
+        press_key(&mut app, KeyCode::Digit5);
+        assert_eq!(
+            app.world().resource::<JoinEntry>().text,
+            "5",
+            "the IP entry owns keystrokes in IP mode"
+        );
+        assert_eq!(code_text(&app), "AB", "each entry keeps its own text");
+
+        click_button(&mut app, join_root, |world, e| {
+            world.get::<JoinModeButton>(e).is_some()
+        });
+        assert_eq!(flow(&app).join_mode, JoinMode::Code);
+        assert_eq!(code_text(&app), "AB");
+    }
+
+    #[test]
+    fn code_entry_types_backspaces_and_rejects_the_sixth_char() {
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        type_code(&mut app, "ABCDE");
+        assert_eq!(code_text(&app), "ABCDE");
+        press_key(&mut app, KeyCode::KeyF);
+        assert_eq!(code_text(&app), "ABCDE", "the 6th char is rejected");
+        press_key(&mut app, KeyCode::Backspace);
+        assert_eq!(code_text(&app), "ABCD");
+        press_key(&mut app, KeyCode::KeyI);
+        assert_eq!(code_text(&app), "ABCD", "I is outside the alphabet");
+        press_key(&mut app, KeyCode::KeyE);
+        assert_eq!(code_text(&app), "ABCDE");
+
+        press_key(&mut app, KeyCode::Enter);
+        let mut looking = false;
+        for _ in 0..10 {
+            if matches!(
+                app.world().resource::<NetGateway>().guest,
+                GuestLookupState::LookingUp(_)
+            ) {
+                looking = true;
+                break;
+            }
+            app.update();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(looking, "Enter starts the gateway lookup (*G)");
+        assert_eq!(join_status_label(&mut app), "joining room…");
+    }
+
+    #[test]
+    fn short_room_code_is_flagged_not_submitted() {
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        press_key(&mut app, KeyCode::KeyA);
+        press_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.world().resource::<CodeEntry>().invalid,
+            "a short code is flagged"
+        );
+        assert_eq!(
+            app.world().resource::<NetGateway>().guest,
+            GuestLookupState::Idle,
+            "nothing is dialed"
+        );
+        press_key(&mut app, KeyCode::KeyB);
+        assert!(
+            !app.world().resource::<CodeEntry>().invalid,
+            "editing clears the flag"
+        );
+    }
+
+    #[test]
+    fn lookup_states_surface_as_join_status_lines() {
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        let cases = [
+            (GuestLookupState::Resolving(*b"ABCDE"), "resolving…"),
+            (GuestLookupState::LookingUp(*b"ABCDE"), "joining room…"),
+            (GuestLookupState::NotFound(*b"ABCDE"), "no such room"),
+            (GuestLookupState::Busy(*b"ABCDE"), "match full"),
+            (
+                GuestLookupState::SlotExhausted(*b"ABCDE"),
+                "gateway full — retry later",
+            ),
+            (
+                GuestLookupState::Timeout,
+                "gateway offline — check connection or join by IP",
+            ),
+            (
+                GuestLookupState::GatewayUnreachable("dns died".into()),
+                "gateway offline — check connection or join by IP",
+            ),
+        ];
+        for (state, want) in cases {
+            app.world_mut().resource_mut::<NetGateway>().guest = state.clone();
+            app.update();
+            assert_eq!(join_status_label(&mut app), want, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_room_code_surfaces_no_such_room() {
+        let rg = spawn_real_gateway(4);
+        let mut app = online_app_with_gateway(&rg.ctrl.to_string());
+        enter_join(&mut app);
+        type_code(&mut app, "ZZZZZ");
+        press_key(&mut app, KeyCode::Enter);
+        let mut surfaced = false;
+        for _ in 0..100 {
+            app.update();
+            if join_status_label(&mut app) == "no such room" {
+                surfaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(surfaced, "the *E reply surfaces as \"no such room\"");
+    }
+
+    #[test]
+    fn room_code_found_feeds_the_existing_join_fsm() {
+        let rg = spawn_real_gateway(4);
+        let host = raw_socket("127.0.0.2");
+        host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
+        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
+
+        let mut app = online_app_with_gateway(&rg.ctrl.to_string());
+        enter_join(&mut app);
+        type_code(&mut app, "ABCDE");
+        press_key(&mut app, KeyCode::Enter);
+        let mut handed_off = false;
+        for _ in 0..100 {
+            app.update();
+            // The *F handoff drives the existing net_join (port-0 client
+            // bind; the Listening | BindFailed tolerance convention applies
+            // to binds, so accept the same pair here).
+            if matches!(
+                status(&app),
+                NetStatus::Connecting | NetStatus::BindFailed(_)
+            ) {
+                handed_off = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            handed_off,
+            "Found must hand off to net_join, got {:?}",
+            status(&app)
+        );
+        if status(&app) == NetStatus::Connecting {
+            assert_eq!(
+                join_status_label(&mut app),
+                "connecting…",
+                "after *F the existing session FSM owns the line"
+            );
+        }
+        assert_eq!(
+            app.world().resource::<NetProfile>().last_join_addr,
+            "",
+            "the code path never overwrites the remembered IP address"
+        );
+    }
+
+    #[test]
+    fn paired_room_surfaces_match_full() {
+        let rg = spawn_real_gateway(4);
+        let host = raw_socket("127.0.0.2");
+        host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
+        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
+        host.send_to(&wire::encode(&Frame::Lookup { code: *b"ABCDE" }), rg.ctrl)
+            .unwrap();
+        let vport = match recv_frame(&host) {
+            Some(Frame::Found { vport, .. }) => vport,
+            other => panic!("expected *F, got {other:?}"),
+        };
+        // Pin the guest slot with first data from a third loopback IP.
+        let guest = raw_socket("127.0.0.3");
+        guest
+            .send_to(b"\x00pin", SocketAddr::from(([127, 0, 0, 1], vport)))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        let mut app = online_app_with_gateway(&rg.ctrl.to_string());
+        enter_join(&mut app);
+        type_code(&mut app, "ABCDE");
+        press_key(&mut app, KeyCode::Enter);
+        let mut surfaced = false;
+        for _ in 0..100 {
+            app.update();
+            if join_status_label(&mut app) == "match full" {
+                surfaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(surfaced, "the *B reply surfaces as \"match full\"");
+    }
+
+    #[test]
+    fn gateway_silence_surfaces_the_offline_line() {
+        // No relay behind the endpoint: the *G goes unanswered and the G2
+        // lookup timeout surfaces the offline copy (one 3 s wait — the only
+        // real-time G3 flow test).
+        let mut app = online_app_with_gateway("127.0.0.1:9");
+        enter_join(&mut app);
+        type_code(&mut app, "ABCDE");
+        press_key(&mut app, KeyCode::Enter);
+        let mut offline = false;
+        for _ in 0..250 {
+            app.update();
+            if join_status_label(&mut app) == "gateway offline — check connection or join by IP" {
+                offline = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(offline, "a silent gateway must surface the offline line");
     }
 }

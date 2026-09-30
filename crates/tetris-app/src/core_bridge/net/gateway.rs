@@ -953,10 +953,6 @@ impl Plugin for NetGatewayPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netplay_gateway::room::{
-        Gateway as Relay, GatewayConfig as RelayConfig, PortAllocator, VClock,
-    };
-    use std::collections::HashMap;
     use std::net::Ipv4Addr;
 
     // ---- config parse (pure; no env, no threads) --------------------------
@@ -1423,170 +1419,9 @@ mod tests {
         assert!(new_code.iter().all(|&b| wire::is_code_byte(b)));
     }
 
-    // ---- real in-process Gateway over loopback UDP ------------------------
-
-    struct RealGateway {
-        ctrl: SocketAddr,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl Drop for RealGateway {
-        fn drop(&mut self) {
-            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-        }
-    }
-
-    /// Real allocator: one non-blocking `UdpSocket` per virtual data port on
-    /// loopback (mirrors the binary's `SockAllocator`) so the **data plane**
-    /// actually flows — needed to pin a guest for the `*B` path.
-    struct RealAlloc {
-        sockets: HashMap<u16, UdpSocket>,
-    }
-    impl RealAlloc {
-        fn new() -> Self {
-            Self {
-                sockets: HashMap::new(),
-            }
-        }
-        fn ports(&self) -> Vec<u16> {
-            self.sockets.keys().copied().collect()
-        }
-        fn socket(&self, port: u16) -> Option<&UdpSocket> {
-            self.sockets.get(&port)
-        }
-    }
-    impl PortAllocator for RealAlloc {
-        fn bind(&mut self, port: u16) -> Result<(), ()> {
-            let sock =
-                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).map_err(|_| ())?;
-            sock.set_nonblocking(true).map_err(|_| ())?;
-            self.sockets.insert(port, sock);
-            Ok(())
-        }
-        fn close(&mut self, port: u16) {
-            self.sockets.remove(&port);
-        }
-    }
-
-    fn free_loopback_port() -> u16 {
-        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe bind");
-        sock.local_addr().expect("probe addr").port()
-    }
-
-    /// Runs the real `netplay_gateway::Gateway` on a thread: a control socket
-    /// on `127.0.0.1:0` plus real per-room data sockets, drained both ways each
-    /// 10 ms (mirrors the binary's `serve`). Host/guest legs in tests bind
-    /// **distinct** loopback addresses — the relay distinguishes legs per-IP
-    /// (G1 note).
-    fn spawn_real_gateway(data_ports: u16) -> RealGateway {
-        let control = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("control bind");
-        control.set_nonblocking(true).unwrap();
-        let ctrl = control.local_addr().unwrap();
-        let control_port = ctrl.port();
-        let data_base = free_loopback_port();
-        let config = RelayConfig {
-            control_port,
-            data_port_start: data_base,
-            data_ports,
-            ..RelayConfig::default()
-        };
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = std::sync::Arc::clone(&stop);
-        let mut gw = Relay::new(config, RealAlloc::new());
-        let start = Instant::now();
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
-            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                let now = VClock(start.elapsed().as_millis() as u64);
-                // Control port.
-                loop {
-                    match control.recv_from(&mut buf) {
-                        Ok((n, src)) => {
-                            let replies = gw.on_packet(control_port, src, &buf[..n], now);
-                            for (dst, reply) in replies {
-                                let _ = control.send_to(&reply, dst);
-                            }
-                        }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                ErrorKind::WouldBlock | ErrorKind::Interrupted
-                            ) =>
-                        {
-                            break
-                        }
-                        Err(_) => break,
-                    }
-                }
-                // Data ports (replies/forwards leave from the receiving socket).
-                for port in gw.allocator().ports() {
-                    loop {
-                        let received = gw
-                            .allocator()
-                            .socket(port)
-                            .map(|sock| sock.recv_from(&mut buf));
-                        let received = match received {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match received {
-                            Ok((n, src)) => {
-                                let replies = gw.on_packet(port, src, &buf[..n], now);
-                                if let Some(sock) = gw.allocator().socket(port) {
-                                    for (dst, reply) in replies {
-                                        let _ = sock.send_to(&reply, dst);
-                                    }
-                                }
-                            }
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    ErrorKind::WouldBlock | ErrorKind::Interrupted
-                                ) =>
-                            {
-                                break
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-                let _ = gw.on_tick(now);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-        RealGateway {
-            ctrl,
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    /// A raw control socket bound to a specific loopback address.
-    fn raw_socket(loopback: &str) -> UdpSocket {
-        let sock = UdpSocket::bind((loopback, 0)).expect("raw bind");
-        sock.set_read_timeout(Some(Duration::from_millis(1_500)))
-            .unwrap();
-        sock
-    }
-
-    fn recv_frame(sock: &UdpSocket) -> Option<Frame> {
-        let mut buf = [0u8; 64];
-        match sock.recv_from(&mut buf) {
-            Ok((n, _)) => wire::decode(&buf[..n]).ok(),
-            Err(_) => None,
-        }
-    }
-
-    fn reg(code: &[u8; 5], port: u16) -> Vec<u8> {
-        wire::encode(&Frame::Register {
-            code: *code,
-            game_port: port,
-        })
-    }
+    // The real in-process relay fixture lives in `super::testutil` (shared
+    // with the G3 online_ui flow tests).
+    use super::testutil::{raw_socket, recv_frame, reg, spawn_real_gateway};
 
     #[test]
     fn real_gateway_host_registers_and_is_announced() {
@@ -1769,5 +1604,185 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(offline, "*S (slot full) must offline the host");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared in-process relay fixture (test-only): the REAL
+// `netplay_gateway::room::Gateway` driven over loopback UDP. Lives here so
+// the G3 `online_ui` flow tests exercise the very same relay without
+// duplicating it.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+    use netplay_gateway::room::{
+        Gateway as Relay, GatewayConfig as RelayConfig, PortAllocator, VClock,
+    };
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    pub struct RealGateway {
+        pub ctrl: SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for RealGateway {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Real allocator: one non-blocking `UdpSocket` per virtual data port on
+    /// loopback (mirrors the binary's `SockAllocator`) so the **data plane**
+    /// actually flows — needed to pin a guest for the `*B` path.
+    struct RealAlloc {
+        sockets: HashMap<u16, UdpSocket>,
+    }
+    impl RealAlloc {
+        fn new() -> Self {
+            Self {
+                sockets: HashMap::new(),
+            }
+        }
+        fn ports(&self) -> Vec<u16> {
+            self.sockets.keys().copied().collect()
+        }
+        fn socket(&self, port: u16) -> Option<&UdpSocket> {
+            self.sockets.get(&port)
+        }
+    }
+    impl PortAllocator for RealAlloc {
+        fn bind(&mut self, port: u16) -> Result<(), ()> {
+            let sock =
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).map_err(|_| ())?;
+            sock.set_nonblocking(true).map_err(|_| ())?;
+            self.sockets.insert(port, sock);
+            Ok(())
+        }
+        fn close(&mut self, port: u16) {
+            self.sockets.remove(&port);
+        }
+    }
+
+    fn free_loopback_port() -> u16 {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe bind");
+        sock.local_addr().expect("probe addr").port()
+    }
+
+    /// Runs the real `netplay_gateway::Gateway` on a thread: a control socket
+    /// on `127.0.0.1:0` plus real per-room data sockets, drained both ways each
+    /// 10 ms (mirrors the binary's `serve`). Host/guest legs in tests bind
+    /// **distinct** loopback addresses — the relay distinguishes legs per-IP
+    /// (G1 note).
+    pub fn spawn_real_gateway(data_ports: u16) -> RealGateway {
+        let control = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("control bind");
+        control.set_nonblocking(true).unwrap();
+        let ctrl = control.local_addr().unwrap();
+        let control_port = ctrl.port();
+        let data_base = free_loopback_port();
+        let config = RelayConfig {
+            control_port,
+            data_port_start: data_base,
+            data_ports,
+            ..RelayConfig::default()
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = std::sync::Arc::clone(&stop);
+        let mut gw = Relay::new(config, RealAlloc::new());
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = VClock(start.elapsed().as_millis() as u64);
+                // Control port.
+                loop {
+                    match control.recv_from(&mut buf) {
+                        Ok((n, src)) => {
+                            let replies = gw.on_packet(control_port, src, &buf[..n], now);
+                            for (dst, reply) in replies {
+                                let _ = control.send_to(&reply, dst);
+                            }
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::WouldBlock | ErrorKind::Interrupted
+                            ) =>
+                        {
+                            break
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Data ports (replies/forwards leave from the receiving socket).
+                for port in gw.allocator().ports() {
+                    loop {
+                        let received = gw
+                            .allocator()
+                            .socket(port)
+                            .map(|sock| sock.recv_from(&mut buf));
+                        let received = match received {
+                            Some(result) => result,
+                            None => break,
+                        };
+                        match received {
+                            Ok((n, src)) => {
+                                let replies = gw.on_packet(port, src, &buf[..n], now);
+                                if let Some(sock) = gw.allocator().socket(port) {
+                                    for (dst, reply) in replies {
+                                        let _ = sock.send_to(&reply, dst);
+                                    }
+                                }
+                            }
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    ErrorKind::WouldBlock | ErrorKind::Interrupted
+                                ) =>
+                            {
+                                break
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let _ = gw.on_tick(now);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        RealGateway {
+            ctrl,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// A raw control socket bound to a specific loopback address.
+    pub fn raw_socket(loopback: &str) -> UdpSocket {
+        let sock = UdpSocket::bind((loopback, 0)).expect("raw bind");
+        sock.set_read_timeout(Some(Duration::from_millis(1_500)))
+            .unwrap();
+        sock
+    }
+
+    pub fn recv_frame(sock: &UdpSocket) -> Option<Frame> {
+        let mut buf = [0u8; 64];
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) => wire::decode(&buf[..n]).ok(),
+            Err(_) => None,
+        }
+    }
+
+    pub fn reg(code: &[u8; 5], port: u16) -> Vec<u8> {
+        wire::encode(&Frame::Register {
+            code: *code,
+            game_port: port,
+        })
     }
 }
