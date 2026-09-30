@@ -303,6 +303,7 @@
 //! `MatchSnapshot` (process-stable, unlike `std::hash`).
 
 // Consumed progressively: N2 (session/plugin), N3 (lockstep), N6 (harness).
+pub mod gateway;
 pub mod harness;
 pub mod lockstep;
 pub mod online_ui;

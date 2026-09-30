@@ -17,6 +17,7 @@ serde_json = "1.0"
 dirs = "7.0.0"
 proptest = "1.11.0"
 tetris-core = { path = "crates/tetris-core" }
+netplay-gateway = { path = "crates/netplay-gateway" }
 
 # Dependencies compile optimized even in dev builds (Bevy is heavy);
 # workspace crates stay at opt-level 0 for fast incremental rebuilds.

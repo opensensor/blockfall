@@ -549,6 +549,7 @@ impl Plugin for NetPlugin {
         .init_resource::<NetSession>()
         .add_message::<NetEvent>()
         .add_plugins(super::lockstep::NetLockstepPlugin)
+        .add_plugins(super::gateway::NetGatewayPlugin)
         .add_observer(host_server_event_observer)
         .add_systems(
             Update,
