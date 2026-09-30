@@ -23,8 +23,11 @@ knowledge — netcode packets are opaque ciphertext to the gateway.
 ### Wire format (crate `netplay-gateway`, module `wire`)
 
 Two packet classes on the control port, demuxed by first byte:
-`0x2A` (`*`, ASCII) = control; **any other first byte** = game data (netcode
-packet types are 0..5 and 0xFF — `0x2A` never appears; pinned by a test).
+`0x2A` (`*`, ASCII) = control; **any other first byte** = game data. (G1
+correction: renetcode 2.0.0's wire first byte is the prefix
+`packet_type | (sequence_bytes << 4)` with `packet_type` in **0..=6** —
+not "0..5 and 0xFF"; 0x2A's low nibble 0xA is outside 0..6 either way,
+pinned by test against the resolved crate sources.)
 
 Control frames (packed, big-endian, all `#[non_exhaustive]`-free plain
 structs, manual encode/decode, strict length checks → `Err(WireError)`,
@@ -40,6 +43,9 @@ never panic):
 *B <code:5B>                      busy (room paired to a different guest)
 *E <code:5B>                      no such room
 *D <code:5B>                      host explicit release (on net_stop/exit)
+*S <code:5B>                      slot exhaustion (G1: gateway full / bind
+                                  failed on *R — retry later; host regenerates
+                                  nothing, the code is simply not created)
 ```
 
 Room codes: 5 chars from the confusion-free alphabet
@@ -134,9 +140,62 @@ Wave: 1    2    3
   test (real sockets, port 0 + fixed data range) pairing two UdpSockets
   through the gateway. `cargo test --workspace` green (existing 276+136+6
   unchanged); clippy `-D warnings` + fmt clean.
-- **status**: Not Completed
+- **status**: Completed (2026-09-30)
 - **log**:
-- **files edited/created**:
+  - TDD: wire + room tests written against stubs first — RED captured at
+    22 failed / 6 passed, then GREEN at 28 passed (+1 integration).
+  - **`*S <code>` added to the wire table** (this file, above): distinct
+    reply for slot exhaustion / `PortAllocator::bind` failure on `*R`,
+    per the plan's risk-section "busy reply with a distinct code
+    (documented)".
+  - `on_packet` gained a `dst_port: u16` parameter (the local port the
+    datagram arrived on). Rooms are keyed by code for control and
+    code+port for data — each room owns its virtual data port
+    exclusively, which is the only sound way to attribute data-plane
+    packets (source-IP attribution breaks for same-NAT hosts). Replies
+    go to `src`, forwards to the pinned peer, always from the receiving
+    socket so the relay's 5-tuple is stable per leg.
+  - Virtual ports bind at `*R` (not lazily at first data): same lifetime,
+    and `main.rs` has a pollable socket before any guest exists.
+  - GC consolidated (matches plan wording): both windows key on **host**
+    activity (`*R` or host data, 15 s — `--idle-secs`); guest slot
+    releases 10 s after last guest data → room falls back to listening.
+    `*D` from the host IP = immediate teardown (allocator closed
+    synchronously; `PortEvent::Closed` surfaces on the next `on_tick`).
+  - Guest pin = first non-host data source by **full SocketAddr**; `*G`
+    idempotency/busy tracked per **IP** (plan wording; same-NAT second
+    guest gets `*F` then loses the pin race → netcode timeout, as
+    accepted in Risks). Keepalive `*R` refreshes `game_port` (host
+    restart on same IP reuses the code).
+  - Rate limit: per-source-IP token bucket, capacity 10, refill 1 token /
+    500 ms (full 10 per 5 s, floor-tracked → 2 s keepalives never
+    deplete); applies to all control frames incl. malformed; silent drop;
+    `Gateway::rate_limited()` counter feeds the binary's ≥60 s summary.
+  - 0x2A demux pin: exhaustive sweep of the renetcode 2.0.0 prefix space
+    (`type 0..=6` × `seq_bytes 0..=8` → first byte) — none equals 0x2A.
+    Cited `renetcode-2.0.0/src/packet.rs:14-21,59-71,346-365`; the plan's
+    "0..5 + 0xFF" prose corrected above. renet's own packet-type bytes
+    ride inside the encrypted Payload, never first on the wire.
+  - No `--listen`/idle env vars (flags only, per "keep trivial");
+    SIGINT/SIGTERM = std-default process exit, OS closes sockets, no
+    persistence — documented in the crate README. std has no poll(): the
+    loop drains nonblocking sockets to `WouldBlock` per 100 ms tick —
+    ample at lockstep load.
+  - `--self-test`: in-process loopback relay on port-0-allocated control
+    + data range; pairs host@127.0.0.1 / guest@127.0.0.2 through
+    `*R/*A/*E/*F` + data both ways + `*F`-relookup + `*B`@127.0.0.3 +
+    `*D→*E`; prints `PASS`/`FAIL`, exit code 0/1 (verified release
+    build). NOTE for G2/G5 tests: host and guest must bind **distinct
+    loopback addresses** (the relay distinguishes legs per-IP; on the WAN
+    they always differ).
+  - Gates: `cargo test --workspace` green (276+136+6 unchanged, +28 lib
+    +1 integration); `cargo clippy --all-targets -- -D warnings` clean
+    (one plan-mandated `#[allow(clippy::result_unit_err)]` on
+    `PortAllocator::bind`); `cargo fmt --all --check` clean; release
+    binary builds; `--self-test` passes.
+- **files edited/created**: `Cargo.toml` (workspace members),
+  `crates/netplay-gateway/{Cargo.toml,README.md,src/lib.rs,src/wire.rs,src/room.rs,src/main.rs,tests/relay_loopback.rs}`,
+  `gateway-plan.md` (this plan: `*S` row + demux note + G1 status/log)
 
 ### G2: Client gateway client — control client, DNS join, room flow
 - **depends_on**: [G1]
