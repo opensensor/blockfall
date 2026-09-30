@@ -101,6 +101,18 @@ there is no video/state streaming, only inputs.
   so the opponent sees "opponent left". A desync freezes both boards and offers
   a return to title.
 
+## Running a netplay gateway
+
+Cross-WAN play without port forwarding: a **netplay gateway** is a tiny
+zero-dependency relay (`crates/netplay-gateway`) that introduces host and
+guest and forwards their encrypted match traffic — guests only need the
+5-character room code, no public IP or router config on either side. Run it
+via Docker or the hardened systemd unit, both documented in
+[crates/netplay-gateway/README.md](crates/netplay-gateway/README.md); the
+box needs inbound UDP **27016–27999** open. With the gateway down, clients
+fall back to today's direct IP join and UPnP unchanged — hosting never
+depends on it.
+
 ## Build & run
 
 Requires a stable Rust toolchain (pinned to **1.95** via `rust-toolchain.toml`,

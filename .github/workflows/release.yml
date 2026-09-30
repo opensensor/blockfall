@@ -67,3 +67,37 @@ jobs:
           files: |
             blockfall-${{ github.ref_name }}-*.tar.gz
             blockfall-${{ github.ref_name }}-*.zip
+
+  # Static musl gateway binary for any opensensor box (gateway-plan.md G4).
+  # Independent of the game matrix above; its softprops step only ADDS files
+  # with a distinct prefix (blockfall-gateway-*) — no overlap with the game
+  # archives, so the concurrent create/update of the same tag is safe.
+  gateway:
+    name: "Build & publish gateway (linux-musl)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Install musl toolchain"
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: "Add musl target"
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "Build gateway (static musl)"
+        run: cargo build --release -p netplay-gateway --target x86_64-unknown-linux-musl
+
+      - name: "Gateway self-test"
+        run: target/x86_64-unknown-linux-musl/release/netplay-gateway --self-test
+
+      - name: "Package gateway (tar.gz)"
+        run: tar czf "blockfall-gateway-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" -C target/x86_64-unknown-linux-musl/release netplay-gateway
+
+      - name: "Publish gateway release asset"
+        uses: softprops/action-gh-release@v2
+        with:
+          files: blockfall-gateway-${{ github.ref_name }}-*.tar.gz

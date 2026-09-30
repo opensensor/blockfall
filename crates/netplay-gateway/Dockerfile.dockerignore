@@ -1,0 +1,7 @@
+# Keep the build context small: the gateway build only needs the workspace
+# manifests and crate sources — never the host target/ dir, git history, or
+# screenshots. Used automatically with:
+#   docker build -f crates/netplay-gateway/Dockerfile .
+.git/
+target/
+assets/

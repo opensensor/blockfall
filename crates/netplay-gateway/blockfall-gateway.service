@@ -1,0 +1,36 @@
+# Hardened systemd unit for the Blockfall netplay gateway (gateway-plan.md G4).
+#
+# Install (after placing the static musl binary, see README "Deploying"):
+#   sudo install -m 0755 blockfall-gateway /usr/local/bin/blockfall-gateway
+#   sudo cp blockfall-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now blockfall-gateway
+#
+# Ports: control 27016 + data 27017-27999 UDP (open the whole range).
+# All ports are > 1024, so the service needs NO privileges at all: the
+# CapabilityBoundingSet below keeps only CAP_NET_BIND_SERVICE in case you
+# move --listen to a privileged port; drop that line entirely to run with
+# zero capabilities.
+#
+# Config is CLI flags only (no env vars): override ExecStart args with a
+# drop-in (`systemctl edit blockfall-gateway`) if you change the ports.
+
+[Unit]
+Description=Blockfall netplay gateway (introduce + port-paired UDP relay)
+Documentation=https://github.com/<repo>/blockfall/tree/main/crates/netplay-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/blockfall-gateway
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
