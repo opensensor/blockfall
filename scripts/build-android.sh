@@ -23,6 +23,13 @@ export ANDROID_NDK_HOME
 ABIS=(arm64-v8a x86_64)
 MIN_SDK=26
 STAGE=$ROOT/target/android
+# Release plumbing: CI passes VERSION_NAME/VERSION_CODE from the git tag and
+# APK_OUT for the artifact path; defaults keep local dev on the plain debug
+# flow. APK_KEYSTORE/APK_STORE_PASS (plus optional APK_KEY_ALIAS/APK_KEY_PASS)
+# sign with a release key; without them the debug keystore is auto-generated.
+VERSION_NAME=${VERSION_NAME:-0.3.0}
+VERSION_CODE=${VERSION_CODE:-300}
+APK_OUT=${APK_OUT:-$STAGE/blockfall-debug.apk}
 mkdir -p "$STAGE"
 
 echo "==> javac + d8 (immersive activity -> classes.dex)"
@@ -56,7 +63,7 @@ rm -f "$STAGE"/*.apk
     --manifest android/AndroidManifest.xml \
     -A crates/tetris-app/assets \
     --min-sdk-version "$MIN_SDK" --target-sdk-version "${PLATFORM#android-}" \
-    --version-code 3 --version-name 0.2.0
+    --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
 
 echo "==> adding native libs (stored, for extractNativeLibs=false)"
 rm -rf "$STAGE/lib"
@@ -70,16 +77,19 @@ cp "$DEX_OUT/classes.dex" "$STAGE/classes.dex"
 echo "==> zipalign"
 "$BUILD_TOOLS/zipalign" -f -p 4 "$STAGE/blockfall-unsigned.apk" "$STAGE/blockfall-aligned.apk"
 
-echo "==> apksigner (debug key)"
-KS=$ROOT/android/debug.keystore
+echo "==> apksigner"
+KS=${APK_KEYSTORE:-$ROOT/android/debug.keystore}
+KS_PASS=${APK_STORE_PASS:-android}
+KEY_PASS=${APK_KEY_PASS:-$KS_PASS}
+KS_ALIAS=${APK_KEY_ALIAS:-blockfall}
 if [[ ! -f $KS ]]; then
     keytool -genkeypair -keystore "$KS" -alias blockfall -keyalg RSA -keysize 2048 \
         -validity 10000 -storepass android -keypass android \
         -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null
 fi
 "$BUILD_TOOLS/apksigner" sign \
-    --ks "$KS" --ks-pass pass:android --key-pass pass:android \
-    --out "$STAGE/blockfall-debug.apk" "$STAGE/blockfall-aligned.apk"
+    --ks "$KS" --ks-key-alias "$KS_ALIAS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+    --out "$APK_OUT" "$STAGE/blockfall-aligned.apk"
 
-"$BUILD_TOOLS/apksigner" verify --print-certs "$STAGE/blockfall-debug.apk" | head -3
-echo "APK: $STAGE/blockfall-debug.apk"
+"$BUILD_TOOLS/apksigner" verify --print-certs "$APK_OUT" | head -3
+echo "APK: $APK_OUT"
