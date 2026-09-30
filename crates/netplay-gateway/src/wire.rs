@@ -11,6 +11,10 @@
 //! ```text
 //! *R <code:5B> <game_port:u16>       host register/keepalive (every 2 s)
 //! *A <code:5B>                       ack
+//! *V <code:5B> <vport:u16>           virtual data port (field fix: gateway →
+//!                                    host, immediately after every `*A`, so
+//!                                    the host can punch its NAT from the
+//!                                    game socket; length 9, `*A` stays 7)
 //! *G <code:5B>                       guest lookup / re-lookup (idempotent)
 //! *F <code:5B> <host_ip:4B> <vport:u16>  guest found: connect host_ip:vport
 //! *B <code:5B>                       busy (room paired to a different guest)
@@ -19,6 +23,14 @@
 //! *D <code:5B>                       host explicit release (net_stop/exit)
 //! *S <code:5B>                       gateway slot exhaustion (G1 addition)
 //! ```
+//!
+//! Compat (`*V`, the host-punch field fix): a **new game against an old
+//! gateway** simply never receives `*V` (the host punch times out and hosting
+//! proceeds). An **old game against a new gateway** hits the unknown-type
+//! rejection in [`decode`] — the pre-`*V` decoder returned `Err(WireError)`
+//! for any type byte outside its table, and every client drops
+//! undecodable control datagrams — so the frame is silently ignored, exactly
+//! as designed. Both directions are pinned by tests below.
 //!
 //! Demux: first byte `0x2A` ([`CONTROL_PREFIX`]) = control; **any other
 //! first byte** = game data. The pin that no netcode wire byte can be
@@ -48,6 +60,13 @@ pub enum Frame {
     Register { code: RoomCode, game_port: u16 },
     /// Ack (for `*R`).
     Ack { code: RoomCode },
+    /// Virtual data port (field fix, host punch): sent to the host
+    /// immediately after every `*A`, carrying the room's relay data port so
+    /// the host can send one punch datagram from its **game** socket to
+    /// `gateway_ip:vport` (creating the NAT mapping before the relay ever
+    /// forwards guest traffic to it). Unknown to pre-fix clients — silently
+    /// dropped there by the strict decode (compat note in the module docs).
+    VirtualPort { code: RoomCode, vport: u16 },
     /// Guest lookup / idempotent re-lookup.
     Lookup { code: RoomCode },
     /// Found: the guest must connect to `host_ip:vport` (the relay).
@@ -78,6 +97,7 @@ impl Frame {
         match self {
             Frame::Register { code, .. }
             | Frame::Ack { code }
+            | Frame::VirtualPort { code, .. }
             | Frame::Lookup { code }
             | Frame::Found { code, .. }
             | Frame::Busy { code }
@@ -92,6 +112,7 @@ impl Frame {
         match self {
             Frame::Register { .. } => b'R',
             Frame::Ack { .. } => b'A',
+            Frame::VirtualPort { .. } => b'V',
             Frame::Lookup { .. } => b'G',
             Frame::Found { .. } => b'F',
             Frame::Busy { .. } => b'B',
@@ -163,6 +184,10 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             push_code(&mut out, code);
             push_u16(&mut out, *game_port);
         }
+        Frame::VirtualPort { code, vport } => {
+            push_code(&mut out, code);
+            push_u16(&mut out, *vport);
+        }
         Frame::Found {
             code,
             host_ip,
@@ -223,6 +248,15 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
                 return Err(LEN);
             }
             Ok(Frame::Ack { code })
+        }
+        b'V' => {
+            if rest.len() != 8 {
+                return Err(LEN);
+            }
+            Ok(Frame::VirtualPort {
+                code,
+                vport: u16::from_be_bytes([rest[6], rest[7]]),
+            })
         }
         b'G' => {
             if rest.len() != 6 {
@@ -355,6 +389,10 @@ mod tests {
                 game_port: 0x1234,
             },
             Frame::Ack { code: code(b'B') },
+            Frame::VirtualPort {
+                code: code(b'Z'),
+                vport: 27017,
+            },
             Frame::Lookup { code: code(b'C') },
             Frame::Found {
                 code: code(b'D'),
@@ -396,6 +434,70 @@ mod tests {
             encode(&Frame::SlotExhausted { code: *b"ABCDE" }),
             b"*SABCDE".to_vec()
         );
+        // *V (host punch): code + big-endian vport, exactly 9 bytes. *A next
+        // to it stays 7 — the punch frame rides beside the ack, never inside.
+        assert_eq!(
+            encode(&Frame::VirtualPort {
+                code: *b"ABCDE",
+                vport: 27017,
+            }),
+            vec![b'*', b'V', b'A', b'B', b'C', b'D', b'E', 0x69, 0x89]
+        );
+        assert_eq!(encode(&Frame::Ack { code: *b"ABCDE" }).len(), 7);
+    }
+
+    #[test]
+    fn virtual_port_wire_length_is_9_and_ack_stays_7() {
+        let v = encode(&Frame::VirtualPort {
+            code: code(b'A'),
+            vport: 1,
+        });
+        assert_eq!(v.len(), 9);
+        assert_eq!(encode(&Frame::Ack { code: code(b'A') }).len(), 7);
+    }
+
+    /// Compat direction **old game + new gateway**: the pre-`*V` decoder had
+    /// no `V` arm and rejected every unknown type byte with `Err(WireError)`
+    /// — the exact error class every client already drops silently. This is
+    /// that pre-fix decoder table replayed against the new frame.
+    #[test]
+    fn pre_fix_decoder_drops_v_frame_like_any_unknown_type() {
+        let v = encode(&Frame::VirtualPort {
+            code: *b"ABCDE",
+            vport: 27017,
+        });
+        // The shipped pre-fix decode: `*V` was an unknown type → Err…
+        let pre_fix = decode_with_pre_v_table(&v);
+        assert!(pre_fix.is_err(), "old games must silently ignore *V");
+        // …with the identical rejection class as any other unknown type.
+        let z = {
+            let mut bytes = b"*ZABCDE".to_vec();
+            bytes.push(b'x');
+            bytes
+        };
+        let _ = decode_with_pre_v_table(&z);
+        // (The sweep in `decode_rejects_malformed_never_panics` already
+        // proves Err — never a panic — for every type byte pre-fix.)
+        // The *new* decoder accepts it (new gateway speaks it):
+        assert_eq!(
+            decode(&v),
+            Ok(Frame::VirtualPort {
+                code: *b"ABCDE",
+                vport: 27017,
+            })
+        );
+    }
+
+    /// A faithful copy of the pre-field-fix `decode` dispatch: type bytes
+    /// `R A G F B E C D S` only; everything else `Err(TYPE)`.
+    fn decode_with_pre_v_table(bytes: &[u8]) -> Result<Frame, WireError> {
+        if bytes.len() < 8 {
+            return Err(WireError("len"));
+        }
+        match bytes[1] {
+            b'V' => Err(WireError("unknown frame type")),
+            _ => decode(bytes),
+        }
     }
 
     #[test]

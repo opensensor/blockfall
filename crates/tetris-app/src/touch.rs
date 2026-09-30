@@ -45,7 +45,9 @@ use bevy::window::AppLifecycle;
 use tetris_core::actions::Action;
 
 use crate::core_bridge::net::{NetSession, NetStatus};
-use crate::core_bridge::{Controller, PendingActions, SimPaused, VersusMatch, VersusWinner, SIM_HZ};
+use crate::core_bridge::{
+    Controller, PendingActions, SimPaused, VersusMatch, VersusWinner, SIM_HZ,
+};
 use crate::hud::hud_anchor;
 use crate::input::{
     soft_drop_period_ticks, ticks_for, RepeatTimer, ShiftDir, ShiftRepeat, VersusActions,
@@ -91,8 +93,7 @@ enum TouchDeck {
 fn ui_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(target_os = "android")
-            || std::env::var_os("TETRIS_UI_DEBUG").is_some_and(|v| v == "1")
+        cfg!(target_os = "android") || std::env::var_os("TETRIS_UI_DEBUG").is_some_and(|v| v == "1")
     })
 }
 
@@ -351,17 +352,89 @@ fn build_touch_overlay(mut commands: Commands) {
             ))
             .with_children(|deck| {
                 // Move cluster: < > and the soft-drop v.
-                touch_button(deck, "<", TouchBtn::Left, 118.0, Node { left: Val::Px(PAD), bottom: Val::Px(PAD), ..default() }, 34.0);
-                touch_button(deck, ">", TouchBtn::Right, 118.0, Node { left: Val::Px(PAD + 130.0), bottom: Val::Px(PAD), ..default() }, 34.0);
-                touch_button(deck, "v", TouchBtn::Soft, 94.0, Node { left: Val::Px(PAD + 262.0), bottom: Val::Px(PAD), ..default() }, 26.0);
+                touch_button(
+                    deck,
+                    "<",
+                    TouchBtn::Left,
+                    118.0,
+                    Node {
+                        left: Val::Px(PAD),
+                        bottom: Val::Px(PAD),
+                        ..default()
+                    },
+                    34.0,
+                );
+                touch_button(
+                    deck,
+                    ">",
+                    TouchBtn::Right,
+                    118.0,
+                    Node {
+                        left: Val::Px(PAD + 130.0),
+                        bottom: Val::Px(PAD),
+                        ..default()
+                    },
+                    34.0,
+                );
+                touch_button(
+                    deck,
+                    "v",
+                    TouchBtn::Soft,
+                    94.0,
+                    Node {
+                        left: Val::Px(PAD + 262.0),
+                        bottom: Val::Px(PAD),
+                        ..default()
+                    },
+                    26.0,
+                );
                 // Action cluster: CW / CCW row with the big hard drop, hold
                 // above the rotation pair.
-                touch_button(deck, "DROP", TouchBtn::HardDrop, 128.0, right_pos(PAD, PAD), 20.0);
-                touch_button(deck, "CW", TouchBtn::RotateCw, 102.0, right_pos(PAD + 132.0, PAD), 20.0);
-                touch_button(deck, "CCW", TouchBtn::RotateCcw, 102.0, right_pos(PAD + 242.0, PAD), 18.0);
-                touch_button(deck, "HOLD", TouchBtn::Hold, 112.0, right_pos(PAD, PAD + 132.0), 18.0);
+                touch_button(
+                    deck,
+                    "DROP",
+                    TouchBtn::HardDrop,
+                    128.0,
+                    right_pos(PAD, PAD),
+                    20.0,
+                );
+                touch_button(
+                    deck,
+                    "CW",
+                    TouchBtn::RotateCw,
+                    102.0,
+                    right_pos(PAD + 132.0, PAD),
+                    20.0,
+                );
+                touch_button(
+                    deck,
+                    "CCW",
+                    TouchBtn::RotateCcw,
+                    102.0,
+                    right_pos(PAD + 242.0, PAD),
+                    18.0,
+                );
+                touch_button(
+                    deck,
+                    "HOLD",
+                    TouchBtn::Hold,
+                    112.0,
+                    right_pos(PAD, PAD + 132.0),
+                    18.0,
+                );
                 // Pause top-right, clear of the HUD.
-                touch_button(deck, "II", TouchBtn::Pause, 84.0, Node { right: Val::Px(PAD), top: Val::Px(PAD), ..default() }, 22.0);
+                touch_button(
+                    deck,
+                    "II",
+                    TouchBtn::Pause,
+                    84.0,
+                    Node {
+                        right: Val::Px(PAD),
+                        top: Val::Px(PAD),
+                        ..default()
+                    },
+                    22.0,
+                );
             });
         });
 }
@@ -438,8 +511,7 @@ fn gesture_system(
         return;
     };
     let size = window.resolution.size();
-    let active =
-        render::portrait_layout(size.x, size.y) && *state == AppState::Playing;
+    let active = render::portrait_layout(size.x, size.y) && *state == AppState::Playing;
     let batch: Vec<TouchInput> = messages.read().cloned().collect();
     if !active || capture.capturing {
         gestures.tracks.clear();
@@ -634,7 +706,12 @@ fn ui_debug_dump(
     mut frame: Local<u32>,
     overlays: Query<(&ComputedNode, &UiGlobalTransform), With<TouchOverlayRoot>>,
     decks: Query<(&TouchDeck, &ComputedNode, &UiGlobalTransform)>,
-    buttons: Query<(&TouchBtn, &ComputedNode, &UiGlobalTransform, Option<&Pickable>)>,
+    buttons: Query<(
+        &TouchBtn,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Option<&Pickable>,
+    )>,
 ) {
     if !ui_debug() {
         return;
@@ -644,7 +721,10 @@ fn ui_debug_dump(
         return;
     }
     for (node, transform) in &overlays {
-        info!("TUI root center {:?} size {:?}", transform.translation, node.size);
+        info!(
+            "TUI root center {:?} size {:?}",
+            transform.translation, node.size
+        );
     }
     for (deck, node, transform) in &decks {
         info!(
@@ -716,8 +796,8 @@ fn touch_action_system(
     // paused; a crowned match blocks a *fresh* pause under the winner
     // overlay).
     let net_in_match = net.is_some_and(|net| net.status == NetStatus::InMatch);
-    let finished_match =
-        versus.as_ref().is_some_and(|versus| versus.active) && winner.is_some_and(|winner| winner.0.is_some());
+    let finished_match = versus.as_ref().is_some_and(|versus| versus.active)
+        && winner.is_some_and(|winner| winner.0.is_some());
     let blocked_fresh_pause = finished_match && *state == AppState::Playing;
     if pause_edge && !capture.capturing && !net_in_match && !blocked_fresh_pause {
         toggle_pause(&mut state, &mut sim, &freeze);
@@ -802,10 +882,9 @@ fn push_gameplay(
     das_ticks: u32,
     arr_ticks: u32,
 ) {
-    if let Some(dir) = machines
-        .shift
-        .step(held_left, held_right, move_left, move_right, das_ticks, arr_ticks)
-    {
+    if let Some(dir) = machines.shift.step(
+        held_left, held_right, move_left, move_right, das_ticks, arr_ticks,
+    ) {
         queue.push(match dir {
             ShiftDir::Left => Action::MoveLeft,
             ShiftDir::Right => Action::MoveRight,
@@ -859,7 +938,9 @@ fn lifecycle_pause_system(
         if !matches!(message, AppLifecycle::WillSuspend | AppLifecycle::Suspended) {
             continue;
         }
-        let net_in_match = net.as_ref().is_some_and(|net| net.status == NetStatus::InMatch);
+        let net_in_match = net
+            .as_ref()
+            .is_some_and(|net| net.status == NetStatus::InMatch);
         let finished_match = versus.as_ref().is_some_and(|versus| versus.active)
             && winner.as_ref().is_some_and(|winner| winner.0.is_some());
         if *state == AppState::Playing && !net_in_match && !finished_match {

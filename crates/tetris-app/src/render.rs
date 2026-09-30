@@ -196,8 +196,8 @@ pub const PORTRAIT_TOP_FRAC: f32 = 0.19;
 /// touch deck (buttons + combo/B2B strip) in [`playfield_view`].
 pub const PORTRAIT_BOTTOM_FRAC: f32 = 0.19;
 
-/// Thread-local portrait force for unit tests (each cargo test thread is
-/// isolated, unlike a process env var). Production code never sets it.
+// Thread-local portrait force for unit tests (each cargo test thread is
+// isolated, unlike a process env var). Production code never sets it.
 #[cfg(test)]
 thread_local! {
     static PORTRAIT_OVERRIDE: std::cell::Cell<Option<bool>> = const {

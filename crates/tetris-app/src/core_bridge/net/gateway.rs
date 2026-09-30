@@ -37,6 +37,51 @@
 //! gateway off there are no threads, no bound sockets, and no per-frame work
 //! beyond reading one bool resource.
 //!
+//! # Host-side NAT punch (field fix, 2026-09-30 — gateway-plan.md)
+//!
+//! Symptom: room codes paired (guest got `*F`, showed "connecting…") but the
+//! host never saw the guest's handshake. Cause: the relay forwarded to
+//! `host_ip:game_port`, and the host's game socket — a UDP *server* — had
+//! never sent a packet, so the host's router had no inbound mapping and
+//! dropped the forwarded connect (LAN-hairpin through the WAN gateway fails
+//! identically; the loopback E2E has no NAT and cannot see it).
+//!
+//! The gateway now answers every `*A` with `*V <code> <vport>` (the room's
+//! virtual data port). With the gateway armed, `session::net_host` only
+//! *binds* the game socket and holds it as
+//! [`session::PendingHostSocket`](super::session::PendingHostSocket)
+//! (`NetStatus::Listening` arrives immediately — the port is reserved); this
+//! driver then:
+//!
+//! 1. sends `*R` (unchanged announce/keepalive);
+//! 2. on `*A`: waits up to [`VPORT_TIMEOUT`] for `*V`;
+//! 3. on `*V`: fires **one** punch datagram ([`PUNCH_BYTE`]) from the game
+//!    socket at `gateway_ip:vport` — `gateway_ip` from the driver's own
+//!    resolver — so the host router opens the mapping the relay forwards to,
+//!    and hands the socket to netcode ([`session::handover_pending_host_socket`]);
+//! 4. on timeout (`*A` never arrives in [`HANDOVER_TIMEOUT`], or `*V` never
+//!    follows it): hands over punch-less — LAN/direct hosting must work, and
+//!    the Host screen's `gateway offline` line explains the rest.
+//!
+//! Connect requests arriving during that ≤ 3 s window sit in the game
+//! socket's OS receive buffer and are read by netcode right after the
+//! handover (test-pinned).
+//!
+//! **Compat**: a *new game against an old gateway* never receives `*V` and
+//! hands over after the timeout (punch-less, exactly the old behavior); an
+//! *old game against a new gateway* drops `*V` silently (the strict pre-fix
+//! wire decode rejects unknown type bytes, and clients drop undecodable
+//! control datagrams). Both directions are pinned by tests.
+//!
+//! **Aging window**: a punch only keeps the NAT mapping alive while traffic
+//! flows (~30–120 s of silence kills it, router-dependent) — a room left
+//! empty after announcing relies on the auto-UPnP mapping (armed on
+//! `Listening`, lease-renewed — untouched by this flow) or a manual forward.
+//! Punch and UPnP are complementary: the punch covers the common
+//! "guest joins shortly after hosting starts" case even when UPnP is off or
+//! the router denies mapping; UPnP covers long-idle waiting rooms. (Same
+//! note in the `netplay-gateway` crate's `room.rs` docs.)
+//!
 //! # Enablement (deviation from the plan prose — recorded in gateway-plan.md)
 //!
 //! [`parse_gateway_env`] is the spec's pure string map (unset → the default
@@ -61,7 +106,9 @@ use bevy::prelude::*;
 
 use netplay_gateway::wire::{self, Frame, RoomCode};
 
-use super::session::{net_join, NetRole, NetSession, NetStatus};
+use super::session::{
+    handover_pending_host_socket, net_join, NetRole, NetSession, NetStatus, PendingHostSocket,
+};
 
 /// Env var selecting the gateway (`host:port`). Unset → **disabled** in a
 /// headless build (see the module-doc deviation note); empty string → disabled
@@ -96,6 +143,23 @@ pub const TEARDOWN_BUDGET: Duration = Duration::from_millis(200);
 /// How many distinct room codes a host tries before declaring
 /// [`HostRoomState::Offline`] on repeated `*C` collisions.
 pub const MAX_CODE_ATTEMPTS: u32 = 4;
+
+/// Field fix (module docs): how long the host waits for the room ack after
+/// the first `*R` before handing the bound game socket to netcode anyway —
+/// LAN/direct hosting must never wait on the gateway.
+pub const HANDOVER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Field fix (module docs): how long the host waits for the `*V` punch port
+/// after the `*A` before handing over punch-less (an old gateway never sends
+/// it, and a lost `*V` must not wedge hosting).
+pub const VPORT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Field fix (module docs): the single punch datagram's payload — content is
+/// irrelevant (it is relay-dropped until the guest arrives); only its
+/// source tuple opens the NAT mapping. `+` (0x2B) can never be confused
+/// with a control frame (`0x2A` prefix) or a netcode first byte (0..=6 |
+/// seq<<4).
+pub const PUNCH_BYTE: u8 = 0x2B;
 
 /// Control frames are ≤ 13 bytes; the socket is non-blocking, so the drain
 /// loop simply stops on `WouldBlock` — an over-large datagram is netcode
@@ -285,6 +349,16 @@ pub fn format_code(code: &RoomCode) -> String {
     String::from_utf8_lossy(code).into_owned()
 }
 
+/// A pending host transport handover (field fix — module docs): built by
+/// the `*V` path (with the punch target) or the handover timeout (without),
+/// consumed by the driver system into an exclusive world command.
+#[derive(Clone, Copy, Debug)]
+struct HandoverRequest {
+    /// Punch the held game socket toward this address (`gateway_ip:vport`
+    /// from `*V`) before netcode takes the socket over.
+    punch: Option<SocketAddr>,
+}
+
 // ---------------------------------------------------------------------------
 // Reply classification (pure)
 // ---------------------------------------------------------------------------
@@ -304,6 +378,10 @@ pub enum LookupOutcome {
     SlotExhausted,
     /// `*A` — an ack (never a lookup reply; a host-side acknowledgement).
     Ack,
+    /// `*V` — the room's virtual data port for the host punch (field fix;
+    /// host-side only — the guest never sees it, and a client that predates
+    /// it drops the frame at the wire decode).
+    VirtualPort { vport: u16 },
     /// `*C` — collision (host-side only).
     Collision,
     /// Anything else (a `*R`/`*D`/`*G` we should never receive back).
@@ -320,6 +398,7 @@ pub fn classify(frame: &Frame) -> LookupOutcome {
         Frame::Busy { .. } => LookupOutcome::Busy,
         Frame::SlotExhausted { .. } => LookupOutcome::SlotExhausted,
         Frame::Ack { .. } => LookupOutcome::Ack,
+        Frame::VirtualPort { vport, .. } => LookupOutcome::VirtualPort { vport: *vport },
         Frame::Collision { .. } => LookupOutcome::Collision,
         _ => LookupOutcome::Unexpected,
     }
@@ -430,6 +509,14 @@ pub struct NetGateway {
     ack_deadline: Option<Instant>,
     attempts: u32,
 
+    /// Field fix (module docs): deadline after which the bound game socket
+    /// is handed to netcode regardless of gateway progress — set on the
+    /// first `*R`, refreshed to the `*V` window when `*A` lands.
+    handover: Option<Instant>,
+    /// Field fix: the handover (with punch target when `*V` arrived) queued
+    /// for the driver system's world command.
+    handover_request: Option<HandoverRequest>,
+
     guest_code: Option<RoomCode>,
     lookup_started: Option<Instant>,
 }
@@ -466,6 +553,8 @@ impl NetGateway {
             last_register: None,
             ack_deadline: None,
             attempts: 0,
+            handover: None,
+            handover_request: None,
             guest_code: None,
             lookup_started: None,
         }
@@ -512,6 +601,15 @@ impl NetGateway {
     pub fn with_leg_bind(mut self, ip: IpAddr) -> Self {
         self.leg_bind = Some(ip);
         self
+    }
+
+    /// Test seam (`harness.rs` legacy-relay race): expire the pending
+    /// punch/handover window immediately instead of waiting the real
+    /// [`VPORT_TIMEOUT`]/[`HANDOVER_TIMEOUT`] (mirrors how the session tests
+    /// fast-forward [`super::session::JOIN_TIMEOUT`]).
+    #[cfg(test)]
+    pub(crate) fn expire_handover_window_for_test(&mut self) {
+        self.handover = Some(Instant::now() - Duration::from_millis(1));
     }
 
     // -- sockets + resolution ------------------------------------------------
@@ -603,6 +701,11 @@ impl NetGateway {
         self.try_register(now);
         self.last_register = Some(now);
         self.ack_deadline = Some(now + ACK_TIMEOUT);
+        // Field fix: the handover clock starts at the first `*R` — if the
+        // gateway never acks, the bound game socket goes to netcode anyway
+        // (LAN/direct hosting must not wait on the gateway).
+        self.handover = Some(now + HANDOVER_TIMEOUT);
+        self.handover_request = None;
         self.host = HostRoomState::Advertising(self.code.unwrap_or_default());
     }
 
@@ -619,6 +722,15 @@ impl NetGateway {
     }
 
     fn tick_host(&mut self, ev: &mut Vec<NetGatewayEvent>, now: Instant) {
+        // Field fix: the punch/handover window expired without `*V` (old
+        // gateway, or a lost frame) — hand the bound socket to netcode
+        // punch-less. A no-op if the handover already ran.
+        if self.handover.is_some_and(|d| now >= d) {
+            self.handover = None;
+            if self.handover_request.is_none() {
+                self.handover_request = Some(HandoverRequest { punch: None });
+            }
+        }
         // A lost/never-started resolution while still advertising: try again
         // (idempotent), and time it out against the deadline if it hangs.
         if self.resolved.is_none() {
@@ -649,6 +761,8 @@ impl NetGateway {
         self.last_register = None;
         self.ack_deadline = None;
         self.attempts = 0;
+        self.handover = None;
+        self.handover_request = None;
     }
 
     fn teardown_host(&mut self) {
@@ -729,7 +843,28 @@ impl NetGateway {
                 {
                     self.host = HostRoomState::Announced(frame.code());
                     self.ack_deadline = None;
+                    // Field fix: the ack opens the `*V` window — punch and
+                    // hand over when it lands, hand over punch-less when it
+                    // expires (old gateway, or a lost `*V`).
+                    self.handover = Some(Instant::now() + VPORT_TIMEOUT);
                     ev.push(NetGatewayEvent::RoomAnnounced(frame.code()));
+                }
+            }
+            LookupOutcome::VirtualPort { vport } => {
+                // Field fix: the punch port for the held game socket. Only
+                // meaningful for the live announced room; everything else
+                // (wrong code, guest leg, post-handover straggler from a
+                // keepalive `*A`) is a silent no-op — the queued handover
+                // itself no-ops once the socket is gone.
+                if matches!(self.host, HostRoomState::Announced(_))
+                    && self.code == Some(frame.code())
+                {
+                    if let Some(gw) = self.resolved {
+                        self.handover = None;
+                        self.handover_request = Some(HandoverRequest {
+                            punch: Some(SocketAddr::new(gw.ip(), vport)),
+                        });
+                    }
                 }
             }
             LookupOutcome::Collision => {
@@ -963,7 +1098,26 @@ fn gateway_control_system(
         events.write(event);
     }
 
-    // 5. Found → net_join handoff (deferred exclusive command; the transport
+    // 5. Field fix — deferred host transport handover (module docs): punch
+    // the held game socket once toward `gateway_ip:vport` (only ever before
+    // netcode owns the socket), then build the server from it. Queued so
+    // the resource insert lands after this system, like the join handoff.
+    if let Some(request) = gateway.handover_request.take() {
+        commands.queue(move |world: &mut World| {
+            if let Some(target) = request.punch {
+                if let Some(pending) = world.get_resource::<PendingHostSocket>() {
+                    // One datagram, contents irrelevant — this exists for
+                    // its NAT side effect; the relay answers it with the
+                    // guest traffic. A failed send must not eat the
+                    // handover: LAN/direct still works.
+                    let _ = pending.socket.send_to(&[PUNCH_BYTE], target);
+                }
+            }
+            handover_pending_host_socket(world);
+        });
+    }
+
+    // 6. Found → net_join handoff (deferred exclusive command; the transport
     // insert applies cleanly after this system).
     if let Some(addr) = join_addr {
         commands.queue(move |world: &mut World| {
@@ -1464,9 +1618,208 @@ mod tests {
         assert!(new_code.iter().all(|&b| wire::is_code_byte(b)));
     }
 
+    // ---- Field fix: `*V` punch + deferred transport handover ----
+
+    use bevy_renet::netcode::NetcodeServerTransport;
+
+    /// Listening edge with a **real** held game socket (what `net_host` does
+    /// with the gateway armed), returning the socket's bound port.
+    fn host_listening_with_pending_socket(app: &mut App) -> u16 {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("game socket bind");
+        let port = socket.local_addr().unwrap().port();
+        app.world_mut()
+            .insert_resource(PendingHostSocket { socket });
+        set_host_listening(app, port);
+        port
+    }
+
+    /// Runs frames until the held socket has been handed to netcode (or
+    /// fails the assertion).
+    fn await_handover(app: &mut App) {
+        for _ in 0..100 {
+            app.update();
+            if app.world().contains_resource::<NetcodeServerTransport>() {
+                assert!(
+                    !app.world().contains_resource::<PendingHostSocket>(),
+                    "handover must consume the pending socket"
+                );
+                assert_eq!(
+                    app.world().resource::<NetSession>().status,
+                    NetStatus::Listening,
+                    "handover must not move NetStatus off Listening"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("transport never went live — handover did not run");
+    }
+
+    #[test]
+    fn virtual_port_punches_held_socket_then_hands_over() {
+        let spy = SpyGateway::bind();
+        let mut app = app_with_gateway(NetGateway::test_with_endpoint(&spy.endpoint()));
+        let game_port = host_listening_with_pending_socket(&mut app);
+
+        let (frame, src) = spy.recv_frame().expect("a *R on the Listening edge");
+        let code = match frame {
+            Frame::Register { code, game_port: p } => {
+                assert_eq!(p, game_port);
+                code
+            }
+            other => panic!("expected *R, got {other:?}"),
+        };
+        spy.send(&wire::encode(&Frame::Ack { code }), src);
+        let mut announced = false;
+        for _ in 0..50 {
+            app.update();
+            if app.world().resource::<NetGateway>().host == HostRoomState::Announced(code) {
+                announced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(announced, "*A must announce before the *V applies");
+        assert!(
+            !app.world().contains_resource::<NetcodeServerTransport>(),
+            "no transport may exist while the punch window is open"
+        );
+
+        // `*V` names the relay data port — the sink stands in for it.
+        let sink = UdpSocket::bind("127.0.0.1:0").expect("sink bind");
+        let vport = sink.local_addr().unwrap().port();
+        sink.set_read_timeout(Some(Duration::from_millis(2_000)))
+            .unwrap();
+        spy.send(&wire::encode(&Frame::VirtualPort { code, vport }), src);
+
+        await_handover(&mut app);
+        // Exactly one punch datagram, from the game socket's port (the NAT
+        // mapping the relay then aims guest traffic at), before handover.
+        let mut buf = [0u8; 16];
+        let (n, from) = sink.recv_from(&mut buf).expect("punch datagram");
+        assert_eq!(&buf[..n], &[PUNCH_BYTE]);
+        assert_eq!(
+            from.port(),
+            game_port,
+            "the punch must leave the held game socket, not any other"
+        );
+    }
+
+    #[test]
+    fn ack_without_virtual_port_hands_over_on_timeout_punch_less() {
+        // Old-gateway compat: `*A` but no `*V` ever arrives — after the
+        // window the socket goes to netcode anyway (a lost *V must not hang
+        // the host; LAN-direct guests can still reach the listening port).
+        let spy = SpyGateway::bind();
+        let mut app = app_with_gateway(NetGateway::test_with_endpoint(&spy.endpoint()));
+        host_listening_with_pending_socket(&mut app);
+        let (frame, src) = spy.recv_frame().expect("*R");
+        let code = match frame {
+            Frame::Register { code, .. } => code,
+            other => panic!("expected *R, got {other:?}"),
+        };
+        spy.send(&wire::encode(&Frame::Ack { code }), src);
+        for _ in 0..50 {
+            app.update();
+            if matches!(
+                app.world().resource::<NetGateway>().host,
+                HostRoomState::Announced(_)
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.world_mut()
+            .resource_mut::<NetGateway>()
+            .expire_handover_window_for_test();
+        await_handover(&mut app);
+        assert!(
+            app.world_mut()
+                .resource::<NetGateway>()
+                .handover_request
+                .is_none(),
+            "the queued handover must be consumed"
+        );
+    }
+
+    #[test]
+    fn never_acked_announce_still_hands_over_after_window() {
+        // LAN/direct hosting with the gateway armed but unreachable: the
+        // first-`*R`+3 s deadline hands over punch-less — the room line may
+        // say gateway-offline, but hosting itself must not hang on DNS.
+        let spy = SpyGateway::bind();
+        let mut app = app_with_gateway(NetGateway::test_with_endpoint(&spy.endpoint()));
+        host_listening_with_pending_socket(&mut app);
+        app.world_mut()
+            .resource_mut::<NetGateway>()
+            .expire_handover_window_for_test();
+        await_handover(&mut app);
+    }
+
+    #[test]
+    fn virtual_port_before_ack_is_ignored() {
+        // A stray `*V` (unsolicited, wrong phase) must not punch, must not
+        // hand over — the window only arms after `*A`.
+        let spy = SpyGateway::bind();
+        let mut app = app_with_gateway(NetGateway::test_with_endpoint(&spy.endpoint()));
+        host_listening_with_pending_socket(&mut app);
+        let (frame, src) = spy.recv_frame().expect("*R");
+        let code = match frame {
+            Frame::Register { code, .. } => code,
+            other => panic!("expected *R, got {other:?}"),
+        };
+        spy.send(&wire::encode(&Frame::VirtualPort { code, vport: 9 }), src);
+        for _ in 0..10 {
+            app.update();
+            assert!(
+                app.world().contains_resource::<PendingHostSocket>()
+                    && !app.world().contains_resource::<NetcodeServerTransport>(),
+                "*V before *A must not hand over"
+            );
+        }
+        // After the ack, the same `*V` path works (window armed).
+        spy.send(&wire::encode(&Frame::Ack { code }), src);
+        for _ in 0..50 {
+            app.update();
+            if matches!(
+                app.world().resource::<NetGateway>().host,
+                HostRoomState::Announced(_)
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let sink = UdpSocket::bind("127.0.0.1:0").expect("sink bind");
+        let vport = sink.local_addr().unwrap().port();
+        sink.set_read_timeout(Some(Duration::from_millis(2_000)))
+            .unwrap();
+        spy.send(&wire::encode(&Frame::VirtualPort { code, vport }), src);
+        await_handover(&mut app);
+        let mut buf = [0u8; 16];
+        sink.recv_from(&mut buf).expect("punch after the ack");
+    }
+
+    #[test]
+    fn stray_virtual_port_on_idle_gateway_is_inert() {
+        // Old-game tolerance mirrors the wire-crate decoder pin at the
+        // client level: no host state, no handover, no event.
+        let mut gw = NetGateway::disabled();
+        let mut ev = Vec::new();
+        gw.handle_frame(
+            &Frame::VirtualPort {
+                code: *b"ABCDE",
+                vport: 9,
+            },
+            &mut ev,
+        );
+        assert!(ev.is_empty());
+        assert!(gw.handover_request.is_none());
+        assert_eq!(gw.host, HostRoomState::Idle);
+    }
+
     // The real in-process relay fixture lives in `super::testutil` (shared
     // with the G3 online_ui flow tests).
-    use super::testutil::{raw_socket, recv_frame, reg, spawn_real_gateway};
+    use super::testutil::{raw_socket, recv_ack_then_vport, recv_frame, reg, spawn_real_gateway};
 
     #[test]
     fn real_gateway_host_registers_and_is_announced() {
@@ -1578,16 +1931,10 @@ mod tests {
         let rg = spawn_real_gateway(4);
         let host = raw_socket("127.0.0.2");
         host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
-        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
-
-        // Learn the vport via a lookup from 127.0.0.2, then pin the guest slot
-        // with first data from 127.0.0.3.
-        host.send_to(&wire::encode(&Frame::Lookup { code: *b"ABCDE" }), rg.ctrl)
-            .unwrap();
-        let vport = match recv_frame(&host) {
-            Some(Frame::Found { vport, .. }) => vport,
-            other => panic!("expected *F, got {other:?}"),
-        };
+        // The field-fix *V announces the relay port directly — no lookup leg
+        // needed to learn it.
+        let vport = recv_ack_then_vport(&host);
+        // Pin the guest slot with first data from 127.0.0.3.
         let guest = raw_socket("127.0.0.3");
         guest
             .send_to(b"\x00pin", SocketAddr::from(([127, 0, 0, 1], vport)))
@@ -1821,6 +2168,20 @@ pub(crate) mod testutil {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) => wire::decode(&buf[..n]).ok(),
             Err(_) => None,
+        }
+    }
+
+    /// Reads a host register reply pair — `*A` then the field-fix `*V` — and
+    /// returns the announced virtual data port. Raw host legs must consume
+    /// both frames before any further reads on the control socket.
+    pub fn recv_ack_then_vport(sock: &UdpSocket) -> u16 {
+        assert!(
+            matches!(recv_frame(sock), Some(Frame::Ack { .. })),
+            "expected *A"
+        );
+        match recv_frame(sock) {
+            Some(Frame::VirtualPort { vport, .. }) => vport,
+            other => panic!("expected *V after *A, got {other:?}"),
         }
     }
 

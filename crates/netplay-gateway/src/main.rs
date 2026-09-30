@@ -358,7 +358,9 @@ fn self_test_scenario(ctrl_addr: SocketAddr, data_base: u16) -> Result<(), Strin
         .map_err(|e| format!("guest lookup send: {e}"))?;
     expect_frame(&guest, |f| matches!(f, wire::Frame::NotFound { .. }), "*E")?;
 
-    // Host registers → *A.
+    // Host registers → *A, and the field-fix *V right behind it (the host's
+    // punch port). Consume both — a leftover *V would poison the data-plane
+    // reads below.
     let host_port = host.local_addr().map_err(|e| e.to_string())?.port();
     host.send_to(
         &wire::encode(&wire::Frame::Register {
@@ -369,6 +371,17 @@ fn self_test_scenario(ctrl_addr: SocketAddr, data_base: u16) -> Result<(), Strin
     )
     .map_err(|e| format!("host register send: {e}"))?;
     expect_frame(&host, |f| matches!(f, wire::Frame::Ack { .. }), "*A")?;
+    let v_from_ack = match expect_frame(
+        &host,
+        |f| matches!(f, wire::Frame::VirtualPort { .. }),
+        "*V",
+    ) {
+        Ok((_, data)) => match wire::decode(&data).map_err(|e| e.to_string())? {
+            wire::Frame::VirtualPort { vport, .. } => vport,
+            other => return Err(format!("unexpected *V payload {other:?}")),
+        },
+        Err(e) => return Err(e),
+    };
 
     // Guest looks up → *F with the relay vport.
     guest
@@ -387,6 +400,11 @@ fn self_test_scenario(ctrl_addr: SocketAddr, data_base: u16) -> Result<(), Strin
         }
         other => return Err(format!("unexpected reply {other:?}")),
     };
+    if v_from_ack != vport {
+        return Err(format!(
+            "*V port {v_from_ack} disagrees with *F vport {vport}"
+        ));
+    }
     let vaddr = SocketAddr::from(([127, 0, 0, 1], vport));
 
     // Host data before any guest packet: dropped (netcode dials from guest).

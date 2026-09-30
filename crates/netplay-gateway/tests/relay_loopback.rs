@@ -133,6 +133,13 @@ fn loopback_pair_two_sockets_through_gateway_thread() {
         )
         .expect("register");
         assert!(matches!(recv_frame(&host), Some((_, Frame::Ack { .. }))));
+        // Field fix: *V follows every *A and carries the room's virtual data
+        // port — consume it here so the data-plane reads below see game bytes.
+        let (_, frame) = recv_frame(&host).expect("*V after *A");
+        let v_from_ack = match frame {
+            Frame::VirtualPort { vport, .. } => vport,
+            other => panic!("expected *V, got {other:?}"),
+        };
         guest
             .send_to(&wire::encode(&Frame::Lookup { code }), ctrl_addr)
             .expect("lookup");
@@ -145,6 +152,10 @@ fn loopback_pair_two_sockets_through_gateway_thread() {
             }
             other => panic!("expected *F, got {other:?}"),
         };
+        assert_eq!(
+            v_from_ack, vport,
+            "*V must announce the same relay port the guest gets in *F"
+        );
         let vaddr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), vport);
 
         // Guest → host (pins the guest slot on the way)…

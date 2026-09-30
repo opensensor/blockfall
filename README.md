@@ -74,10 +74,14 @@ there is no video/state streaming, only inputs.
   mode), types the five characters, and the netplay gateway introduces them
   and relays the match — neither side needs a public IP, a port forward, or
   even to know the other's address. The relay only ever sees the game's
-  encrypted netcode traffic; the code is the only secret. Failures name
-  themselves while you are still looking at the screen: **`no such room`**,
-  **`match full`** (someone else already joined), **`gateway offline — check
-  connection or join by IP`**. The entry toggles to **IP** mode with the mode
+encrypted netcode traffic; the code is the only secret. Hosting opens the
+host's router for the relay automatically via a UDP punch (UPnP if you have
+it); when a router still refuses, the Join screen says so plainly instead of
+hanging. Failures name themselves while you are still looking at the screen:
+**`no such room`**,
+**`match full`** (someone else already joined), **`gateway offline — check
+connection or join by IP`**, **`host unreachable — ask host to enable UPnP
+or port-forward UDP 27015`**. The entry toggles to **IP** mode with the mode
   button when you would rather type an address. The gateway is configured with
   **`TETRIS_GATEWAY=<host:port>`** (default **`blockfall.opensensor.io:27016`**;
   set it to **empty** to disable the whole feature and go direct-IP only — you

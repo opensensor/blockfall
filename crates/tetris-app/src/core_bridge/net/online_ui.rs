@@ -411,6 +411,24 @@ pub fn lookup_status_text(state: &GuestLookupState) -> String {
     }
 }
 
+/// The room-path-specific connect failure (field fix): the gateway answered
+/// `*F` (room found — [`GuestLookupState::Found`] is sticky for the whole
+/// connect), and the netcode connect **through the relay** then timed out:
+/// the host's router refused the relayed handshake (no mapping — the punch
+/// was impossible, aged out, or the router is symmetric). This is a strictly
+/// more actionable message than the generic timeout line, and applies ONLY
+/// here — `*B`/`*E` copy, direct-IP joins, and every other loss are
+/// untouched.
+#[must_use]
+pub fn room_connect_failure_text(status: &NetStatus) -> Option<&'static str> {
+    match status {
+        NetStatus::Lost(NetLossReason::Timeout) => {
+            Some("host unreachable — ask host to enable UPnP or port-forward UDP 27015")
+        }
+        _ => None,
+    }
+}
+
 /// The Host screen's single extra line (gateway-plan.md G3): the live room
 /// code wins (`Room XXXXX — share with a friend`), an in-flight registration
 /// shows the same code while announcing, and the offline fallback names the
@@ -446,6 +464,14 @@ pub fn join_status_text(
 ) -> String {
     if mode == JoinMode::Code {
         if let Some(gateway) = gateway {
+            // Field fix: a successful `*F` whose connect then died says so
+            // with the actionable room-path copy (see
+            // [`room_connect_failure_text`]) instead of the generic line.
+            if matches!(gateway.guest, GuestLookupState::Found { .. }) {
+                if let Some(text) = room_connect_failure_text(status) {
+                    return text.to_string();
+                }
+            }
             let line = lookup_status_text(&gateway.guest);
             if !line.is_empty() {
                 return line;
@@ -1085,9 +1111,8 @@ pub fn online_ime_system(
     let Ok(mut window) = windows.single_mut() else {
         return;
     };
-    let want = cfg!(target_os = "android")
-        && *state == AppState::Title
-        && flow.stage == OnlineStage::Join;
+    let want =
+        cfg!(target_os = "android") && *state == AppState::Title && flow.stage == OnlineStage::Join;
     if window.ime_enabled != want {
         window.ime_enabled = want;
     }
@@ -2136,6 +2161,61 @@ mod tests {
     // ---- status/overlay copy ----
 
     #[test]
+    fn found_room_that_cannot_connect_shows_the_punch_failure_copy() {
+        // Field fix: `*F` succeeded (sticky `Found`) but the netcode connect
+        // through the relay timed out — the status line names the actual
+        // suspect (host router) instead of the generic loss line.
+        use GuestLookupState as G;
+        let mut gw = NetGateway::disabled();
+        gw.enabled = true;
+        gw.guest = G::Found {
+            code: *b"ABCDE",
+            addr: "127.0.0.1:9".parse().unwrap(),
+        };
+        assert_eq!(
+            join_status_text(
+                JoinMode::Code,
+                Some(&gw),
+                &NetStatus::Lost(NetLossReason::Timeout)
+            ),
+            "host unreachable — ask host to enable UPnP or port-forward UDP 27015"
+        );
+        // Mid-connect the generic lines are untouched…
+        assert_eq!(
+            join_status_text(JoinMode::Code, Some(&gw), &NetStatus::Connecting),
+            status_text(NetRole::Guest, &NetStatus::Connecting)
+        );
+        // …and neither other loss reasons nor IP mode get the new copy.
+        assert_eq!(
+            join_status_text(
+                JoinMode::Code,
+                Some(&gw),
+                &NetStatus::Lost(NetLossReason::Denied)
+            ),
+            status_text(NetRole::Guest, &NetStatus::Lost(NetLossReason::Denied))
+        );
+        assert_eq!(
+            join_status_text(
+                JoinMode::Ip,
+                Some(&gw),
+                &NetStatus::Lost(NetLossReason::Timeout)
+            ),
+            status_text(NetRole::Guest, &NetStatus::Lost(NetLossReason::Timeout)),
+            "IP-mode loss keeps the generic copy — no relay was involved"
+        );
+        // Never-Found room paths (lookup still authoritative) unchanged:
+        gw.guest = G::Timeout;
+        assert_eq!(
+            join_status_text(
+                JoinMode::Code,
+                Some(&gw),
+                &NetStatus::Lost(NetLossReason::Timeout)
+            ),
+            "gateway offline — check connection or join by IP"
+        );
+    }
+
+    #[test]
     fn status_text_covers_every_net_status() {
         use NetStatus as S;
         let cases = [
@@ -3099,7 +3179,7 @@ mod tests {
     // the gateway must actually register for the share line to exist.
 
     use crate::core_bridge::net::gateway::testutil::{
-        raw_socket, recv_frame, reg, spawn_real_gateway,
+        raw_socket, recv_ack_then_vport, recv_frame, reg, spawn_real_gateway,
     };
     use netplay_gateway::wire::Frame;
 
@@ -3468,13 +3548,8 @@ mod tests {
         let rg = spawn_real_gateway(4);
         let host = raw_socket("127.0.0.2");
         host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
-        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
-        host.send_to(&wire::encode(&Frame::Lookup { code: *b"ABCDE" }), rg.ctrl)
-            .unwrap();
-        let vport = match recv_frame(&host) {
-            Some(Frame::Found { vport, .. }) => vport,
-            other => panic!("expected *F, got {other:?}"),
-        };
+        // Consume the field-fix *V pair and take the relay port from it.
+        let vport = recv_ack_then_vport(&host);
         // Pin the guest slot with first data from a third loopback IP.
         let guest = raw_socket("127.0.0.3");
         guest
@@ -3496,6 +3571,71 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(surfaced, "the *B reply surfaces as \"match full\"");
+    }
+
+    /// The field symptom end-to-end: pairing succeeds (real relay answers
+    /// `*G` with `*F`), but the host behind the relay is a dead announce —
+    /// the connect through the relay goes nowhere. The status line must
+    /// carry the actionable room-path copy, not the generic loss line, and
+    /// the `*F`-sticky `Found` state is what selects it. (The watchdog is
+    /// fast-forwarded through `joining_since` like the session tests do —
+    /// no 10 s sleep.)
+    #[test]
+    fn found_room_that_cannot_connect_surfaces_the_punch_copy() {
+        use crate::core_bridge::net::gateway::GuestLookupState;
+        use crate::core_bridge::net::session::{NetSession, JOIN_TIMEOUT};
+
+        let rg = spawn_real_gateway(4);
+        // A "host" whose announced game port nobody binds: the relay pairs
+        // the room, then every forwarded packet is dropped.
+        let dead = raw_socket("127.0.0.2")
+            .local_addr()
+            .expect("probe bind")
+            .port();
+        let host = raw_socket("127.0.0.2");
+        host.send_to(&reg(b"ABCDE", dead), rg.ctrl).unwrap();
+        let _vport = recv_ack_then_vport(&host);
+
+        let mut app = online_app_with_gateway(&rg.ctrl.to_string());
+        enter_join(&mut app);
+        type_code(&mut app, "ABCDE");
+        press_key(&mut app, KeyCode::Enter);
+        let mut connecting = false;
+        for _ in 0..150 {
+            app.update();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if join_status_label(&mut app) == "connecting…" {
+                connecting = true;
+                break;
+            }
+        }
+        assert!(connecting, "*F must hand off to the netcode connect");
+        assert!(
+            matches!(
+                app.world()
+                    .resource::<crate::core_bridge::net::gateway::NetGateway>()
+                    .guest,
+                GuestLookupState::Found { .. }
+            ),
+            "`Found` must stay sticky through the connect attempt"
+        );
+
+        app.world_mut().resource_mut::<NetSession>().joining_since =
+            Some(std::time::Instant::now() - JOIN_TIMEOUT);
+        let mut surfaced = false;
+        for _ in 0..10 {
+            app.update();
+            if join_status_label(&mut app)
+                == "host unreachable — ask host to enable UPnP or port-forward UDP 27015"
+            {
+                surfaced = true;
+                break;
+            }
+        }
+        assert!(
+            surfaced,
+            "the watchdog loss must show the room-path punch copy"
+        );
     }
 
     #[test]

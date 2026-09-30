@@ -109,7 +109,11 @@ pub fn hud_anchor(window_w: f32, window_h: f32) -> HudAnchor {
         } else {
             -panel
         },
-        right_panel_x: if portrait { window_w * 0.5 - 2.3 * cell } else { panel },
+        right_panel_x: if portrait {
+            window_w * 0.5 - 2.3 * cell
+        } else {
+            panel
+        },
         portrait,
         window_w,
         window_h,

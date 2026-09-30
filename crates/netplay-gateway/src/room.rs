@@ -20,6 +20,37 @@
 //!   `*G` idempotency/busy is per-IP (plan wording).
 //! - The gateway is IPv4-only (the `*F` payload carries 4-byte IPs, as
 //!   planned); IPv6 sources are dropped.
+//!
+//! # Host-side NAT punch (field fix, 2026-09-30)
+//!
+//! The relay used to send guest traffic to `(host_ip, game_port)` as
+//! advertised in `*R` — but a UDP server is silent until a client arrives,
+//! so the host's router never had an inbound mapping for that port and
+//! dropped the forwarded handshake (the exact field bug: room codes paired
+//! fine, guests timed out). The fix lives on both sides of the wire: the
+//! gateway tells the host its virtual data port via `*V` (sent immediately
+//! after every `*A`), the host punches one datagram from its game socket,
+//! and this machine routes guest data to the **observed** source:
+//!
+//! - Each room keeps `host_data_addr` — initialized `(host_ip, game_port)`
+//!   from `*R`, then replaced by the source of every host-side data packet.
+//! - A data-plane packet is host-side when its **source IP equals the
+//!   room's `host_ip`** (IP-level attribution, not per-socket): under NAT the
+//!   public port of the game socket is *not* the advertised `game_port`, so
+//!   the port carries no information — only the IP (the room was keyed by
+//!   the host's observed control-leg IP) does. A host-side packet refreshes
+//!   the punch and the room's liveness; it never pins the guest slot and is
+//!   never forwarded *as* guest data (it forwards *to* the pinned guest).
+//! - Guest pinning is unchanged: first data from a source IP ≠ `host_ip`.
+//! - Keepalive `*R` frames refresh `host_data_addr` **only until the first
+//!   punch** — after that the observed address is authoritative (a keepalive
+//!   arrives on the host's control socket, whose public port is unrelated to
+//!   the game socket's mapping).
+//! - **Aging window**: the punch mapping dies with the NAT's UDP timeout
+//!   (commonly ~30–120 s of silence). A long-idle waiting room therefore
+//!   relies on the game's auto-UPnP (which maps the game port explicitly and
+//!   renews its own lease) or a manual forward — punch and UPnP are
+//!   complementary; see the same note in the game's `gateway.rs` driver.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -119,6 +150,15 @@ struct Room {
     code: RoomCode,
     host_ip: Ipv4Addr,
     game_port: u16,
+    /// Where guest-bound data goes: initialized `(host_ip, game_port)` from
+    /// `*R`, then re-pointed by every host-side packet on the data port
+    /// (the NAT punch — the public port of the game socket is not the
+    /// advertised `game_port` under port-preserving-NAT-off routers).
+    host_data_addr: SocketAddr,
+    /// A host data packet has been observed on the data port. Once set,
+    /// keepalive `*R` frames stop refreshing `host_data_addr` (they arrive
+    /// from the control socket, not the game socket).
+    punched: bool,
     vport: u16,
     /// Last host activity (`*R` or host data) — drives both GC windows.
     last_host: VClock,
@@ -267,19 +307,24 @@ impl<Alloc: PortAllocator> Gateway<Alloc> {
             return Vec::new();
         };
         if src.ip() == room.host_ip {
-            room.last_host = now; // host data counts as keepalive
+            // Host-side leg (IP-level attribution — see the module docs on
+            // the NAT punch): refresh liveness AND re-point the guest-bound
+            // target at the observed source (the punch; this also follows a
+            // mid-session NAT port rotation). Never a guest pin, never
+            // forwarded as guest data.
+            room.last_host = now;
+            room.host_data_addr = src;
+            room.punched = true;
             match room.guest {
                 Some(guest) => vec![(guest.addr, bytes.to_vec())],
                 // Netcode connects from the guest side: host→nobody is a drop.
                 None => Vec::new(),
             }
         } else {
+            let to_host = room.host_data_addr;
             match room.guest {
                 Some(guest) if guest.addr == src => {
-                    vec![(
-                        SocketAddr::from((room.host_ip, room.game_port)),
-                        bytes.to_vec(),
-                    )]
+                    vec![(to_host, bytes.to_vec())]
                 }
                 Some(_) => Vec::new(), // third source: room already has its guest
                 None => {
@@ -287,10 +332,7 @@ impl<Alloc: PortAllocator> Gateway<Alloc> {
                         addr: src,
                         last_data: now,
                     });
-                    vec![(
-                        SocketAddr::from((room.host_ip, room.game_port)),
-                        bytes.to_vec(),
-                    )]
+                    vec![(to_host, bytes.to_vec())]
                 }
             }
         }
@@ -304,39 +346,55 @@ impl<Alloc: PortAllocator> Gateway<Alloc> {
         game_port: u16,
         now: VClock,
     ) -> Vec<(SocketAddr, Vec<u8>)> {
-        let frame = if let Some(idx) = self.find(code) {
+        // `*A` is answered with `*V <code> <vport>` right behind it (field
+        // fix, module docs): the host needs the virtual data port to punch
+        // its NAT from the game socket. Every Ack carries it — a lost `*V`
+        // gets another chance on the next 2 s keepalive, and pre-`*V`
+        // clients drop the extra datagram silently.
+        let frames: Vec<Frame> = if let Some(idx) = self.find(code) {
             let room = self.slots[idx].as_mut().expect("find returned a live slot");
             if room.host_ip == src_ip {
                 room.last_host = now;
                 // A restart on the same IP reuses the code with a fresh
-                // game port; keepalive refreshes it.
+                // game port; keepalive refreshes it — and the initial
+                // host_data_addr with it, until the first punch makes the
+                // observed address authoritative.
                 room.game_port = game_port;
-                Frame::Ack { code }
+                if !room.punched {
+                    room.host_data_addr = SocketAddr::from((src_ip, game_port));
+                }
+                let vport = room.vport;
+                vec![Frame::Ack { code }, Frame::VirtualPort { code, vport }]
             } else {
-                Frame::Collision { code }
+                vec![Frame::Collision { code }]
             }
         } else {
             match self.free_slot() {
                 Some(idx) => {
                     let vport = self.config.data_port_start + idx as u16;
                     if self.alloc.bind(vport).is_err() {
-                        Frame::SlotExhausted { code }
+                        vec![Frame::SlotExhausted { code }]
                     } else {
                         self.slots[idx] = Some(Room {
                             code,
                             host_ip: src_ip,
                             game_port,
+                            host_data_addr: SocketAddr::from((src_ip, game_port)),
+                            punched: false,
                             vport,
                             last_host: now,
                             guest: None,
                         });
-                        Frame::Ack { code }
+                        vec![Frame::Ack { code }, Frame::VirtualPort { code, vport }]
                     }
                 }
-                None => Frame::SlotExhausted { code },
+                None => vec![Frame::SlotExhausted { code }],
             }
         };
-        vec![(src, wire::encode(&frame))]
+        frames
+            .into_iter()
+            .map(|frame| (src, wire::encode(&frame)))
+            .collect()
     }
 
     fn lookup(&self, code: RoomCode, src: SocketAddr) -> Vec<(SocketAddr, Vec<u8>)> {
@@ -511,7 +569,10 @@ mod tests {
     fn register_acks_and_binds_first_slot() {
         let mut g = gw();
         let replies = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
-        assert_frame_to!(&replies, HOST, ack(b"ABCDE"));
+        // Field fix: every *A is followed by *V (see `register_*_virtual_port`).
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (HOST, ack(b"ABCDE")));
+        assert_eq!(parse_vport(&replies[1].1), Some(27017));
         assert_eq!(g.live_rooms(), 1);
         assert_eq!(g.allocator().bound, vec![27017]);
     }
@@ -528,7 +589,8 @@ mod tests {
             &reg(b"ABCDE", 6000),
             VClock(10_000),
         );
-        assert_frame_to!(&replies, same_ip_other_port, ack(b"ABCDE"));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (same_ip_other_port, ack(b"ABCDE")));
         assert_eq!(g.live_rooms(), 1);
         // Keepalive refreshed the game port: guest data now forwards there.
         let fwd = g.on_packet(27017, GUEST, b"\x05hello", VClock(10_500));
@@ -599,16 +661,19 @@ mod tests {
     fn guest_pins_on_first_data_and_forward_both_ways() {
         let mut g = gw();
         let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
-        // Host data with no guest yet: dropped (netcode dials from the guest).
+        // Host data with no guest yet: dropped (netcode dials from the guest)
+        // — and since the field fix it doubles as the NAT punch, re-pointing
+        // guest-bound forwarding at the observed host socket (51 000 here,
+        // not the advertised 5000).
         assert!(g.on_packet(27017, HOST, b"\x05h", VClock(10)).is_empty());
         // First non-host packet pins the guest and forwards to the host.
         let fwd = g.on_packet(27017, GUEST, b"\x00g", VClock(20));
-        assert_eq!(fwd, vec![(sa([10, 0, 0, 1], 5000), b"\x00g".to_vec())]);
+        assert_eq!(fwd, vec![(HOST, b"\x00g".to_vec())]);
         // Host→guest and guest→host both flow.
         let fwd = g.on_packet(27017, HOST, b"\x05h2", VClock(30));
         assert_eq!(fwd, vec![(GUEST, b"\x05h2".to_vec())]);
         let fwd = g.on_packet(27017, GUEST, b"\x00g2", VClock(40));
-        assert_eq!(fwd, vec![(sa([10, 0, 0, 1], 5000), b"\x00g2".to_vec())]);
+        assert_eq!(fwd, vec![(HOST, b"\x00g2".to_vec())]);
         // A third source is dropped: the room already has its guest.
         assert!(g.on_packet(27017, OTHER, b"\x00x", VClock(50)).is_empty());
     }
@@ -691,7 +756,8 @@ mod tests {
         assert_eq!(g.on_tick(VClock(30)), vec![PortEvent::Closed(27017)]);
         // Code reusable right away; *D is silent for unknown codes.
         let replies = g.on_packet(CTRL, OTHER, &reg(b"ABCDE", 6000), VClock(31));
-        assert_frame_to!(&replies, OTHER, ack(b"ABCDE"));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (OTHER, ack(b"ABCDE")));
         let replies = g.on_packet(CTRL, HOST, &release(b"QQQQQ"), VClock(32));
         assert!(replies.is_empty());
     }
@@ -770,7 +836,8 @@ mod tests {
         // Freeing a slot (*D) makes room again, reusing the freed port.
         let _ = g.on_packet(CTRL, HOST, &release(b"ABCDE"), VClock(1_000));
         let replies = g.on_packet(CTRL, fifth, &reg(b"MNPQR", 5000), VClock(1_100));
-        assert_frame_to!(&replies, fifth, ack(b"MNPQR"));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (fifth, ack(b"MNPQR")));
         assert_eq!(g.allocator().bound, vec![27018, 27017]);
     }
 
@@ -798,7 +865,8 @@ mod tests {
         // Nothing was poisoned: with binds working again the register succeeds.
         g.alloc.fail_from = None;
         let replies = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(10));
-        assert_frame_to!(&replies, HOST, ack(b"ABCDE"));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (HOST, ack(b"ABCDE")));
     }
 
     #[test]
@@ -863,6 +931,165 @@ mod tests {
         assert_eq!(normalize_code(b"ABCDEA"), None);
         assert_eq!(normalize_code(b"ABCDI"), None); // I excluded
         assert_eq!(normalize_code(b"ABCD0"), None); // 0 excluded
+    }
+
+    // ---- field fix: host-side NAT punch (written RED first against the
+    // pre-fix room.rs — see the commit log for the captured failures) ----
+
+    /// Hand-parses a `*V <code:5B> <vport:u16>` frame (len 9) directly from
+    /// the bytes. Deliberately independent of `wire::Frame` so these tests
+    /// compile and fail at *runtime* (RED) against the pre-fix wire codec,
+    /// then stay honest after the variant lands.
+    fn parse_vport(bytes: &[u8]) -> Option<u16> {
+        if bytes.len() == 9 && bytes[0] == b'*' && bytes[1] == b'V' {
+            Some(u16::from_be_bytes([bytes[7], bytes[8]]))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn register_replies_ack_then_virtual_port() {
+        let mut g = gw();
+        let replies = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        assert_eq!(replies.len(), 2, "expected [*A, *V] to the host");
+        assert_eq!(replies[0], (HOST, ack(b"ABCDE")), "*A first, unchanged");
+        assert_eq!(replies[1].0, HOST);
+        assert_eq!(
+            parse_vport(&replies[1].1),
+            Some(27017),
+            "*V carries the room's virtual data port, right after *A"
+        );
+        // Keepalive: same pairing every 2 s (a punch missed on packet loss
+        // gets another chance; old clients drop the extra frame).
+        let replies = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(2_000));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], (HOST, ack(b"ABCDE")));
+        assert_eq!(parse_vport(&replies[1].1), Some(27017));
+    }
+
+    #[test]
+    fn virtual_port_accompanies_only_acks() {
+        let mut g = gw();
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        // Collision, *F lookups and *E answers never carry a *V.
+        let replies = g.on_packet(CTRL, OTHER, &reg(b"ABCDE", 7000), VClock(100));
+        assert_eq!(replies.len(), 1);
+        let replies = g.on_packet(CTRL, GUEST, &lookup(b"ABCDE"), VClock(200));
+        assert_eq!(replies.len(), 1);
+        let replies = g.on_packet(CTRL, GUEST, &lookup(b"ZZZZZ"), VClock(300));
+        assert_eq!(replies.len(), 1);
+        // Slot exhaustion: *S only.
+        let config = GatewayConfig {
+            data_ports: 1,
+            ..GatewayConfig::default()
+        };
+        let mut full = Gateway::new(config, FakeAlloc::default());
+        let _ = full.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        let replies = full.on_packet(CTRL, OTHER, &reg(b"FGHJK", 5000), VClock(0));
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            decoded(&replies),
+            vec![Frame::SlotExhausted { code: *b"FGHJK" }]
+        );
+    }
+
+    #[test]
+    fn punch_updates_host_data_addr_and_guest_data_follows_it() {
+        let mut g = gw();
+        // *R advertises game_port 5000; the NAT's real public port is 40123 —
+        // forwarding must follow the observed punch, never the advertised port.
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        let punched = sa([10, 0, 0, 1], 40_123);
+        // The punch datagram: no guest yet → no forward…
+        assert!(g.on_packet(27017, punched, b"\x2b", VClock(10)).is_empty());
+        // …and it never consumes the guest slot.
+        let replies = g.on_packet(CTRL, GUEST, &lookup(b"ABCDE"), VClock(20));
+        assert_eq!(
+            decoded(&replies),
+            vec![Frame::Found {
+                code: *b"ABCDE",
+                host_ip: [10, 0, 0, 1],
+                vport: 27017,
+            }]
+        );
+        // First guest packet pins and forwards to the PUNCHED address.
+        let fwd = g.on_packet(27017, GUEST, b"\x00hello", VClock(30));
+        assert_eq!(fwd, vec![(punched, b"\x00hello".to_vec())]);
+        // Host replies from the punched socket flow back to the guest.
+        let fwd = g.on_packet(27017, punched, b"\x05hi", VClock(40));
+        assert_eq!(fwd, vec![(GUEST, b"\x05hi".to_vec())]);
+    }
+
+    #[test]
+    fn host_ip_data_never_pins_the_guest() {
+        let mut g = gw();
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        // Any source with the host's IP is host-side — the original game
+        // socket, the punch socket, a rotated mapping — and none of them
+        // pair the room.
+        assert!(g.on_packet(27017, HOST, b"\x05a", VClock(10)).is_empty());
+        assert!(g
+            .on_packet(27017, sa([10, 0, 0, 1], 41_000), b"\x2b", VClock(20))
+            .is_empty());
+        let replies = g.on_packet(CTRL, OTHER, &lookup(b"ABCDE"), VClock(30));
+        assert_eq!(
+            decoded(&replies),
+            vec![Frame::Found {
+                code: *b"ABCDE",
+                host_ip: [10, 0, 0, 1],
+                vport: 27017,
+            }],
+            "*F not *B: host-side data must never pair the room"
+        );
+        // A non-host source still pins on first data.
+        assert_eq!(g.on_packet(27017, GUEST, b"\x00g", VClock(40)).len(), 1);
+        // And a host-IP source after pairing forwards to the guest instead
+        // of becoming a second guest.
+        let fwd = g.on_packet(27017, sa([10, 0, 0, 1], 41_999), b"\x05h", VClock(50));
+        assert_eq!(fwd, vec![(GUEST, b"\x05h".to_vec())]);
+    }
+
+    #[test]
+    fn punch_refreshes_room_liveness() {
+        let mut g = gw();
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        // No *R keepalives at all: a punch at 14 s refreshes the host clock.
+        let _ = g.on_packet(27017, sa([10, 0, 0, 1], 40_123), b"\x2b", VClock(14_000));
+        assert!(g.on_tick(VClock(14_999)).is_empty());
+        assert_eq!(g.live_rooms(), 1);
+        assert_eq!(g.on_tick(VClock(29_000)), vec![PortEvent::Closed(27017)]);
+    }
+
+    #[test]
+    fn keepalive_after_punch_does_not_clobber_the_punched_address() {
+        let mut g = gw();
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        let punched = sa([10, 0, 0, 1], 40_123);
+        let _ = g.on_packet(27017, punched, b"\x2b", VClock(100));
+        // Keepalive *R arrives on the CONTROL socket — a different source
+        // than the game socket — and must not reset the guest-bound target
+        // back to the advertised (unreachable) game_port.
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(2_000));
+        let fwd = g.on_packet(27017, GUEST, b"\x00x", VClock(2_500));
+        assert_eq!(fwd, vec![(punched, b"\x00x".to_vec())]);
+    }
+
+    #[test]
+    fn punch_relocates_mid_session_on_nat_port_rotation() {
+        let mut g = gw();
+        let _ = g.on_packet(CTRL, HOST, &reg(b"ABCDE", 5000), VClock(0));
+        let first = sa([10, 0, 0, 1], 40_123);
+        let _ = g.on_packet(27017, first, b"\x2b", VClock(100));
+        let _ = g.on_packet(27017, GUEST, b"\x00p", VClock(200));
+        // The NAT rotates the host's public mapping mid-session: the next
+        // host-sourced packet re-points guest-bound forwarding (and keeps
+        // flowing to the guest itself).
+        let second = sa([10, 0, 0, 1], 42_000);
+        let fwd = g.on_packet(27017, second, b"\x05r", VClock(1_000));
+        assert_eq!(fwd, vec![(GUEST, b"\x05r".to_vec())]);
+        let fwd = g.on_packet(27017, GUEST, b"\x00y", VClock(1_100));
+        assert_eq!(fwd, vec![(second, b"\x00y".to_vec())]);
     }
 
     #[test]

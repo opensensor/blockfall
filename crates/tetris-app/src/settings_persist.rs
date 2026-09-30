@@ -607,6 +607,16 @@ impl Plugin for SettingsPersistPlugin {
     }
 }
 
+/// Serializes every test that mutates the process-wide
+/// `TETRIS_CONFIG_DIR`, so parallel cargo threads can never observe a
+/// half-set override. `pub(crate)` because `state`'s smoke tests must
+/// hold it too: they boot [`SettingsPersistPlugin`], and without the
+/// lock a concurrent `set_var` from this module's tests could point
+/// their startup load at another test's temp dir mid-window (the
+/// das_ms 111/150 flake).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,11 +624,6 @@ mod tests {
     use crate::core_bridge::CoreBridgePlugin;
     use crate::input::ALL_BIND_SLOTS;
     use crate::state::{AppState, EffectsQuality};
-
-    /// Serializes every test that mutates the process-wide
-    /// `TETRIS_CONFIG_DIR`, so parallel cargo threads can never observe a
-    /// half-set override.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Unique temp dir under the system temp dir. Tests that go through the
     /// plugin point `TETRIS_CONFIG_DIR` at these dirs, so the real config

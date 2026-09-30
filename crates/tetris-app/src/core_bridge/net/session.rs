@@ -306,8 +306,10 @@ pub struct NetSession {
     /// Guest: `Hello` was queued this frame and still needs one frame to
     /// flush before `Ready` (internal).
     hello_pending: bool,
-    /// Watchdog base for `Connecting` (internal).
-    joining_since: Option<Instant>,
+    /// Watchdog base for `Connecting` (internal — `pub(crate)` only so the
+    /// `online_ui` flow tests can fast-forward the timeout instead of
+    /// sleeping the full [`JOIN_TIMEOUT`]).
+    pub(crate) joining_since: Option<Instant>,
     /// `RenetServerEvent`s queued by the observer for the host bridge
     /// system to process (internal — observers can't write `Messages`).
     server_notes: VecDeque<ServerNote>,
@@ -419,8 +421,19 @@ pub(crate) fn net_host_on(world: &mut World, bind: Ipv4Addr, port: u16) {
 
 fn net_host_at(world: &mut World, bind: Ipv4Addr, port: u16) {
     net_stop(world);
-    match bind_host(bind, port) {
-        Ok((transport, addr)) => {
+    // Field fix (gateway-plan.md "Field fix: host punch"): with the gateway
+    // armed, the freshly bound game socket is *held* (`PendingHostSocket`)
+    // while the control driver announces the room — the NAT punch has to
+    // leave this socket before netcode owns it. `NetStatus::Listening`
+    // arrives at bind time either way (the port is reserved; announce
+    // latency ≤ 3 s). With the gateway disabled this collapses to the
+    // pre-fix path byte for byte: bind → transport → `Listening` in one
+    // synchronous step.
+    let gateway_enabled = world
+        .get_resource::<super::gateway::NetGateway>()
+        .is_some_and(|gateway| gateway.enabled);
+    match bind_game_socket(bind, port) {
+        Ok((socket, addr)) => {
             {
                 let mut session = world.resource_mut::<NetSession>();
                 session.role = NetRole::Host;
@@ -428,11 +441,28 @@ fn net_host_at(world: &mut World, bind: Ipv4Addr, port: u16) {
                 session.apply(NetTrigger::BindOk);
                 session.listen_addr = Some(addr);
             }
-            world.insert_resource(transport);
-            world.insert_resource(RenetServer::new(ConnectionConfig::default()));
-            info!(
-                "net: hosting on {addr} (protocol id {PROTOCOL_ID:#x}, version {PROTOCOL_VERSION})"
-            );
+            if gateway_enabled {
+                world.insert_resource(PendingHostSocket { socket });
+                info!(
+                    "net: hosting on {addr} (protocol id {PROTOCOL_ID:#x}, version {PROTOCOL_VERSION}) — gateway announce pending"
+                );
+            } else {
+                match transport_from_socket(socket) {
+                    Ok(transport) => {
+                        world.insert_resource(transport);
+                        world.insert_resource(RenetServer::new(ConnectionConfig::default()));
+                        info!(
+                            "net: hosting on {addr} (protocol id {PROTOCOL_ID:#x}, version {PROTOCOL_VERSION})"
+                        );
+                    }
+                    Err(message) => {
+                        let mut session = world.resource_mut::<NetSession>();
+                        session.apply(NetTrigger::BindFailed(message.clone()));
+                        world.write_message(NetEvent::BindFailed(message.clone()));
+                        warn!("net: host bind failed on port {port}: {message}");
+                    }
+                }
+            }
         }
         Err(message) => {
             {
@@ -446,10 +476,18 @@ fn net_host_at(world: &mut World, bind: Ipv4Addr, port: u16) {
     }
 }
 
-/// Bind the UDP socket *before* handing it to the transport — the transport
-/// exposes no `local_addr()` (port-0 strategy from the Verified API notes).
-fn bind_host(bind: Ipv4Addr, port: u16) -> Result<(NetcodeServerTransport, SocketAddr), String> {
+/// Bind the UDP socket only — the transport exposes no `local_addr()`
+/// (port-0 strategy from the Verified API notes), so the bound address is
+/// read back here at bind time.
+fn bind_game_socket(bind: Ipv4Addr, port: u16) -> Result<(UdpSocket, SocketAddr), String> {
     let socket = UdpSocket::bind((bind, port)).map_err(|e| e.to_string())?;
+    let addr = socket.local_addr().map_err(|e| e.to_string())?;
+    Ok((socket, addr))
+}
+
+/// Build the netcode server transport around a socket already bound by
+/// [`bind_game_socket`] (the advertised address is the bound one).
+fn transport_from_socket(socket: UdpSocket) -> Result<NetcodeServerTransport, String> {
     let addr = socket.local_addr().map_err(|e| e.to_string())?;
     let config = ServerConfig {
         current_time: unix_now(),
@@ -458,8 +496,53 @@ fn bind_host(bind: Ipv4Addr, port: u16) -> Result<(NetcodeServerTransport, Socke
         public_addresses: vec![addr],
         authentication: ServerAuthentication::Unsecure,
     };
-    let transport = NetcodeServerTransport::new(config, socket).map_err(|e| e.to_string())?;
-    Ok((transport, addr))
+    NetcodeServerTransport::new(config, socket).map_err(|e| e.to_string())
+}
+
+/// A game socket bound by the gateway-armed host flow whose netcode server
+/// has not been built yet (see [`net_host_at`]): the gateway driver punches
+/// it, then hands it over with [`handover_pending_host_socket`]. `net_stop`
+/// drops it (freeing the port) if hosting ends before the handover.
+#[derive(Resource)]
+pub(crate) struct PendingHostSocket {
+    pub(crate) socket: UdpSocket,
+}
+
+/// Completes the deferred gateway host flow: moves the held game socket into
+/// a live `NetcodeServerTransport` + `RenetServer` while the session stays
+/// `Listening` on the same `listen_addr` (no new [`NetStatus`] state). UDP
+/// connect requests that arrived during the announce window sat in the
+/// socket's OS receive buffer — netcode reads them on its first poll (pinned
+/// by `buffered_connect_requests_survive_deferred_handover`).
+///
+/// A no-op when nothing is pending (already handed over, gateway-disabled
+/// host, or stopped mid-window). A transport-construction failure surfaces
+/// exactly like a bind failure at `net_host` time: `BindFailed` + event.
+pub(crate) fn handover_pending_host_socket(world: &mut World) {
+    let Some(pending) = world.remove_resource::<PendingHostSocket>() else {
+        return;
+    };
+    let addr = pending
+        .socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    match transport_from_socket(pending.socket) {
+        Ok(transport) => {
+            world.insert_resource(transport);
+            world.insert_resource(RenetServer::new(ConnectionConfig::default()));
+            info!("net: game transport live on {addr} (gateway announce window closed)");
+        }
+        Err(message) => {
+            warn!("net: deferred host transport failed on {addr}: {message}");
+            {
+                let mut session = world.resource_mut::<NetSession>();
+                session.apply(NetTrigger::Stop);
+                session.apply(NetTrigger::BindFailed(message.clone()));
+            }
+            world.write_message(NetEvent::BindFailed(message));
+        }
+    }
 }
 
 /// Join the host at `addr` (netcode client, unsecure auth). Transitions to
@@ -518,6 +601,9 @@ fn build_client(addr: SocketAddr) -> Result<(NetcodeClientTransport, RenetClient
 /// sockets). This is the "Esc-on-Listening" and universal teardown entry
 /// point; safe to call in any state.
 pub fn net_stop(world: &mut World) {
+    // A gateway-armed host stopped before its transport handover must free
+    // the held game socket too (field fix — see [`PendingHostSocket`]).
+    world.remove_resource::<PendingHostSocket>();
     // Server and transport are removed independently: test seams (and any
     // half-built session) may hold one without the other, and `Idle` after
     // `net_stop` must mean *no* transport resources in the world.
@@ -826,6 +912,7 @@ fn guest_net_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_bridge::net::gateway::NetGateway;
 
     // ---- Pure FSM transition table (netplay-plan.md N2 validation) ----
     // RED→GREEN evidence: these run against next_status alone — no
@@ -1099,6 +1186,110 @@ mod tests {
         // Recovery through the same entry point.
         net_host(app.world_mut(), 0);
         assert_eq!(session_status(&app), NetStatus::Listening);
+    }
+
+    // ---- Field fix: gateway-armed deferred host transport ----
+
+    fn gateway_armed_app() -> App {
+        let mut app = net_app();
+        // The endpoint is irrelevant: these tests drive `net_host`/handover
+        // directly and never tick the control system.
+        app.world_mut()
+            .insert_resource(NetGateway::test_with_endpoint("127.0.0.1:9"));
+        app
+    }
+
+    #[test]
+    fn gateway_armed_host_holds_the_socket_until_handover() {
+        let mut app = gateway_armed_app();
+        net_host(app.world_mut(), 0);
+        assert_eq!(session_status(&app), NetStatus::Listening);
+        assert!(app.world().contains_resource::<PendingHostSocket>());
+        assert!(!app.world().contains_resource::<NetcodeServerTransport>());
+        assert!(!app.world().contains_resource::<RenetServer>());
+        let listen = app.world().resource::<NetSession>().listen_addr;
+
+        handover_pending_host_socket(app.world_mut());
+        assert!(!app.world().contains_resource::<PendingHostSocket>());
+        assert!(app.world().contains_resource::<NetcodeServerTransport>());
+        assert!(app.world().contains_resource::<RenetServer>());
+        assert_eq!(session_status(&app), NetStatus::Listening);
+        assert_eq!(app.world().resource::<NetSession>().listen_addr, listen);
+        // A late second call (`*V` after a timeout handover) is a pure no-op.
+        handover_pending_host_socket(app.world_mut());
+        assert_eq!(session_status(&app), NetStatus::Listening);
+    }
+
+    #[test]
+    fn gateway_disabled_host_builds_transport_synchronously() {
+        // Pre-fix path byte for byte: bind → transport → Listening in one
+        // synchronous step, nothing ever pending.
+        let mut app = net_app();
+        net_host(app.world_mut(), 0);
+        assert!(!app.world().contains_resource::<PendingHostSocket>());
+        assert!(app.world().contains_resource::<NetcodeServerTransport>());
+        assert_eq!(session_status(&app), NetStatus::Listening);
+
+        // An explicit disabled resource behaves identically to absent.
+        let mut app = net_app();
+        app.world_mut().insert_resource(NetGateway::disabled());
+        net_host(app.world_mut(), 0);
+        assert!(!app.world().contains_resource::<PendingHostSocket>());
+        assert!(app.world().contains_resource::<NetcodeServerTransport>());
+    }
+
+    #[test]
+    fn net_stop_drops_pending_socket_and_frees_the_port() {
+        let mut app = gateway_armed_app();
+        net_host(app.world_mut(), 0);
+        let port = app
+            .world()
+            .resource::<NetSession>()
+            .listen_addr
+            .unwrap()
+            .port();
+        assert!(app.world().contains_resource::<PendingHostSocket>());
+        net_stop(app.world_mut());
+        assert_eq!(session_status(&app), NetStatus::Idle);
+        assert!(!app.world().contains_resource::<PendingHostSocket>());
+        let rebind = UdpSocket::bind(("127.0.0.1", port));
+        assert!(
+            rebind.is_ok(),
+            "net_stop must free the held game port: {rebind:?}"
+        );
+    }
+
+    #[test]
+    fn buffered_connect_requests_survive_deferred_handover() {
+        // The guest's netcode connect requests arrive **while the game
+        // socket has no owner** (announce window): they must sit in the OS
+        // receive buffer and be picked up by the transport's first poll —
+        // the join must not need to retry after the handover.
+        let mut host = gateway_armed_app();
+        net_host(host.world_mut(), 0);
+        let listen = host.world().resource::<NetSession>().listen_addr.unwrap();
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), listen.port());
+        // The gateway was only needed for the deferred bind; disarm it so the
+        // control system never announces to the dummy endpoint (removing the
+        // resource entirely would break the driver system's parameters).
+        host.world_mut().resource_mut::<NetGateway>().enabled = false;
+
+        let mut guest = net_app();
+        net_join(guest.world_mut(), addr);
+        for _ in 0..20 {
+            guest.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            host.world().contains_resource::<PendingHostSocket>(),
+            "the handover must not have happened yet"
+        );
+        assert_eq!(session_status(&guest), NetStatus::Connecting);
+
+        handover_pending_host_socket(host.world_mut());
+        drive_until(&mut host, &mut guest, 1_000, |h, g| {
+            session_status(h) == NetStatus::Ready && session_status(g) == NetStatus::Ready
+        });
     }
 
     #[test]

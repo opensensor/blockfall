@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Room-code hosting across consumer NAT (field fix, gateway-plan.md
+  "Field fix: host punch")**: room codes paired reliably but guests then
+  sat in `Connecting` forever against a real host NAT — the host's game
+  socket never sent a packet, so the host router had no inbound mapping for
+  the relay's forwarded connect requests. The relay now announces the room's
+  virtual data port in a new `*V` frame after every `*A`; the host punches
+  that address once from the held game socket before netcode takes it over,
+  and the relay retargets the room's host-side address on the punch (and on
+  every host-source packet, following NAT port rotation) instead of the
+  advertised `game_port`. Hosting with the gateway armed is now a two-phase
+  bind (`Listening` is immediate; the netcode transport comes up when the
+  announce window closes, ≤ 3 s), connect requests that arrive mid-window
+  are served from the socket's receive buffer, and the wire stays
+  backward/forward compatible in both directions (old games drop the unknown
+  frame; new games hand the socket over punch-less when no `*V` arrives).
+  A `*F`-then-dead-air guest now reads
+  `host unreachable — ask host to enable UPnP or port-forward UDP 27015`
+  instead of the generic loss line.
+- **Test isolation**: the full-plugin smoke tests now pin `TETRIS_CONFIG_DIR`
+  to a private temp dir under the settings tests' shared env lock, fixing an
+  intermittent `das_ms 111 vs 150` race when a settings-persistence test
+  wrote its temp dir mid-boot.
+
 ## [0.3.0] — 2026-09-30
 
 ### Added

@@ -590,3 +590,88 @@ zero-dependency crate (`crates/netplay-gateway`) with packaging and CI, the
 client surfaces every failure mode in words, and the whole stack is pinned by
 an E2E that crowns a full Garbage match through the real relay with per-60-tick
 hash-stream equality — all riding `cargo test --workspace`.
+
+## Field fix: host punch (2026-09-30)
+
+**Symptom (field report).** Two players over the relay: guest enters the
+room code, sees the pair succeed, then dead air — the guest sits in
+`Connecting` until the netcode join times out while the host sits in
+`Listening` seeing nothing. Reproduced against a consumer NAT: the guest's
+netcode connect requests reach the relay, the relay forwards them to the
+host's **advertised** `game_port` from the `*R`, but on the host side that
+advertised port never had an inbound UDP mapping — the host's game socket
+was created by the netcode server and never sent a single packet, so the
+host router dropped every relayed packet. The relay's pin-on-first-data rule
+(G1) made this invisible in the loopback suite: on the test box the
+advertised port *is* reachable, so `relay_loopback` and the crown E2E stayed
+green while the WAN path was broken.
+
+**Design.** The fix is a classic host-side UDP punch, driven by a new
+gateway→host control frame so the host can punch the exact socket the
+session will use:
+
+1. **`*V` frame** — `*V <code:5B> <vport:u16>` (9 bytes), sent by the relay
+   immediately after **every** `*A` (initial and keepalive). `*A` stays 7
+   bytes; everything else on the wire is frozen. The vport is the room's
+   virtual data port — the only source address whose relayed packets will
+   reach the guest, so punching toward it opens the host NAT mapping for the
+   relay's forwarded traffic.
+2. **Deferred handover** (`session.rs`) — with the gateway armed, `net_host`
+   binds the game socket and *holds* it (`PendingHostSocket`) while still
+   going `Listening` immediately (the port is reserved; `*V`/handover add
+   ≤ 3 s of latency). The gateway driver (`gateway.rs`) punches once
+   (`0x2B` datagram, contents irrelevant — NAT side effect only) from the
+   held socket toward `gateway_ip:vport`, then hands the socket to netcode
+   (`handover_pending_host_socket` builds `NetcodeServerTransport` +
+   `RenetServer` on the same bound port). Guest connect requests that
+   arrived during the announce window sit in the socket's OS receive buffer
+   and are picked up on the transport's first poll — pinned by
+   `buffered_connect_requests_survive_deferred_handover`.
+3. **Relay-side address book** (`room.rs`) — the room tracks
+   `host_data_addr` (init: advertised `(host_ip, game_port)` from `*R`).
+   Any data packet whose source **IP** matches the host gets
+   `host_data_addr = src`: punch, refresh, NAT-port-rotation tracking.
+   Attribution is IP-level because the host has two sockets (control +
+   game) whose ports differ; guest pinning is unchanged (first data from a
+   non-host IP) and guest→host forwarding always targets
+   `host_data_addr`. A keepalive `*R` refreshes `host_data_addr` only until
+   the first punch — keepalives arrive from the control socket and must not
+   clobber the punched address (test-pinned).
+4. **Degraded-path honesty** — a room whose `*F` succeeded but whose
+   netcode connect then times out shows
+   `host unreachable — ask host to enable UPnP or port-forward UDP 27015`
+   on the Join status line (`room_connect_failure_text`, selected while
+   `GuestLookupState::Found` is sticky). `*B`/`*E`/gateway-offline and every
+   IP-mode line are untouched.
+
+**Timing.** First `*R` + 3 s without `*A` → hand over punch-less (DNS dead,
+gateway down — LAN/direct must never wait on the gateway). `*A` + 3 s
+without `*V` → hand over punch-less (old gateway, lost frame). `*V` at any
+time while `Announced` → punch + hand over immediately. `NetStatus` stays
+`Listening` throughout; no new session states.
+
+**Compatibility matrix (all pinned by tests).**
+
+| game | gateway | behavior |
+|------|---------|----------|
+| new | new | `*V` punches, guest connects immediately |
+| new | old (no `*V`) | 3 s after `*A` (or `*R`) the socket is handed over punch-less — same outcome as pre-fix: LAN/direct works, punching a strict NAT does not; the actionable copy tells the host why |
+| old | new | strict wire decode rejects the unknown `*V` type byte → old clients silently drop it (pinned by `pre_fix_decoder_drops_v_frame_like_any_unknown_type` + an equivalent client-level pin) |
+
+UPnP on the hosting path is unaffected (it triggers on the `Listening` edge,
+which now arrives at bind time, *earlier* than before). One documented
+aging caveat: if the punch's NAT mapping is aged out (some routers < 30 s)
+and no guest connects in that window, the keepalive `*R` cannot re-punch
+(it refreshes only until the first punch) — acceptable for human-paced
+joins; noted in `room.rs` module docs.
+
+**Operator deploy.** The gateway is on the pull cycle: tag → CI builds the
+musl binary (the release job runs `--self-test`, which now also pins the
+`*A`+`*V` handshake) → on threadripper `systemctl start
+blockfall-update.service` (or wait for the 6 h timer) adopts it —
+`--self-test` is the install gate; failures keep the previous container.
+Watch it with `podman logs -f blockfall-gateway` (banner + collision +
+per-60 s slot summaries) and `journalctl -u blockfall-update.service -f`
+(adopt decision). Old clients are unaffected by the new binary; games that
+have not updated still work against it (drop-unknown rule).
+

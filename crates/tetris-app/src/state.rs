@@ -133,8 +133,42 @@ mod smoke_tests {
             .init_resource::<RebindingCapture>();
     }
 
+    /// Pins `TETRIS_CONFIG_DIR` to a fresh empty directory for the test's
+    /// duration, holding the shared `settings_persist` env lock so a
+    /// parallel env-mutating test cannot point the plugin's startup load at
+    /// *another* test's temp dir (the historical `das_ms 111 vs 150` flake).
+    struct ConfigDirGuard {
+        _env: std::sync::MutexGuard<'static, ()>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::settings_persist::CONFIG_DIR_ENV);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn isolate_config_dir(label: &str) -> ConfigDirGuard {
+        let _env = crate::settings_persist::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "blockfall-smoke-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("smoke temp dir");
+        std::env::set_var(crate::settings_persist::CONFIG_DIR_ENV, &dir);
+        ConfigDirGuard { _env, dir }
+    }
+
     #[test]
     fn app_with_all_plugin_stubs_runs_frames_without_a_window() {
+        let _config = isolate_config_dir("frames");
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         add_app_plugins(&mut app);
@@ -154,6 +188,7 @@ mod smoke_tests {
     /// `visible: false` window with no display server involved.
     #[test]
     fn app_with_hidden_window_builds_runs_and_exits_after_n_frames() {
+        let _config = isolate_config_dir("hidden");
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.add_plugins(WindowPlugin {

@@ -1501,11 +1501,10 @@ mod tests {
     #[test]
     fn gateway_busy_room_surfaces_match_full_before_join_timeout() {
         use crate::core_bridge::net::gateway::testutil::{
-            raw_socket, recv_frame, reg, spawn_real_gateway,
+            raw_socket, recv_ack_then_vport, reg, spawn_real_gateway,
         };
         use crate::core_bridge::net::gateway::{join_room, GuestLookupState, NetGateway};
         use crate::core_bridge::net::online_ui::lookup_status_text;
-        use netplay_gateway::wire::{self, Frame};
 
         let rg = spawn_real_gateway(4);
         // Host leg registers ABCDE (from 127.0.0.2 per the G1 rule), and a
@@ -1513,13 +1512,8 @@ mod tests {
         // slot — the room is now busy.
         let host = raw_socket("127.0.0.2");
         host.send_to(&reg(b"ABCDE", 6000), rg.ctrl).unwrap();
-        assert!(matches!(recv_frame(&host), Some(Frame::Ack { .. })));
-        host.send_to(&wire::encode(&Frame::Lookup { code: *b"ABCDE" }), rg.ctrl)
-            .unwrap();
-        let vport = match recv_frame(&host) {
-            Some(Frame::Found { vport, .. }) => vport,
-            other => panic!("expected *F, got {other:?}"),
-        };
+        // Consume the field-fix *V pair and take the relay port from it.
+        let vport = recv_ack_then_vport(&host);
         let pinned = raw_socket("127.0.0.3");
         pinned
             .send_to(b"\x00pin", SocketAddr::from(([127, 0, 0, 1], vport)))
