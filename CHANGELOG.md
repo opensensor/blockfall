@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-30
+
 ### Added
 
 - **Android port**: `crates/tetris-app` now builds as an `android_arm64` /
@@ -32,7 +34,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
   lifecycle suspend auto-pauses a live match, the Online → Join entry
   auto-focuses the Android soft keyboard, and the desktop "Quit" buttons
   are compiled out (back gesture exits). Verified on an API 36 emulator and
-  a Pixel 10 Pro XL.
+  a Pixel 10 Pro XL. Release tags now build the universal APK in CI
+  (Release workflow `android` job — SDK pinned to build-tools 37.0.0 /
+  platform 36 / NDK r30) and attach it to the GitHub release as
+  `blockfall-<tag>-android.apk`.
 - **Netplay gateway & room codes** (gateway-plan.md G1–G5): cross-WAN play
   with zero setup on both sides.
   - **Gateway** (`crates/netplay-gateway`, new zero-dependency crate):
@@ -153,5 +158,6 @@ First public release.
     `TETRIS_SHOT` screenshot hook for visual regression checks
   - GPLv3 license
 
+[0.3.0]: https://github.com/opensensor/blockfall/releases/tag/v0.3.0
 [0.2.0]: https://github.com/opensensor/blockfall/releases/tag/v0.2.0
 [0.1.0]: https://github.com/opensensor/blockfall/releases/tag/v0.1.0
