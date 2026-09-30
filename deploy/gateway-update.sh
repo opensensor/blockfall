@@ -36,7 +36,7 @@ pat = re.compile(sys.argv[1])
 for a in d.get("assets", []):
     if pat.match(a["name"]):
         print(a["browser_download_url"]); break
-')
+' "$ASSET_RE")
 
 current=""
 [ -f "$STATE/release" ] && current=$(cat "$STATE/release")
