@@ -58,7 +58,7 @@ chmod +x "$work/gateway"
 
 "$work/gateway" --self-test || { echo "self-test FAILED — keeping ${current:-previous} version"; exit 1; }
 
-printf 'FROM scratch\nCOPY gateway /blockfall-gateway\n' > "$work/Containerfile"
+printf 'FROM scratch\nCOPY gateway /blockfall-gateway\nENTRYPOINT ["/blockfall-gateway"]\n' > "$work/Containerfile"
 podman build -q -t "$IMAGE:$tag" -t "$IMAGE:local" -f "$work/Containerfile" "$work" >/dev/null
 
 systemctl restart "$SERVICE"
