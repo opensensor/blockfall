@@ -79,7 +79,7 @@ there is no video/state streaming, only inputs.
   **`match full`** (someone else already joined), **`gateway offline — check
   connection or join by IP`**. The entry toggles to **IP** mode with the mode
   button when you would rather type an address. The gateway is configured with
-  **`TETRIS_GATEWAY=<host:port>`** (default **`netplay.opensensor.xyz:27016`**;
+  **`TETRIS_GATEWAY=<host:port>`** (default **`blockfall.opensensor.io:27016`**;
   set it to **empty** to disable the whole feature and go direct-IP only — you
   can also run [your own gateway](#running-a-netplay-gateway) and point it
   there). Hosting never fails because the gateway is down: the room line just
@@ -186,6 +186,39 @@ TETRIS_BOT=1 TETRIS_SEED=7 \
 TETRIS_SHOT=/tmp/shot.png@900 \
 ../../target/release/blockfall
 ```
+
+### Android
+
+The game ships as an Android `cdylib` (`libblockfall_app.so`) loaded by a
+`NativeActivity` (winit native-activity backend, `#[bevy_main]` entry point),
+subclassed by `dev.blockfall.app.Main` (`android/java/...`, compiled to
+`classes.dex` by javac + d8) purely for immersive-fullscreen enforcement —
+the nav pill and status bar are hidden sticky-style, so nothing overlays the
+playfield. No Gradle: build and package with NDK + build-tools directly —
+
+```sh
+export ANDROID_HOME=/path/to/android-sdk   # needs a platform, build-tools, ndk
+./scripts/build-android.sh                 # javac/d8 + cargo-ndk + aapt2 + zipalign + apksigner
+$ANDROID_HOME/platform-tools/adb install -r target/android/blockfall-debug.apk
+```
+
+The debug keystore is generated on first run (`android/debug.keystore`,
+git-ignored). The APK is **portrait-native** (`portrait`, `targetSdk 34` —
+Android 15+ ignores system-bar hiding for apps targeting 35+): the field
+fills a vertical column with a HUD strip above (score/level/lines, hold box
+and horizontal next queue) and a compact button deck below. Controls
+(`crates/tetris-app/src/touch.rs`): playfield **gestures** — tap to rotate,
+drag left/right to shift, swipe down to soft-drop, flick down to hard-drop —
+plus discs for the rare actions (`CCW` `CW` `HOLD` `DROP` + `II` pause), all
+feeding the same DAS/ARR pipeline as the keyboard. A landscape button deck
+(`< > v` / `CCW CW DROP` / `HOLD`) still builds and is shown for rotated or
+desktop windows (`TETRIS_TOUCH=1` smoke-tests the buttons,
+`TETRIS_PORTRAIT=1` the portrait layout). Phone build notes: settings/best
+scores persist to the app's internal storage (there is no `~/.config`),
+hosting relies on the gateway or direct IP (SSDP multicast needs a Java-side
+lock), the Online → Join entry auto-focuses the soft keyboard, and the
+desktop-only "Quit" buttons are compiled out — exit through
+the system back gesture.
 
 ## App icon
 

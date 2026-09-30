@@ -7,6 +7,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
 
 ### Added
 
+- **Android port**: `crates/tetris-app` now builds as an `android_arm64` /
+  `android_x86_64` `cdylib` (`libblockfall_app.so`, `#[bevy_main]` entry)
+  packaged by `scripts/build-android.sh` (javac/d8 + cargo-ndk +
+  aapt2/zipalign/apksigner, no Gradle) against `android/AndroidManifest.xml`
+  — debug-signed APK in `target/android/`. The activity is portrait-locked
+  and immersive-fullscreen: `dev.blockfall.app.Main` (`android/java/`, a
+  `NativeActivity` subclass shipped as `classes.dex`) hides the nav pill and
+  status bar sticky-style on create/resume/focus, `targetSdk 34` because
+  Android 15+ ignores system-bar hiding for apps targeting 35+.
+  **Portrait-native layout**: `render::playfield_view` reserves a HUD strip
+  above the field (`LEVEL | SCORE | LINES`, hold box + horizontal next
+  queue) and a touch deck below (`combo`/`B2B` row under the field);
+  landscape windows keep the classic side-panel HUD, versus panels and the
+  full button cluster. New `crates/tetris-app/src/touch.rs`: playfield
+  **gestures** (tap = rotate, horizontal drag = shift per cell, swipe down =
+  soft drop, flick down = hard drop) plus a compact disc row (`CCW CW HOLD
+  DROP`) and pause disc on portrait; a landscape deck (`< > v` / `CCW CW
+  DROP` / `HOLD` / `II`) auto-swaps in for rotated/desktop windows —
+  desktop smoke-testable with `TETRIS_TOUCH=1` (`TETRIS_PORTRAIT=1` forces
+  the portrait layout). All input drives the existing DAS/ARR/soft-drop
+  repeat machines and the local versus seat. Android details: settings/best
+  scores write to the app's private internal storage (no `dirs` home),
+  lifecycle suspend auto-pauses a live match, the Online → Join entry
+  auto-focuses the Android soft keyboard, and the desktop "Quit" buttons
+  are compiled out (back gesture exits). Verified on an API 36 emulator and
+  a Pixel 10 Pro XL.
 - **Netplay gateway & room codes** (gateway-plan.md G1–G5): cross-WAN play
   with zero setup on both sides.
   - **Gateway** (`crates/netplay-gateway`, new zero-dependency crate):
@@ -38,6 +64,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow 
     `cargo test --workspace`. The crown test also caught and fixed a client
     edge: the room is no longer released on the peer-connect transition,
     which would have torn the relay out from under the first match.
+- **Hosted netplay gateway** (`deploy/`): the production gateway now runs at
+  **`blockfall.opensensor.io:27016`** (data ports 27017–27216) on the
+  opensensor home server — `DEFAULT_GATEWAY_ENDPOINT` switched from the
+  unregistered `netplay.opensensor.xyz` to it. Ops stack: hardened systemd
+  unit + `blockfall-update` pull-agent (picks up the CI-built musl release
+  automatically, self-tests before swap) and a `blockfall-dns` agent that
+  keeps the DynamicDNS-style A record pointed at the home egress IP (failover
+  to a cloud standby slots in later). See `deploy/README.md`.
 - **UPnP IGD auto port mapping for cross-WAN hosting** (netplay-plan.md
   addendum): hosting now asks the home router to forward the UDP port via
   SSDP discovery + SOAP `AddPortMapping` (no new dependencies — hand-rolled
