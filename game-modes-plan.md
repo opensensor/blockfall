@@ -1172,9 +1172,42 @@ T1 ──► T2 ──┬──────────────────�
   handshake rejection test for old↔new; `snapshot_hash` coverage test;
   gateway self-test still passes (`cargo run -p netplay-gateway --
   --self-test`).
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: T19 complete at commit 81bfdb6 (2026-10-01). `AttackRule::Dig`
+  (unit) + `AttackRule::Switch { swap_interval_ticks, warning_ticks }`
+  appended after `Race` — bincode indices pinned by canaries (core +
+  protocol): Garbage=0, Race=1, Dig=2, Switch=3. `Match::settle` gained
+  documented no-attack placeholder arms (`Dig | Switch { .. } => {}`);
+  behavior lands in T20/T21. `MatchEvent::SwapWarning { at_tick }` /
+  `BoardSwapped { tick }` appended, no emission logic yet. Match clock:
+  explicit `Match::advance_match_clock() -> Vec<MatchEvent>` called EXACTLY
+  ONCE per fixed step after both sides ticked, mirrored identically in
+  `versus_bridge_system` (local) and `lockstep::apply_batch` (host+guest
+  netplay) — pure call-sequence logic, both peers run identical bridge
+  code; gated on open match (winner set ⇒ frozen, snapshots stay
+  byte-stable); pinned by tests (`match_ticks == lockstep.tick` 1:1 on both
+  peers, bridge `match_ticks == steps`). `MatchSnapshot` gained appended
+  `match_ticks: u64` + `swaps_done: u32` (T21 swap bookkeeping);
+  `snapshot_hash` coverage test proves snapshots differing ONLY in the new
+  fields hash differently. `PROTOCOL_VERSION` "0.1.0"→"0.2.0" (constant is
+  single source; handshake tests already dynamic); roundtrip fuzz cases +
+  `net_msg_strategy` cover Dig/Switch; rule-index patch test proves a stale
+  0/1-only peer rejects new indices. Gateway confirmed rule-agnostic
+  (`wire.rs`/`room.rs` never inspect `AttackRule` — untouched). Validation:
+  `cargo test -p tetris-core` green incl. T1 golden canary 3/3 untouched;
+  `cargo test -p tetris-app` 473+7 green (10k-case fuzz ×2, exhaustive
+  truncation, lockstep/relay; 12 consecutive full-suite runs + 16 isolated
+  loopback runs); 20-match soak `--release --ignored` green; gateway 37+2
+  + `--self-test` PASS; `cargo test --workspace` green; clippy
+  `-D warnings` clean; fmt clean. NOTE T20/T21: loopback mirror tests that
+  snapshot across the input-delay pipeline (guest lags by design) normalize
+  `match_ticks` before hash-equality — tick-aligned equality is what the
+  production per-60-tick `SnapshotHash` exchange checks.
+- **files edited/created**: `crates/tetris-core/src/versus.rs`,
+  `crates/tetris-app/src/core_bridge/net/protocol.rs`,
+  `crates/tetris-app/src/core_bridge/versus.rs`,
+  `crates/tetris-app/src/core_bridge/net/harness.rs`,
+  `crates/tetris-app/src/core_bridge/net/lockstep.rs`
 
 ### T20: Dig Duel rule (core + local 1v1 first)
 - **depends_on**: [T19]
