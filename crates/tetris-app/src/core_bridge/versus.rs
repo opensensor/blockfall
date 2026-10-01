@@ -108,8 +108,15 @@ pub struct VersusMatch {
     /// the solo marathon machinery.
     bots: [BotState; 2],
     /// Per-side pacing countdown: while `> 0` the side's bot idles (and the
-    /// counter ticks down), see [`BOT_LOCK_COOLDOWN_STEPS`].
+    /// counter ticks down), reset to this side's [`bot_cooldown_ticks`]
+    /// (T15) after every hard drop.
     bot_cooldown: [u32; 2],
+    /// Per-match, per-side cooldown (fixed steps a bot idles after each lock,
+    /// see [`BOT_LOCK_COOLDOWN_STEPS`] for the default). Written by
+    /// [`start_versus_with_cooldown`], read by [`versus_bot_system`];
+    /// [`start_versus`] and every netplay mirror rebuild reset it to the
+    /// default.
+    pub bot_cooldown_ticks: [u32; 2],
 }
 
 impl VersusMatch {
@@ -126,6 +133,7 @@ impl VersusMatch {
             crowned: false,
             bots: Default::default(),
             bot_cooldown: [0; 2],
+            bot_cooldown_ticks: [BOT_LOCK_COOLDOWN_STEPS; 2],
         }
     }
 
@@ -152,6 +160,9 @@ pub const BOT_LOCK_COOLDOWN_STEPS: u32 = 60;
 /// [`SEED_ENV`](super::SEED_ENV) when set (reproducible CI/headless runs) else wall clock,
 /// mirroring [`restart_run`](super::restart_run). Takes over the game screen
 /// (`AppState::Playing`) and clears any previous [`VersusWinner`].
+///
+/// Bot pacing is the [`BOT_LOCK_COOLDOWN_STEPS`] default on both sides; use
+/// [`start_versus_with_cooldown`] for per-match cooldowns (Bot Ladder, T16).
 pub fn start_versus(
     versus: &mut VersusMatch,
     winner: &mut VersusWinner,
@@ -160,11 +171,38 @@ pub fn start_versus(
     p1: Controller,
     p2: Controller,
 ) {
+    start_versus_with_cooldown(
+        versus,
+        winner,
+        app_state,
+        rule,
+        p1,
+        p2,
+        [BOT_LOCK_COOLDOWN_STEPS; 2],
+    );
+}
+
+/// [`start_versus`] with per-side bot cooldowns (T15): `cooldowns[side]`
+/// fixed steps each [`Controller::Bot`] side idles after every lock
+/// (ladder rungs ramp this, e.g. `[120, 104, 82, 60, 44, 30, 19, 10]`).
+/// Everything else is exactly [`start_versus`]; the countdown fields stay
+/// `[0; 2]` so a bot starts driving on the first step.
+pub fn start_versus_with_cooldown(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    app_state: &mut AppState,
+    rule: AttackRule,
+    p1: Controller,
+    p2: Controller,
+    cooldowns: [u32; 2],
+) {
     let (seed, source) = match env_seed() {
         Some(seed) => (seed, "fixed"),
         None => (wall_clock_seed(), "wall clock"),
     };
-    info!("versus start: seed {seed} ({source}) rule {rule:?} p1={p1:?} p2={p2:?}");
+    info!(
+        "versus start: seed {seed} ({source}) rule {rule:?} p1={p1:?} p2={p2:?} cooldowns={cooldowns:?}"
+    );
     versus.match_ = Match::new(seed, rule);
     versus.seed = seed;
     versus.rule = rule;
@@ -174,6 +212,7 @@ pub fn start_versus(
     versus.crowned = false;
     versus.bots = Default::default();
     versus.bot_cooldown = [0; 2];
+    versus.bot_cooldown_ticks = cooldowns;
     versus.active = true;
     winner.0 = None;
     *app_state = AppState::Playing;
@@ -228,6 +267,7 @@ fn setup_net_mirror(world: &mut World, seed: u64, rule: AttackRule, delay: u8, l
         versus.crowned = false;
         versus.bots = Default::default();
         versus.bot_cooldown = [0; 2];
+        versus.bot_cooldown_ticks = [BOT_LOCK_COOLDOWN_STEPS; 2];
         versus.active = true;
         // The remote seat is always the peer; the local seat keeps whatever
         // the caller arranged (`Human` for a duel, `Bot` for the harness),
@@ -397,7 +437,8 @@ pub(crate) fn guest_pending_start_system(world: &mut World) {
 /// Feed every [`Controller::Bot`] side's snapshot to the shared greedy bot
 /// executor and push its chosen action into that side's queue. Sides that
 /// already finished a Race target (frozen boards) are skipped. Each bot is
-/// paced: after its hard drop it idles for [`BOT_LOCK_COOLDOWN_STEPS`]
+/// paced: after its hard drop it idles for its per-match
+/// [`VersusMatch::bot_cooldown_ticks`] (default [`BOT_LOCK_COOLDOWN_STEPS`])
 /// fixed steps, keeping it at a human-plausible lock rate instead of
 /// stacking 300 pieces a minute. Runs in `FixedUpdate` *before*
 /// [`versus_bridge_system`], so actions apply same-tick (same placement as
@@ -437,7 +478,7 @@ fn versus_bot_system(
             queue.push(a);
         });
         if dropped {
-            versus.bot_cooldown[index] = BOT_LOCK_COOLDOWN_STEPS;
+            versus.bot_cooldown[index] = versus.bot_cooldown_ticks[index];
         }
     }
 }
@@ -778,6 +819,32 @@ mod tests {
 
     fn activate(app: &mut App, p1: Controller, p2: Controller) {
         start_in_app(app, AttackRule::Garbage, p1, p2);
+    }
+
+    /// `start_versus_with_cooldown` through the world (T15), mirroring
+    /// [`start_in_app`].
+    fn start_in_app_with_cooldown(
+        app: &mut App,
+        rule: AttackRule,
+        p1: Controller,
+        p2: Controller,
+        cooldowns: [u32; 2],
+    ) {
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus_with_cooldown(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        rule,
+                        p1,
+                        p2,
+                        cooldowns,
+                    );
+                });
+            });
     }
 
     fn drained_versus(app: &mut App) -> Vec<VersusEvent> {
@@ -1138,6 +1205,80 @@ mod tests {
         assert!(
             locks[0] + locks[1] > 0,
             "the bots still play, they are only throttled"
+        );
+    }
+
+    /// `start_versus` keeps the `BOT_LOCK_COOLDOWN_STEPS` default;
+    /// `start_versus_with_cooldown` records the per-side values verbatim.
+    #[test]
+    fn start_versus_sets_default_and_param_cooldown_ticks() {
+        let mut app = test_app(12);
+        activate(&mut app, Controller::Bot, Controller::Bot);
+        assert_eq!(
+            app.world().non_send::<VersusMatch>().bot_cooldown_ticks,
+            [BOT_LOCK_COOLDOWN_STEPS; 2],
+            "start_versus fills the default"
+        );
+        start_in_app_with_cooldown(
+            &mut app,
+            AttackRule::Garbage,
+            Controller::Bot,
+            Controller::Bot,
+            [10, 30],
+        );
+        assert_eq!(
+            app.world().non_send::<VersusMatch>().bot_cooldown_ticks,
+            [10, 30],
+            "start_versus_with_cooldown records the per-match params"
+        );
+    }
+
+    #[test]
+    fn per_match_cooldown_scales_the_bot_lock_rate() {
+        // Fixed `Match::tick` window (no wall clock): a [10, 10] bot-vs-bot
+        // match must produce materially more `PieceLocked` events than the
+        // 60-tick default over the same number of fixed steps. Race with an
+        // unreachable target keeps the boards garbage-free, so the only
+        // throttle on the lock rate is the cooldown under test (no
+        // top-out/garbage truncation on the wall-clock match seeds).
+        let run = |cooldowns: [u32; 2]| -> [u32; 2] {
+            let mut app = test_app(42);
+            let rule = AttackRule::Race {
+                target_lines: 100_000,
+            };
+            start_in_app_with_cooldown(&mut app, rule, Controller::Bot, Controller::Bot, cooldowns);
+            // Pin the match RNG: `start_versus_with_cooldown` seeds from the
+            // wall clock, and a rare seed lets one bot wedge and stall. The
+            // cooldown param under test is untouched by this re-seed — it
+            // only makes the measured counts reproducible.
+            app.world_mut().non_send_mut::<VersusMatch>().match_ = Match::new(0x5EED_0015, rule);
+            let mut locks = [0u32; 2];
+            for _ in 0..300 {
+                fixed_step(&mut app);
+                let drained: Vec<VersusEvent> = app
+                    .world_mut()
+                    .resource_mut::<Messages<VersusEvent>>()
+                    .drain()
+                    .collect();
+                for e in drained {
+                    if let MatchEvent::PieceLocked { side, .. } = e.0 {
+                        locks[if matches!(side, Side::Left) { 0 } else { 1 }] += 1;
+                    }
+                }
+            }
+            locks
+        };
+        let slow = run([BOT_LOCK_COOLDOWN_STEPS; 2]);
+        let fast = run([10, 10]);
+        let (slow_total, fast_total) = (slow[0] + slow[1], fast[0] + fast[1]);
+        assert!(
+            slow_total >= 2 && fast_total >= 6,
+            "both matches must be live: slow={slow:?} fast={fast:?}"
+        );
+        assert!(
+            fast_total >= 3 * slow_total,
+            "10-tick cooldowns must lock >= 3x the 60-tick default over 300 \
+             fixed steps: slow={slow_total} fast={fast_total}"
         );
     }
 
