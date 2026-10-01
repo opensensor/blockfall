@@ -752,7 +752,9 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   (env override to 100k → 0.47 s).
 
   **(a) Soak** — `netplay_soak_20_matches` (`#[ignore]`,
-  `core_bridge/net/harness.rs`): 20 matches over **one** connected pair on
+  `core_bridge/net/harness.rs`; since game-modes T22 extended and renamed to
+  `netplay_soak_20_matches_per_rule` — 20 matches per attack rule incl. Dig
+  Duel and Switch): 20 matches over **one** connected pair on
   real UDP loopback at 24× virtual speed, alternating Garbage / Race-to-40
   (`DEFAULT_RACE_LINES`), rotated-mix seed sweep, rematches through the wire
   `MatchStart` (production path, first-ever automated coverage), per-60-tick
@@ -767,7 +769,7 @@ Wave:  1    2    3    4    5(N5,N6)   6(N7,N8)
   hash divergences**. Nightly rides CI (`nightly-soak` job got system-deps
   install + `cargo test --release -p tetris-app -- --ignored` step; timeout
   75→95 min). Manual one-liner:
-  `cargo test -p tetris-app --release -- core_bridge::net::harness::tests::netplay_soak_20_matches -- --ignored --exact --nocapture`.
+  `cargo test -p tetris-app --release -- core_bridge::net::harness::tests::netplay_soak_20_matches_per_rule -- --ignored --exact --nocapture`.
 
   *Soak driver decision*: pure `Controller::Bot` seats cannot supply the
   churn/long-Race dimensions in a net match — the bot plan-stepper assumes

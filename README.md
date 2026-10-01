@@ -2,9 +2,9 @@
 
 A fast, modern falling-block puzzle game built in Rust on the
 [Bevy](https://bevyengine.org) ECS engine (`tetris` was the working title — see
-[PRD.md](PRD.md) §14 #1 for the rename decision). Single-player marathon plus 1v1
-versus — local (shared keyboard, human or bot opponent) and online lockstep
-netplay (see [Playing online](#playing-online)).
+[PRD.md](PRD.md) §14 #1 for the rename decision). Eight single-player modes
+plus 1v1 versus — local (shared keyboard, human or bot opponent) and online
+lockstep netplay (see [Playing online](#playing-online)).
 
 Gameplay follows modern community-standard mechanics: SRS rotation with wall
 kicks and T-spin detection, 7-bag randomizer, hold, ghost piece, lock delay,
@@ -26,10 +26,26 @@ greedy bot playing seeded runs.
 
 ## Features
 
-- **Arcade marathon mode** — levels, escalating gravity, guideline-style scoring
+- **Game modes** — every mode keeps its own best-record table:
+
+  | Mode | Goal |
+  |---|---|
+  | Marathon | Endless lines on the classic level curve |
+  | Sprint | Clear 40 lines as fast as you can |
+  | Ultra | Highest score in six minutes |
+  | Dig | Dig through ten rows of buried garbage |
+  | Survival | Outlast the ever-rising garbage feed |
+  | Zen | No goals, no game over — a top-out just wipes the stack |
+  | Bot Ladder | Beat eight bots of rising speed |
+  | Daily Challenge | One seeded run per UTC day — everyone gets the same one |
+
 - **1v1 versus** — local (shared keyboard, human or bot) and **online lockstep
   netplay** over room codes (relayed, zero-config) or direct IP join,
-  delay-based input sync (default ≈ 133 ms)
+  delay-based input sync (default ≈ 133 ms); four attack rules: Garbage,
+  Race, Dig Duel (race the same seeded garbage board) and Switch (boards
+  swap on a timer)
+- **Mutators** — per-run toggles: No Hold, No Ghost, One Preview, 20G and
+  Invisible (locked cells fade out); mutated runs never write best records
 - **Modern controls feel** — DAS/ARR, hard drop, lock delay, ghost piece, hold
 - **SRS rotation** with wall kicks, including basic T-spin detection
 - **7-bag randomizer** with seeded, reproducible runs (`TETRIS_SEED=<u64>`)

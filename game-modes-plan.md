@@ -1454,9 +1454,30 @@ T1 ──► T2 ──┬──────────────────�
   `PRD.md` and close §14 item 3 (**pending the owner checkbox**), update the
   README modes table.
 - **validation**: All green; changelog reviewed.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: R3 automated gate GREEN at commit 4473366 (2026-10-01). `cargo test
+  --workspace` = 15/15 suites ok incl. T1 golden canary (3 golden — Marathon +
+  `GameSnapshot` wire untouched end-to-end; the only wire change of the plan
+  was T19's versioned bump); per-rule soak
+  `core_bridge::net::harness::tests::netplay_soak_20_matches_per_rule` PASS in
+  debug (`-- --ignored`, 272 s; release run at T22: 80 matches / 394,772 ticks
+  / 6,539 hash boundaries, **0 mismatches**, every rule crowned); gateway
+  `--self-test` PASS; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean; `cargo fmt --all --check` clean. NOTE: `cargo test --workspace --
+  --ignored` also picks up netplay-gateway's `crash_free_soak_1h` (1-hour
+  nightly long-runner — out of scope here; run nightly). Docs shipped with
+  this gate: version 0.3.2 → 0.4.0; CHANGELOG 0.4.0 entry (modes, Dig Duel +
+  Switch, mutators, PROTOCOL 0.2.0 "desktop and Android must update
+  together"); README modes table + rules/mutators bullets; stale
+  `netplay_soak_20_matches` name refs annotated in `netplay-plan.md`.
+  DEFERRED TO OWNER: check-in of `game-modes-PRD.md` + closing PRD §14 item 3
+  (**owner checkbox pending** — both left untouched/untracked); Android APK
+  portrait touch check (mode screens reachable w/ touch, Switch swap warning
+  visible); playtest tuning of named consts (Survival `FEED_*`,
+  `RUNG_COOLDOWNS`, `SWITCH_SWAP_INTERVAL_TICKS`/`SWITCH_WARNING_TICKS`,
+  `FADE_*`).
+- **files edited/created**: `Cargo.toml`, `CHANGELOG.md`, `README.md`,
+  `netplay-plan.md`, this plan entry
 
 ## Parallel Execution Groups
 

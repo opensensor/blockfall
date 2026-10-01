@@ -3,6 +3,36 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.4.0] — 2026-10-01
+
+### Added
+
+- **Game modes** — seven playable single-player modes alongside Marathon:
+  Sprint (40 lines), Ultra (6-minute score), Dig (10 buried garbage rows),
+  Survival (rising garbage feed), Zen (no game over — a top-out wipes the
+  stack), Bot Ladder (eight bots of rising speed, unlock persisted) and the
+  Daily Challenge (one seeded run per UTC day; the whole world gets the same
+  board and mode, shareable as a text line). Mode-select screen, per-mode
+  HUD (clocks, goals, garbage meters) and mode-aware result screens with
+  per-mode best records.
+- **New versus attack rules** — Dig Duel (both players race the same seeded
+  buried garbage board with the same piece sequence; first to clear wins,
+  first to top out loses) and Switch (Garbage attacks plus a full
+  board-swap of both players' states every 30 s with a 3 s warning). Both
+  selectable locally and online.
+- **Mutators** — per-run toggles on the mode-select screen: No Hold, No
+  Ghost, One Preview, 20G and Invisible (locked cells fade out after 1 s).
+  Mutated runs still count plays but never write best records.
+
+### Changed
+
+- **Net protocol `0.1.0` → `0.2.0`** — `AttackRule` gained the Dig and
+  Switch variants and match snapshots carry a match-level tick clock. The
+  version handshake refuses mixed builds: **desktop and Android must be
+  updated together**.
+- Records file migrated to per-mode keys (one-time, automatic); the nightly
+  netplay soak now covers all four attack rules (20 matches each).
+
 ## [0.3.2] — 2026-09-30
 
 ### Fixed
