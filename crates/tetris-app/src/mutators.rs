@@ -9,7 +9,7 @@
 //! | `2`   | [`Mutators::NO_GHOST`] | render skips ghost cells (`render::render_playfield`); the core keeps computing `ghost_row` |
 //! | `4`   | [`Mutators::ONE_PREVIEW`] | HUD next queue forces a single preview (`hud::sync_hud_previews`) |
 //! | `8`   | [`Mutators::TWENTY_G`] | `start_level = 20` override in `GameCore::start_mode` (R1 config, plan R7) |
-//! | `128` | [`Mutators::INVISIBLE`] | **reserved** — T24 (lock fade) owns its wiring; deliberately not in [`Mutators::SELECTABLE`] |
+//! | `128` | [`Mutators::INVISIBLE`] | locked cells fade out in the render (`render::render_playfield` per-cell lock ages, T24) |
 //!
 //! ## Lifecycle
 //!
@@ -38,18 +38,19 @@ impl Mutators {
     pub const ONE_PREVIEW: Self = Self(4);
     /// The run starts at level 20 (20G gravity cap).
     pub const TWENTY_G: Self = Self(8);
-    /// Reserved for T24 (Invisible lock fade). Never selectable today: not
-    /// in [`Self::SELECTABLE`], and no consumer reads it yet.
+    /// Locked cells fade out in the render (grace then linear fade over 60
+    /// fixed steps, see `render::lock_fade_alpha`); active piece and ghost
+    /// untouched. Wired in T24.
     pub const INVISIBLE: Self = Self(128);
 
     /// The mutators the mode-select screen exposes as toggles, in fixed
-    /// left-to-right UI order (deterministic layout order). T24 appends
-    /// [`Self::INVISIBLE`] here when it wires the fade.
-    pub const SELECTABLE: [Self; 4] = [
+    /// left-to-right UI order (deterministic layout order).
+    pub const SELECTABLE: [Self; 5] = [
         Self::NO_HOLD,
         Self::NO_GHOST,
         Self::ONE_PREVIEW,
         Self::TWENTY_G,
+        Self::INVISIBLE,
     ];
 
     /// No mutators (clean run).
@@ -120,8 +121,8 @@ mod tests {
         for m in Mutators::SELECTABLE {
             assert_eq!(all & m.bits(), m.bits(), "{m:?} is a distinct single bit");
         }
-        // INVISIBLE reserves the sign-free top bit, clear of everything else.
-        assert_eq!(all & Mutators::INVISIBLE.bits(), 0);
+        // INVISIBLE uses the sign-free top bit, clear of everything else.
+        assert_eq!(all, 1 | 2 | 4 | 8 | 128);
     }
 
     #[test]
@@ -145,11 +146,11 @@ mod tests {
         assert!(m.is_empty());
     }
 
-    /// T24 seam: INVISIBLE is a reserved bit the framework tolerates, but
-    /// the mode-select screen must not offer it until T24 appends it.
+    /// T24 landed: INVISIBLE is selectable (the fade is rendered), last in
+    /// the fixed left-to-right toggle order.
     #[test]
-    fn invisible_is_reserved_not_selectable() {
-        assert!(!Mutators::SELECTABLE.contains(&Mutators::INVISIBLE));
+    fn invisible_is_selectable_last() {
+        assert!(Mutators::SELECTABLE.contains(&Mutators::INVISIBLE));
         assert_eq!(
             Mutators::SELECTABLE,
             [
@@ -157,10 +158,11 @@ mod tests {
                 Mutators::NO_GHOST,
                 Mutators::ONE_PREVIEW,
                 Mutators::TWENTY_G,
+                Mutators::INVISIBLE,
             ],
             "fixed left-to-right UI order"
         );
-        // A set that carries the reserved bit still behaves as a bitset.
+        // A set that carries the bit still behaves as a bitset.
         let m = Mutators(Mutators::NO_GHOST.bits() | Mutators::INVISIBLE.bits());
         assert!(m.contains(Mutators::INVISIBLE));
         assert!(m.contains(Mutators::NO_GHOST));

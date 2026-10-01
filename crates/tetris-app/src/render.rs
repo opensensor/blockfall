@@ -125,6 +125,36 @@ pub const GHOST_ALPHA: f32 = 0.3;
 /// deliberately outside the tetromino palette so garbage reads as garbage.
 pub const GARBAGE_CELL_COLOR: Color = Color::srgb(0.42, 0.42, 0.47);
 
+/// T24 **Invisible**: fixed steps a locked cell stays at full alpha before
+/// its fade starts (half a second at the 60 Hz fixed step).
+pub const FADE_GRACE_TICKS: u16 = 30;
+
+/// T24 **Invisible**: total cell age (fixed steps since the lock) at which
+/// the fade reaches [`FADE_FLOOR_ALPHA`] — one second after the lock.
+pub const FADE_TOTAL_TICKS: u16 = 60;
+
+/// T24 **Invisible**: alpha of a fully faded locked cell — invisible.
+pub const FADE_FLOOR_ALPHA: f32 = 0.0;
+
+/// `lock_ages` entry for a cell that is absent or not tracked (a reappearing
+/// cell re-stamps from 0 — fades restart; see [`advance_lock_ages`]).
+const NO_LOCK: u16 = u16::MAX;
+
+/// Draw alpha of a locked cell aged `age` fixed steps (T24 **Invisible**):
+/// full until [`FADE_GRACE_TICKS`], then linear down to [`FADE_FLOOR_ALPHA`]
+/// at [`FADE_TOTAL_TICKS`], staying there once faded.
+#[must_use]
+pub fn lock_fade_alpha(age: u16) -> f32 {
+    if age <= FADE_GRACE_TICKS {
+        1.0
+    } else if age >= FADE_TOTAL_TICKS {
+        FADE_FLOOR_ALPHA
+    } else {
+        let t = (age - FADE_GRACE_TICKS) as f32 / (FADE_TOTAL_TICKS - FADE_GRACE_TICKS) as f32;
+        1.0 + (FADE_FLOOR_ALPHA - 1.0) * t
+    }
+}
+
 /// Solid fill color for cells locked/spawned as `piece`.
 pub fn piece_color(piece: Piece) -> Color {
     if piece == Piece::Garbage {
@@ -375,9 +405,29 @@ pub struct PlayfieldCell {
 pub struct VersusCellSide(pub Side);
 
 /// Pooled cell sprite entities (rebuilt to the needed count each frame).
-#[derive(Resource, Default)]
+#[derive(Resource)]
 struct CellPool {
     entities: Vec<Entity>,
+    /// T24 **Invisible**: lock age (fixed core steps since the cell was
+    /// first observed) of the solo board's settled cells, `[row][col]`.
+    /// `NO_LOCK` = absent/untracked. Fixed 22×10 table — zero allocations
+    /// per frame, ages saturate at [`FADE_TOTAL_TICKS`] so they never
+    /// collide with the sentinel.
+    lock_ages: [[u16; COLS]; ROWS],
+    /// `GameCore::steps` at the previous fade update; `None` until the
+    /// first INVISIBLE frame. A `steps` rewind (or `steps == 0`, both only
+    /// possible on a fresh run) resets the whole table.
+    fade_last_steps: Option<u64>,
+}
+
+impl Default for CellPool {
+    fn default() -> Self {
+        Self {
+            entities: Vec::new(),
+            lock_ages: [[NO_LOCK; COLS]; ROWS],
+            fade_last_steps: None,
+        }
+    }
 }
 
 /// Color of the boundary frame drawn around each playfield (solo and both
@@ -440,14 +490,72 @@ struct VersusCellPools {
     right: Vec<Entity>,
 }
 
+/// Advance the per-cell lock-age table to `snapshot` (T24 **Invisible**).
+///
+/// Ages are keyed by `(col, row)` and tied to presence continuity: a cell
+/// newly present in the board snapshot is stamped at `age = 0`; a still
+/// present cell ages by the number of applied core fixed steps (the
+/// `GameCore::steps` delta — frame-rate independent, frozen during pause and
+/// the pre-roll, which never advances `steps`); a vanished cell is
+/// unstamped, so a cell that *reappears* at the same `(col,row)` counts as
+/// new and restarts its fade. Documented artifact of this rule on row
+/// clears: rows sliding down into an occupied `(col,row)` keep the old age,
+/// while a cell sliding into a free one is stamped fresh. Cells already
+/// present when an INVISIBLE run begins (e.g. Dig's buried-garbage start
+/// board) are stamped as just-locked — full alpha through the grace, then
+/// the normal fade — never retro-faded to the floor. A fresh run
+/// (`steps == 0`, or a `steps` rewind) clears the whole table, so no age is
+/// ever inherited across runs; faded cells simply stay invisible until
+/// cleared.
+fn advance_lock_ages(
+    ages: &mut [[u16; COLS]; ROWS],
+    last_steps: &mut Option<u64>,
+    snapshot: &GameSnapshot,
+    steps: u64,
+) {
+    let fresh_run = steps == 0
+        || match *last_steps {
+            None => true,
+            Some(prev) => steps < prev,
+        };
+    // Ages saturate at FADE_TOTAL_TICKS, so a bigger delta can be capped.
+    let delta = if fresh_run {
+        0
+    } else {
+        (steps - last_steps.unwrap_or(steps)).min(FADE_TOTAL_TICKS as u64)
+    } as u16;
+    *last_steps = Some(steps);
+    if fresh_run {
+        for row in ages.iter_mut() {
+            *row = [NO_LOCK; COLS];
+        }
+    }
+    for (row, age_row) in ages.iter_mut().enumerate() {
+        for (col, age) in age_row.iter_mut().enumerate() {
+            if snapshot.board.get(row, col).is_some() {
+                *age = if *age == NO_LOCK {
+                    0
+                } else {
+                    age.saturating_add(delta).min(FADE_TOTAL_TICKS)
+                };
+            } else {
+                *age = NO_LOCK;
+            }
+        }
+    }
+}
+
 /// Bring one pooled entity list in line with the cells of one frame: reuse
-/// the prefix, despawn the surplus tail, spawn what is missing.
+/// the prefix, despawn the surplus tail, spawn what is missing. With
+/// `fades` (T24 **Invisible**), [`CellKind::Board`] cells draw at
+/// [`lock_fade_alpha`] of their table entry; the other layers are untouched.
 fn sync_pool(
     commands: &mut Commands,
     pool: &mut Vec<Entity>,
     cells: &[SnapshotCell],
     layout: &FieldLayout,
     side: Option<VersusCellSide>,
+    fades: Option<&[[u16; COLS]; ROWS]>,
 ) {
     if pool.len() > cells.len() {
         let surplus = pool.split_off(cells.len());
@@ -458,8 +566,17 @@ fn sync_pool(
 
     for (index, frame_cell) in cells.iter().enumerate() {
         let center = layout.cell_center(frame_cell.row, frame_cell.col);
+        let mut color = frame_cell.color();
+        if let (Some(ages), CellKind::Board) = (fades, frame_cell.kind) {
+            let age = ages
+                .get(frame_cell.row as usize)
+                .and_then(|row| row.get(frame_cell.col))
+                .copied()
+                .unwrap_or(0);
+            color = color.with_alpha(lock_fade_alpha(age));
+        }
         let sprite = Sprite {
-            color: frame_cell.color(),
+            color,
             custom_size: Some(Vec2::splat(layout.cell)),
             ..default()
         };
@@ -574,6 +691,7 @@ fn render_playfield(
             &cells,
             &left,
             Some(VersusCellSide(Side::Left)),
+            None,
         );
         let cells = frame_cells(&snapshot.right);
         sync_pool(
@@ -582,6 +700,7 @@ fn render_playfield(
             &cells,
             &right,
             Some(VersusCellSide(Side::Right)),
+            None,
         );
         return;
     }
@@ -593,7 +712,8 @@ fn render_playfield(
     let Some(core) = core else { return };
     let layout = FieldLayout::fit_window(size.x, size.y);
     sync_frame(&mut commands, &mut frames.solo, &layout, None);
-    let mut cells = frame_cells(&core.game.snapshot());
+    let snapshot = core.game.snapshot();
+    let mut cells = frame_cells(&snapshot);
     // T23 **No Ghost**: render-only suppression — the core keeps computing
     // `ghost_row` and the snapshot wire is untouched, the cells are simply
     // never handed to the sprite pool.
@@ -604,7 +724,32 @@ fn render_playfield(
     {
         cells.retain(|cell| cell.kind != CellKind::Ghost);
     }
-    sync_pool(&mut commands, &mut pool.entities, &cells, &layout, None);
+    // T24 **Invisible**: render-only lock fade — per-cell ages live in the
+    // solo sprite pool's fixed table and never feed back into the core or
+    // the snapshot; only `CellKind::Board` sprites get their alpha scaled
+    // (the active piece and the ghost are untouched).
+    let invisible = core
+        .active_mode
+        .mutators
+        .contains(crate::mutators::Mutators::INVISIBLE);
+    // Split the pool borrow: the age table is read while its entity list
+    // is mutated by the sync below (disjoint fields).
+    let CellPool {
+        entities,
+        lock_ages,
+        fade_last_steps,
+    } = &mut *pool;
+    if invisible {
+        advance_lock_ages(lock_ages, fade_last_steps, &snapshot, core.steps);
+    }
+    sync_pool(
+        &mut commands,
+        entities,
+        &cells,
+        &layout,
+        None,
+        invisible.then_some(&*lock_ages),
+    );
 }
 
 /// Flat colored playfield renderer fed exclusively by `Game::snapshot()`
@@ -1364,6 +1509,380 @@ mod t23_tests {
             drawn_cells(&mut app, CellKind::Ghost),
             baseline_ghost,
             "clean re-run draws the ghost again (regression)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod t24_tests {
+    //! T24 **Invisible** mutator: locked board cells fade out over
+    //! [`FADE_TOTAL_TICKS`] fixed steps ([`FADE_GRACE_TICKS`] at full alpha,
+    //! then linear to [`FADE_FLOOR_ALPHA`]). Render-only; the active piece
+    //! and the ghost (per NO_GHOST) are untouched.
+    use super::*;
+    use crate::core_bridge::{CoreBridgePlugin, GameCore, PendingActions};
+    use crate::modes::ModeId;
+    use crate::mutators::Mutators;
+    use crate::state::AppState;
+
+    use bevy::app::FixedUpdate;
+    use bevy::window::WindowPlugin;
+    use tetris_core::actions::Action;
+
+    const EPS: f32 = 1e-4;
+
+    fn render_app(seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(WindowPlugin {
+            primary_window: Some(Window {
+                title: "tetris t24 render".into(),
+                resolution: (1280, 720).into(),
+                resizable: true,
+                visible: false,
+                ..default()
+            }),
+            ..default()
+        });
+        app.add_plugins((CoreBridgePlugin, RenderPlugin));
+        app.insert_non_send(GameCore::new(seed));
+        app.init_resource::<AppState>();
+        app
+    }
+
+    /// One scripted frame: apply `actions` through the real fixed schedule,
+    /// then run `Update` (render).
+    fn frame(app: &mut App, actions: &[Action]) {
+        {
+            let mut pending = app.world_mut().resource_mut::<PendingActions>();
+            for action in actions {
+                pending.push(*action);
+            }
+        }
+        app.world_mut().run_schedule(FixedUpdate);
+        let _ = app.world_mut().try_run_schedule(Update);
+    }
+
+    /// Snapshot of settled board occupancy — the (col,row) keys the fade
+    /// table is keyed by.
+    fn locked_cells(app: &App) -> Vec<(usize, usize)> {
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        (0..ROWS)
+            .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+            .filter(|&(r, c)| snapshot.board.get(r, c).is_some())
+            .collect()
+    }
+
+    /// Alpha of the drawn sprite at the board position `(row, col)`, or
+    /// `None` when nothing is drawn there.
+    fn board_alpha(app: &mut App, row: usize, col: usize) -> Option<f32> {
+        let layout = FieldLayout::fit_window(1280.0, 720.0);
+        let center = layout.cell_center(row as i32, col);
+        let mut query = app
+            .world_mut()
+            .query::<(&PlayfieldCell, &Sprite, &Transform)>();
+        query
+            .iter(app.world())
+            .find(|(cell, _, t)| {
+                cell.kind == CellKind::Board
+                    && (t.translation.x - center.x).abs() < 1e-3
+                    && (t.translation.y - center.y).abs() < 1e-3
+            })
+            .map(|(_, sprite, _)| sprite.color.to_srgba().alpha)
+    }
+
+    fn alphas_at(app: &mut App, cells: &[(usize, usize)]) -> Vec<f32> {
+        cells
+            .iter()
+            .map(|&(row, col)| {
+                board_alpha(app, row, col)
+                    .unwrap_or_else(|| panic!("board cell ({row},{col}) not drawn"))
+            })
+            .collect()
+    }
+
+    /// Locks the first piece of an INVISIBLE run and returns the positions
+    /// of its settled cells.
+    fn start_invisible_and_lock(seed: u64) -> (App, Vec<(usize, usize)>) {
+        let mut app = render_app(seed);
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::INVISIBLE;
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        frame(&mut app, &[Action::HardDrop]);
+        let cells = locked_cells(&app);
+        assert!(!cells.is_empty(), "hard drop must settle board cells");
+        (app, cells)
+    }
+
+    /// The fade curve itself, at the named sample ages.
+    #[test]
+    fn fade_curve_is_grace_then_linear_floor() {
+        assert_eq!(lock_fade_alpha(0), 1.0);
+        assert_eq!(lock_fade_alpha(FADE_GRACE_TICKS - 1), 1.0);
+        assert_eq!(lock_fade_alpha(FADE_GRACE_TICKS), 1.0);
+        let mid = (FADE_GRACE_TICKS + FADE_TOTAL_TICKS) / 2;
+        let mid_alpha = lock_fade_alpha(mid);
+        assert!((mid_alpha - 0.5).abs() < EPS, "mid-fade alpha {mid_alpha}");
+        assert!(
+            lock_fade_alpha(FADE_GRACE_TICKS + 1) < lock_fade_alpha(FADE_GRACE_TICKS),
+            "strictly decreasing past the grace"
+        );
+        assert_eq!(lock_fade_alpha(FADE_TOTAL_TICKS), FADE_FLOOR_ALPHA);
+        assert_eq!(
+            lock_fade_alpha(FADE_TOTAL_TICKS + 500),
+            FADE_FLOOR_ALPHA,
+            "stays invisible once faded"
+        );
+    }
+
+    /// A locked cell's drawn alpha follows the curve at ages 0 / grace / mid
+    /// / full fade (one fixed step per frame), and stays invisible after.
+    #[test]
+    fn locked_cells_follow_the_fade_curve_over_60_ticks() {
+        let (mut app, cells) = start_invisible_and_lock(0x024);
+        // Age 0 — the frame the lock is first observed: full alpha.
+        assert!(
+            alphas_at(&mut app, &cells)
+                .iter()
+                .all(|a| (a - 1.0).abs() < EPS),
+            "fresh lock draws at full alpha: {:?}",
+            alphas_at(&mut app, &cells)
+        );
+        // Age 30 == grace boundary: still fully visible.
+        for _ in 0..FADE_GRACE_TICKS {
+            frame(&mut app, &[]);
+        }
+        assert!(
+            alphas_at(&mut app, &cells)
+                .iter()
+                .all(|a| (a - 1.0).abs() < EPS),
+            "grace keeps locked cells fully visible: {:?}",
+            alphas_at(&mut app, &cells)
+        );
+        // Age 45 == halfway through the fade: alpha 0.5.
+        let half = (FADE_TOTAL_TICKS - FADE_GRACE_TICKS) / 2;
+        assert_eq!(
+            FADE_GRACE_TICKS + half,
+            (FADE_GRACE_TICKS + FADE_TOTAL_TICKS) / 2
+        );
+        for _ in 0..half {
+            frame(&mut app, &[]);
+        }
+        let mid_alphas = alphas_at(&mut app, &cells);
+        assert!(
+            mid_alphas.iter().all(|a| (a - lock_fade_alpha(
+                (FADE_GRACE_TICKS + FADE_TOTAL_TICKS) / 2
+            ))
+            .abs()
+                < EPS),
+            "mid-fade alpha {mid_alphas:?}"
+        );
+        // Age >= FADE_TOTAL_TICKS: invisible, and stays invisible.
+        let rest = (FADE_TOTAL_TICKS - FADE_GRACE_TICKS) - half;
+        for _ in 0..=rest {
+            frame(&mut app, &[]);
+        }
+        let floor = alphas_at(&mut app, &cells);
+        assert!(
+            floor.iter().all(|a| (*a - FADE_FLOOR_ALPHA).abs() < EPS),
+            "locked cells at floor after {FADE_TOTAL_TICKS} ticks: {floor:?}"
+        );
+        for _ in 0..30 {
+            frame(&mut app, &[]);
+        }
+        let floor = alphas_at(&mut app, &cells);
+        assert!(
+            floor.iter().all(|a| (*a - FADE_FLOOR_ALPHA).abs() < EPS),
+            "faded cells stay invisible until cleared: {floor:?}"
+        );
+    }
+
+    /// The active piece draws at full alpha and the ghost at
+    /// [`GHOST_ALPHA`] even with INVISIBLE on — only locked cells fade.
+    #[test]
+    fn invisible_never_touches_active_piece_or_ghost() {
+        let (mut app, _cells) = start_invisible_and_lock(0x024);
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        let piece = snapshot.active.expect("spawned piece").piece;
+        let mut query = app.world_mut().query::<(&PlayfieldCell, &Sprite)>();
+        let (mut active, mut ghost) = (0usize, 0usize);
+        for (cell, sprite) in query.iter(app.world()) {
+            match cell.kind {
+                CellKind::Active => {
+                    active += 1;
+                    assert_eq!(sprite.color.to_srgba(), piece_color(piece).to_srgba());
+                }
+                CellKind::Ghost => {
+                    ghost += 1;
+                    assert_eq!(
+                        sprite.color.to_srgba(),
+                        piece_color(piece).with_alpha(GHOST_ALPHA).to_srgba()
+                    );
+                }
+                CellKind::Board => {}
+            }
+        }
+        assert_eq!(active, 4, "active piece still draws its four cells");
+        assert!(ghost > 0, "ghost untouched by INVISIBLE (NO_GHOST off)");
+    }
+
+    /// Exact sprite color drawn at board position `(row, col)`.
+    fn board_color(app: &mut App, row: usize, col: usize) -> Option<Color> {
+        let layout = FieldLayout::fit_window(1280.0, 720.0);
+        let center = layout.cell_center(row as i32, col);
+        let mut query = app
+            .world_mut()
+            .query::<(&PlayfieldCell, &Sprite, &Transform)>();
+        query
+            .iter(app.world())
+            .find(|(cell, _, t)| {
+                cell.kind == CellKind::Board
+                    && (t.translation.x - center.x).abs() < 1e-3
+                    && (t.translation.y - center.y).abs() < 1e-3
+            })
+            .map(|(_, sprite, _)| sprite.color)
+    }
+
+    /// **Disabled** mutator ⇒ byte-for-byte today's colors: every settled
+    /// cell keeps its exact palette color (alpha 1.0) forever — nothing ever
+    /// fades on a clean run.
+    #[test]
+    fn disabled_invisible_draws_exactly_todays_colors() {
+        let mut app = render_app(0x024);
+        frame(&mut app, &[Action::HardDrop]);
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        let cells = locked_cells(&app);
+        assert!(!cells.is_empty());
+
+        // Right after the lock: the exact `piece_color` of each settled piece
+        // (alpha 1.0) — the pre-T24 color, constant for constant.
+        for &(row, col) in &cells {
+            let piece = snapshot.board.get(row, col).expect("settled");
+            assert_eq!(
+                board_color(&mut app, row, col),
+                Some(piece_color(piece)),
+                "clean run draws today's exact palette color"
+            );
+        }
+
+        // And at every layer, 200 frames later (>= 2 full fade windows):
+        // still today's colors, nothing dimmed.
+        for _ in 0..200 {
+            frame(&mut app, &[]);
+        }
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        for (row, col) in locked_cells(&app) {
+            let piece = snapshot.board.get(row, col).expect("settled");
+            assert_eq!(
+                board_color(&mut app, row, col),
+                Some(piece_color(piece)),
+                "clean run never fades a locked cell ({row},{col})"
+            );
+        }
+        let mut query = app.world_mut().query::<(&PlayfieldCell, &Sprite)>();
+        for (cell, sprite) in query.iter(app.world()) {
+            let alpha = sprite.color.to_srgba().alpha;
+            let expect = if cell.kind == CellKind::Ghost {
+                GHOST_ALPHA
+            } else {
+                1.0
+            };
+            assert!(
+                (alpha - expect).abs() < EPS,
+                "clean run {cell:?} alpha {alpha} != {expect}"
+            );
+        }
+    }
+
+    /// A locked cell that vanishes (run reset) and is later refilled at the
+    /// same (col,row) is a **new** stamp: the fade restarts from full alpha
+    /// (documented presence-continuity rule — no stale invisible ages).
+    #[test]
+    fn refill_after_clear_restart_the_fade() {
+        let (mut app, cells) = start_invisible_and_lock(0x024);
+        // Fade the first lock fully out.
+        for _ in 0..=FADE_TOTAL_TICKS {
+            frame(&mut app, &[]);
+        }
+        let floor = alphas_at(&mut app, &cells);
+        assert!(
+            floor.iter().all(|a| (*a - FADE_FLOOR_ALPHA).abs() < EPS),
+            "precondition: fully faded: {floor:?}"
+        );
+
+        // New INVISIBLE run (same seed): the old stack vanishes first.
+        let seed = app.world().non_send::<GameCore>().seed;
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::INVISIBLE;
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        frame(&mut app, &[]);
+        assert!(
+            locked_cells(&app).is_empty(),
+            "fresh run starts with an empty board"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<CellPool>()
+                .lock_ages
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .expect("table"),
+            NO_LOCK,
+            "run reset unstamps every cell"
+        );
+
+        // Same scripted first lock lands in the same (col,row) cells.
+        frame(&mut app, &[Action::HardDrop]);
+        assert_eq!(
+            locked_cells(&app),
+            cells,
+            "same seed + drop refills the same cells"
+        );
+        let fresh = alphas_at(&mut app, &cells);
+        assert!(
+            fresh.iter().all(|a| (*a - 1.0).abs() < EPS),
+            "refilled cells are stamped fresh (fade restarts): {fresh:?}"
+        );
+    }
+
+    /// A run that **starts** with an existing stack (Dig's buried garbage,
+    /// the only start board) never starts faded: present cells are stamped
+    /// as just-locked (documented choice — age 0, grace applies, then fade),
+    /// never retro-faded to the floor.
+    #[test]
+    fn start_board_is_never_retro_faded() {
+        let mut app = render_app(0x024);
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::INVISIBLE;
+            core.start_mode(0x024, ModeId::Dig);
+        }
+        frame(&mut app, &[]);
+        let cells = locked_cells(&app);
+        assert!(
+            cells.len() > 50,
+            "Dig's buried-garbage start board has many settled cells (got {})",
+            cells.len()
+        );
+        let fresh = alphas_at(&mut app, &cells);
+        assert!(
+            fresh.iter().all(|a| (*a - 1.0).abs() < EPS),
+            "pre-existing stack starts fully visible, never retro-faded: {fresh:?}"
+        );
+        // ...and ages normally from there: fully faded after grace + fade.
+        for _ in 0..FADE_TOTAL_TICKS {
+            frame(&mut app, &[]);
+        }
+        let faded = alphas_at(&mut app, &cells);
+        assert!(
+            faded.iter().all(|a| (*a - FADE_FLOOR_ALPHA).abs() < EPS),
+            "start-board cells fade like any lock: {faded:?}"
         );
     }
 }

@@ -1546,7 +1546,7 @@ mod tests {
         assert_eq!(
             toggle_bits(&mut app),
             Mutators::SELECTABLE.to_vec(),
-            "four toggles, fixed left-to-right order (INVISIBLE stays T24)"
+            "toggles spawn from SELECTABLE in fixed left-to-right order"
         );
         for bit in Mutators::SELECTABLE {
             assert_eq!(
@@ -1555,7 +1555,6 @@ mod tests {
                 "{bit:?} starts OFF"
             );
         }
-        assert!(!toggle_bits(&mut app).contains(&Mutators::INVISIBLE));
         assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD OFF");
     }
 
