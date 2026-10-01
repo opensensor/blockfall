@@ -1346,9 +1346,67 @@ T1 ──► T2 ──┬──────────────────�
   playtest locally first, implement behind a named const if needed.
 - **validation**: `cargo test -p tetris-app -- --ignored` soak green for every
   rule; relay e2e green; version-skew handshake test.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01. Commits 5992bec (code) + (this docs commit). Host rule
+  picker: `OnlineRuleDigButton` + `OnlineRuleSwitchButton` markers in
+  `online_ui.rs` spawned beside the existing two, dispatch arms call the same
+  `host_start` path (`AttackRule::Dig` / `Switch { SWITCH_SWAP_INTERVAL_TICKS,
+  SWITCH_WARNING_TICKS }` — the production defaults already exported by T21's
+  `screens_menu.rs`, imported not redefined; rule still travels on `MatchStart`,
+  guest mirrors untouched). **Bevy 0.19 constraint**: tuple `QueryData` caps at
+  15 elements and the exclusive click query was exactly at 15, so the four
+  `Has<RuleButton>` markers ride one nested sub-tuple (flat query otherwise
+  would not compile); `ClickFlags` gained `dig`/`switch`. Two new UI tests
+  (four-rule coverage + portrait-safe stacking). Soak: `soak_rule(i)` now
+  rotates `i % 4` over Garbage/Race/Dig/Switch, 20 per rule ⇒ 80 matches; test
+  renamed `netplay_soak_20_matches` → `netplay_soak_20_matches_per_rule`
+  (CI invokes by module selection `--release -p tetris-app -- --ignored`, so
+  the rename is CI-safe; the stale name lingers in `netplay-plan.md` §754/§770
+  + one CI comment — docs-only, left for T25). Switch soak interval
+  **300/60 (soak-only constant, documented in place)** so every match crosses
+  ≥1 swap boundary inside the 20-match budget — production default stays
+  1 800/180. Per-rule win conditions: Dig crowns with winner `buried_rows == 0`
+  (guest-mirror `buried_rows` probe pins the buried start boards to exactly
+  `DIG_DUEL_GARBAGE_ROWS`) or loser dead; Switch requires `loser_dead` **and**
+  `snapshot.swaps_done >= 1` ⇒ a soak match that somehow never swapped fails.
+  E2e: direct-UDP and gateway-relay crowns refactored to shared
+  `run_pair_crown_match` / `relay_crown_match` helpers with per-rule wrappers —
+  `e2e_bot_vs_bot_dig_match_over_udp`,
+  `e2e_bot_vs_bot_switch_match_over_udp_crossing_a_swap` (interval 240, hash
+  comparison forced ≥ tick 240 so both peers' streams are compared **past**
+  the swap), plus the same two through the real gateway relay
+  (`..._through_gateway_relay`). `crates/netplay-gateway/tests/`
+  {relay_loopback, nat_punch_e2e}: **no rule variants added** — that crate has
+  zero dependencies and its tests are rule-agnostic byte-relay wire proofs;
+  rule-carrying relay e2e necessarily lives in `harness.rs` against the real
+  gateway (design note, PRD intent preserved). Version skew:
+  `assert_kicks_wrong_version(version)` extracted, new
+  `old_0_1_0_build_is_refused_by_the_0_2_0_host` exercises the exact
+  historical bump (pins `PROTOCOL_VERSION != "0.1.0"`). **Input-freeze verdict:
+  NOT shipped, no const needed** — headless probe = soak + swap-crossing e2e:
+  bots fire inputs every 60-tick cooldown around ~110 swap boundary crossings
+  (33 155 Switch ticks at interval 300) with both peers' `SnapshotHash`
+  streams compared across every boundary ⇒ zero mismatches, zero desyncs;
+  inputs straddling swap ticks stay bit-deterministic (swap executes inside
+  `advance_match_clock` after both sides ticked, before next-frame inputs —
+  T21 ordering). Measured soak (release): 80 matches / 394 772 ticks / **6 539
+  hash boundaries compared / 0 mismatches** — per rule wall: Garbage 22.6 s
+  (530 cmp), Race 77.8 s (1 855), Dig 150.8 s (3 611; longest match 37 939
+  ticks — bots dig out their buried stacks, long matches are the rule's
+  nature), Switch 23.0 s (543); garbage storm healthy (916 sent / 898 landed,
+  21 cap hits); total 274 s release, 271 s `-- --ignored` debug — nightly-
+  friendly. Validation: app 515 lib + 7 integration green (was 508+7, +7 new
+  tests), `cargo test --workspace` green (core 199 + invariants/golden canary
+  untouched), `cargo run -p netplay-gateway -- --self-test` PASS, clippy
+  `--workspace --all-targets -- -D warnings` clean (one new lint fixed: type
+  alias in the picker test), `cargo fmt --all --check` clean. Test updates:
+  soak rename (above) + helper extractions of the two pre-existing e2e and the
+  version-mismatch test — same assertions, shared bodies. No core-crate edits;
+  `GameSnapshot`/`AttackRule` wire untouched; `gateway.rs`/`lockstep.rs`/
+  `protocol.rs` unchanged (clock already wired in T19/T21). Not pushed.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/net/online_ui.rs`,
+  `crates/tetris-app/src/core_bridge/net/harness.rs`,
+  `crates/tetris-app/src/core_bridge/net/session.rs`
 
 ### T23: Mutator framework + cheap mutators
 - **depends_on**: [T18, T7]
