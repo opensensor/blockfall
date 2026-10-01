@@ -257,9 +257,63 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Headless bridge tests (MinimalPlugins pattern already in the
   file): starting Sprint runs the countdown before the first core tick; Ultra
   `TimeUp` flips `AppState::GameOver`; Sprint top-out yields no goal event.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `ce46eee`. `modes.rs`: ALL TEN `ModeId`s
+  pre-declared (+ `ModeId::ALL`); `mode_config` (Marathon = `default`;
+  Sprint = `Lines(40)` + fixed level 1; Ultra = clock 7200 + marathon
+  progression; Dig = `GarbageCleared` + `BuriedGarbage{10}` + fixed level 1;
+  Survival = placeholder `default` until T12's feed field; Zen = fixed
+  level 1 + `WipeAndContinue` (wired T14); BotLadder/Daily/DigDuel/Switch =
+  placeholder configs — versus campaigns/rules start via `start_versus`/
+  `AttackRule`, and Daily resolves at runtime to Sprint/Ultra/Dig in T17);
+  `display_name`/`description` per mode; `is_shipped` = Marathon/Sprint/
+  Ultra/Dig only (later tasks flip only this); `pre_roll_ticks` = 180 for
+  Sprint/Dig, 0 else; `mode_key` maps all ten onto `records::ModeKey`;
+  `format_time_ticks` = `m:ss.hh`, 60 Hz floor division, centiseconds
+  **truncated**. `core_bridge`: `ActiveMode { id, config }` lives as a
+  **`GameCore` field** (the design-note's non-send option — one new resource
+  entity only, no borrow conflicts; `restart_with` resets it to Marathon so
+  legacy `restart_run` stays consistent); `GameCore::start_mode(seed, id)` =
+  `Game::with_config` + steps/seed/events reset; free fn
+  `start_mode_run(id, core, countdown, app_state, Option<&mut Records>) ->
+  seed` honors `TETRIS_SEED` like `restart_run`, re-arms the mode's
+  pre-roll and `bump_plays` centrally; `Countdown(u32)` resource +
+  `countdown_system` (FixedUpdate, before `core_bridge_system`) decrements
+  only while `Playing && !SimPaused` — pause freezes the remaining budget,
+  never cancels; `PendingActions` held through the pre-roll exactly like
+  freeze frames, core tick 0 = first playable frame; `core_bridge_system`
+  steps only while `Countdown == 0` and flips `AppState::GameOver` on
+  `GoalReached`/`TimeUp` like `GameOver` (CoreEvent forwarding unchanged);
+  `restart_on_r_system` retries `core.active_mode.id`; `bot_drive_system`
+  idles during a pre-roll.
+  **Pre-roll frame math for T7/T8**: 180 ticks = 179 fully-frozen frames +
+  the frame whose decrement exhausts the budget, which is core tick 0 (the
+  first playable frame); HUD 3-2-1 = `ceil(countdown.0 / 60)`; playable iff
+  `Countdown == 0`; terminal reason via `core.game.finished_reason()`.
+  RED captured (E0583 `modes` + 7×E0425 `ActiveMode`/`Countdown`/
+  `start_mode_run`) → GREEN: `cargo test -p tetris-app` 377 pass,
+  `cargo test --workspace` green (T1 golden included), clippy
+  `-D warnings` clean, `fmt --check` clean.
+  Gotchas: (a) the plan's example "10 235 ticks → 2:43.91" is off by 400 —
+  at 60 Hz truncation 10 235 is **2:50.58**, and **9 835** ticks is what
+  yields 2:43.91 (both pinned in `format_time_ticks` tests; T8 must not
+  assert 2:43.91 against 10 235); (b) the two screens_menu submenu-click
+  tests (`one_v_one_submenu_clicks…`, `dummy_resources_cannot_reroute…`)
+  are entity-iteration-order sensitive — `rect_of("settings")` grabs the
+  first match, which at HEAD is the *pause* panel button (y=494) that
+  happens to be inert; measured sensitivity: +1 new `init_resource` green,
+  +2 red, +3/+4 still red. T5 passes only because it kept new resource
+  entities to exactly one (`Countdown`). **T7/T8 add more resources and
+  WILL break them** — fix deterministically in T7's screens_menu pass (make
+  `button_rects`/`rect_of` sort by (label, y) and pick the intended root);
+  do not work around by avoiding resources. (c) `screens_menu` Start/Retry
+  still call `restart_run` (Marathon) — switch them to `start_mode_run` in
+  T7/T9; until then `active_mode` self-heals (reset to Marathon by
+  `restart_with`). (d) `start_mode_run` returns the resolved seed. (e) the
+  Ultra headless test runs the full 7 200-step clock (~1 s).
+- **files edited/created**: `crates/tetris-app/src/modes.rs` (new),
+  `crates/tetris-app/src/core_bridge/mod.rs`, `crates/tetris-app/src/lib.rs`
+  (`mod modes;`)
 
 ### T6: Per-mode records file + best.json migration + play counts
 - **depends_on**: []
