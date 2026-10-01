@@ -1223,9 +1223,50 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Core tests: identical boards+sequences from one seed;
   first-to-clear crowns winner; top-out hands win over; replay determinism.
   Local human-vs-bot Dig Duel plays through.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `987e067`. Core: `Match::new` under
+  `AttackRule::Dig` draws ONE side seed (left's first draw) and builds both
+  games with `Game::with_config` + new `versus::dig_side_config()` — the
+  documented mirror of solo Dig (`modes::mode_config(ModeId::Dig)`: level
+  pinned 1 / `levels_advance:false`, `Goal::GarbageCleared`,
+  `StartBoard::BuriedGarbage`) so gravity is fixed at level 1 and the side
+  game freezes in lockstep with the match crown. Board/hole derivation stays
+  single-source (`mode::StartBoard::BuriedGarbage::build`): versus and solo
+  Dig from the same seed produce the identical buried board (test-pinned);
+  `DIG_DUEL_GARBAGE_ROWS = 10` mirrors `modes::DIG_GARBAGE_ROWS`. `settle()`
+  Dig arm: never sends garbage, crowns the first side whose
+  `garbage_rows_left() == 0` on a lock via the existing winner path
+  (`WinnerCrowned` — Garbage-rule precedent, overlay/rematch flow
+  unchanged); top-out keeps the existing immediate opponent-crown (checked
+  before the Dig arm, so same-lock top-out wins, mirroring core goal
+  precedence). Tie rule: crowning is synchronous with the zeroing settle,
+  so a "tie" is only possible within one bridge frame and goes to the
+  first-settled side — fixed Left-then-Right bridge order ⇒ deterministic
+  and symmetric on both peers (pinned by `dig_same_frame_double_zero...`
+  both orders). T19's `new_rules_are_no_attack_placeholders` split to
+  Switch-only (renamed `switch_rule_is_a_no_attack_placeholder`). App:
+  `RuleDigButton` third button in the rules submenu → `start_versus` with
+  `AttackRule::Dig` (bot seat works; ladder still hard-wires Garbage);
+  versus HUD Pending slot doubles as `DUG n/10` (rows of the side's own
+  board containing `Piece::Garbage`, computed from `GameSnapshot.board` —
+  no snapshot/wire change) under Dig, `+N` meter unchanged for
+  Garbage/Race. Human-vs-bot Duel plays through to a crowned winner
+  (top-out). DEVIATION (reported on board): one stale T19 net-test
+  expectation adapted — `protocol.rs::match_clock_is_deterministic_...`
+  asserted placeholder-era `dig.match_ticks == 40`; real rules legitimately
+  crown seed 99's duel at step 35 (T19 clock freeze), replaced with
+  determinism-equality + `match_ticks <= 40 && winner.is_some()`; wire
+  untouched, no protocol exposure. RED captured first (4 failing dig tests
+  against the placeholder: empty boards, no crowns) → GREEN. Validation:
+  tetris-core 188 lib + 6 + 3 + 5 green (marathon golden untouched), app
+  476 + 7 green, `cargo test --workspace` green, clippy
+  `--workspace --all-targets -- -D warnings` clean, `cargo fmt --all
+  --check` clean.
+- **files edited/created**: `crates/tetris-core/src/versus.rs`,
+  `crates/tetris-app/src/core_bridge/versus.rs`,
+  `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/hud.rs`,
+  `crates/tetris-app/src/core_bridge/net/protocol.rs` (test-expectation
+  adaptation only, see log)
 
 ### T21: Switch rule (core + local 1v1 first)
 - **depends_on**: [T19, T20]
