@@ -487,9 +487,60 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Headless UI test: button click moves `AppState` to
   `ModeSelect`, row click starts the right `ModeConfig`; manual portrait APK
   check (start, scroll, select, back).
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `3a6f486` (`screens_modes.rs` new,
+  `screens_menu.rs`, `state.rs`, `lib.rs`; `touch.rs` intentionally
+  untouched — see touch note). `AppState::ModeSelect` added after `Title`;
+  all existing `match` sites have wildcards (nothing broke). New
+  `ModeSelectPlugin` mounted after `MenuScreensPlugin`: root spawned once
+  (hidden like the T17 menu roots, handlers state-gated), rows rendered from
+  `ModeId::ALL` filtered by `is_shipped` (never hardcoded) via
+  `spawn_mode_rows`; each row = `ModeRowButton { id }` + display name +
+  description + `record_line` refreshed live on `Records::is_changed()`.
+  Record formats (pure fns `record_line`/`group_thousands`): `-`,
+  `Best 2:43.91` (`format_time_ticks`), `Best 123 456` (space thousands),
+  `Lines N`, `Rung N`, `date: result` — ASCII only (bundled font subset).
+  Row press → `open_mode_select`-pair helper `start_mode_row` → shared
+  `start_mode_run` (seed/pre-roll/plays) — Sprint row test asserts pre-roll
+  180 + gate. **Scrolling**: native bevy_ui `overflow: Clip/Scroll` +
+  `ScrollPosition`; `mode_scroll_system` drives it from
+  `MessageReader<MouseWheel>` (90 px/notch) and vertical per-finger touch
+  drags (`MessageReader<TouchInput>`), clamped by pure `clamp_scroll`
+  against `ComputedNode.size/content_size`; `ui_focus_system` clipping makes
+  scrolled-out rows inert (verified). **MessageReader is load-bearing**:
+  bevy_ecs 0.19 `Messages::update` only swaps buffers when the resource
+  changed, so `iter_current_update_messages` re-delivers or drops messages
+  written between updates (bevy_ecs docs: arrival "unpredictable") — a
+  wheel test written that way flaked ~50 % until converted; same codebase
+  pattern as `touch.rs`/`input.rs`, do NOT "simplify" back. Keyboard: Esc →
+  Title, Enter → first shipped row; pause chord already gates on
+  Playing/Paused (verified inert). **screens_menu test-helper fix (T8
+  canary)**: `button_rects` now returns root-scoped
+  `(root, label, pos)` sorted via `total_cmp`, `rect_of_under(root, label)`
+  replaces first-match `rect_of`; new churn test
+  `root_scoped_rect_resolution_survives_resource_and_entity_churn` — the
+  two submenu canaries now survive the extra-resource churn T8 proved was
+  order-flipping. Title "Start" → `ModeSelect`; adapted tests:
+  `start_button_launches_fresh_playing_run` clicks the Sprint row (pre-roll
+  asserted), versus quit/winner-menu flows land on `ModeSelect`. **Touch
+  parity**: no `touch.rs` change needed — `ui_focus_system` presses buttons
+  from `Touches` fed by `Messages<TouchInput>`; two headless portrait
+  411×731 tests tap a row and Back through the real winit-shaped pipeline.
+  Manual portrait APK check deferred to the T11 gate (same as T8's).
+  Gotchas: (1) Pause "Restart" and Game-Over R still use `restart_run`;
+  confirm in T9 they resume the mode selected here, not Marathon. (2)
+  Pre-existing flakes observed during validation, NOT from this tree:
+  `core_bridge::tests::ultra_time_up_flips_game_over_and_exposes_terminal_reason`
+  (~1–5 %, load-correlated, reproduces on pristine `c3e42ff` at 1/60
+  isolated without this commit) and
+  `core_bridge::net::gateway::tests::real_gateway_host_registers_and_is_announced`
+  (real UDP, flakes under CPU contention) — worth a core_bridge owner's
+  look before the T10 CI gates bake them in. Verified: workspace green,
+  app 404/404 ×5 on `c551afd` + these changes, wheel test 15/15, clippy
+  `--workspace --all-targets -D warnings` + fmt `--check` clean.
+- **files edited/created**: `crates/tetris-app/src/screens_modes.rs` (new),
+  `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/state.rs`,
+  `crates/tetris-app/src/lib.rs`
 
 ### T8: HUD clock and goal counter
 - **depends_on**: [T5]
