@@ -51,8 +51,8 @@ use tetris_core::actions::Action;
 use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
-use tetris_core::mode::{Goal, ModeConfig};
-use tetris_core::piece::{PieceState, Rotation};
+use tetris_core::mode::{FinishReason, Goal, ModeConfig};
+use tetris_core::piece::{Piece, PieceState, Rotation};
 
 use crate::modes::{self, ModeId};
 use crate::records::Records;
@@ -67,7 +67,10 @@ pub(crate) mod net;
 /// marathons; applies at startup and on every restart).
 pub const SEED_ENV: &str = "TETRIS_SEED";
 
-/// Env var enabling the greedy snapshot bot + marathon logging (`"1"`).
+/// Env var enabling the greedy snapshot bot: `"1"`/`"marathon"` run today's
+/// marathon bot (2 games + logging), `"sprint"` / `"ultra"` / `"dig"` run the
+/// T10 named-mode bot (single mode to its terminal state, `BOT mode_done` /
+/// `BOT mode_abort` machine lines, nonzero exit on Sprint/Dig top-out).
 pub const BOT_ENV: &str = "TETRIS_BOT";
 
 /// Games the bot plays before exiting the app (M2 gate marathon).
@@ -76,6 +79,11 @@ const BOT_GAMES: u32 = 2;
 /// Seconds the bot waits after a game over before restarting.
 const BOT_RESTART_DELAY_SECS: f32 = 0.5;
 
+/// Ultra bot lock cadence (T4 proven): after each hard drop the driver idles
+/// this many fixed steps. A free-running greedy solver tops out before the
+/// 7 200-tick clock; ~one placement per 30 ticks survives to `TimeUp`.
+const ULTRA_BOT_PACE_TICKS: u32 = 30;
+
 /// Parsed [`SEED_ENV`] value, if set and a valid `u64`.
 fn env_seed() -> Option<u64> {
     std::env::var(SEED_ENV)
@@ -83,9 +91,70 @@ fn env_seed() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-/// [`BOT_ENV`] set to exactly `"1"`.
-fn bot_enabled() -> bool {
-    std::env::var(BOT_ENV).is_ok_and(|v| v.trim() == "1")
+/// What [`BOT_ENV`] asks the app to do (parsed at plugin build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
+struct BotMode {
+    /// Any bot at all (gates every bot system + the FPS reporter).
+    enabled: bool,
+    /// `Some(id)` for the T10 named-mode bot (`sprint`/`ultra`/`dig`),
+    /// `None` for the legacy marathon bot (`1`/`marathon`).
+    named: Option<ModeId>,
+}
+
+impl BotMode {
+    const OFF: Self = Self {
+        enabled: false,
+        named: None,
+    };
+    const MARATHON: Self = Self {
+        enabled: true,
+        named: None,
+    };
+    const fn named(id: ModeId) -> Self {
+        Self {
+            enabled: true,
+            named: Some(id),
+        }
+    }
+}
+
+/// Pure [`BOT_ENV`] value parser (split out so tests never race the process
+/// env against other plugin builds). Unknown values disable the bot.
+fn parse_bot_value(raw: &str) -> BotMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "marathon" => BotMode::MARATHON,
+        "sprint" => BotMode::named(ModeId::Sprint),
+        "ultra" => BotMode::named(ModeId::Ultra),
+        "dig" => BotMode::named(ModeId::Dig),
+        "" => BotMode::OFF,
+        other => {
+            warn!(
+                "ignoring unknown {BOT_ENV} value {other:?} \
+                 (expected 1|marathon|sprint|ultra|dig)"
+            );
+            BotMode::OFF
+        }
+    }
+}
+
+/// [`BOT_ENV`] at plugin build.
+fn bot_mode_from_env() -> BotMode {
+    std::env::var(BOT_ENV)
+        .map(|v| parse_bot_value(&v))
+        .unwrap_or(BotMode::OFF)
+}
+
+/// Lower-case machine name for the T10 log lines (`mode=sprint` etc.).
+fn bot_mode_name(id: ModeId) -> &'static str {
+    match id {
+        ModeId::Sprint => "sprint",
+        ModeId::Ultra => "ultra",
+        ModeId::Dig => "dig",
+        other => {
+            let _ = other;
+            "mode"
+        }
+    }
 }
 
 /// Simulation rate of the fixed-step schedule, Hz (PRD: core ticks at 60 Hz).
@@ -345,13 +414,10 @@ fn restart_on_r_system(
     }
 }
 
-/// Bot toggle resource, from [`BOT_ENV`] at plugin build (T14).
-#[derive(Resource)]
-struct BotMode(bool);
-
 /// Marathon bookkeeping for the bot: completed games, the post-game-over
 /// restart countdown (plain f32 seconds; no `Timer` resource dance needed),
-/// and the committed placement the step-wise executor is realizing.
+/// and the committed placement the step-wise executor is realizing. The
+/// `named_*` + pacing fields drive the T10 named-mode lifecycle.
 #[derive(Resource, Default)]
 struct BotState {
     games_done: u32,
@@ -361,6 +427,12 @@ struct BotState {
     last_rot: Option<Rotation>,
     last_col: Option<i32>,
     wedge: u32,
+    /// Named bot already pressed its Start-equivalent (mode is live).
+    named_started: bool,
+    /// Named bot already wrote its terminal `mode_done`/`mode_abort` line.
+    finished_logged: bool,
+    /// Ultra pacing countdown: fixed steps to stay quiet after a hard drop.
+    drive_cooldown: u32,
 }
 
 /// A committed target for the currently active piece; re-planned whenever a
@@ -370,6 +442,9 @@ struct BotPlan {
     piece: tetris_core::piece::Piece,
     rot: Rotation,
     target_col: i32,
+    /// Dig hold-fish: push [`Action::Hold`] this step (the plan is a one-shot,
+    /// the newly held piece gets a fresh plan next step).
+    hold: bool,
 }
 
 /// Steps a committed piece toward its plan (one action per tick): rotate →
@@ -383,6 +458,11 @@ fn step_bot_plan(
     active: PieceState,
     mv: BotPlan,
 ) {
+    if mv.hold {
+        push(Action::Hold);
+        state.plan = None;
+        return;
+    }
     let progressed = state.last_rot != Some(active.rot) || state.last_col != Some(active.col);
     state.wedge = if progressed { 0 } else { state.wedge + 1 };
     state.last_rot = Some(active.rot);
@@ -419,8 +499,23 @@ fn step_bot_plan(
 
 /// One bot brain tick for a snapshot: execute the committed plan or commit a
 /// fresh greedy one for a new piece. Shared by the solo marathon driver and
-/// the versus per-side bot driver (T25).
+/// the versus per-side bot driver (T25) — versus boards (garbage rule or
+/// not) always take the **marathon** brain; only the solo driver opts into
+/// the T10 dig-aware pipeline via [`bot_side_drive_mode`].
 fn bot_side_drive(snapshot: &GameSnapshot, state: &mut BotState, push: &mut dyn FnMut(Action)) {
+    bot_side_drive_mode(snapshot, state, push, false);
+}
+
+/// [`bot_side_drive`] with the T10 dig-awareness switch: `dig_aware` routes
+/// garbage-bearing boards through the nub-down Dig solver (see
+/// [`bot_move_mode`]); without garbage on the board — and always for
+/// `!dig_aware` — decisions are bit-identical to the legacy greedy bot.
+fn bot_side_drive_mode(
+    snapshot: &GameSnapshot,
+    state: &mut BotState,
+    push: &mut dyn FnMut(Action),
+    dig_aware: bool,
+) {
     let Some(active) = snapshot.active else {
         state.plan = None;
         return;
@@ -430,10 +525,11 @@ fn bot_side_drive(snapshot: &GameSnapshot, state: &mut BotState, push: &mut dyn 
             step_bot_plan(push, state, active, mv);
         }
         _ => {
-            state.plan = bot_move(snapshot).map(|mv| BotPlan {
+            state.plan = bot_move_mode(snapshot, dig_aware).map(|mv| BotPlan {
                 piece: active.piece,
                 rot: mv.rot,
                 target_col: mv.target_col,
+                hold: mv.hold,
             });
             state.wedge = 0;
             state.last_rot = Some(active.rot);
@@ -447,24 +543,61 @@ fn bot_side_drive(snapshot: &GameSnapshot, state: &mut BotState, push: &mut dyn 
 /// `FixedUpdate` *before* `core_bridge_system`, so actions apply same-tick.
 /// Asleep while a versus match is active (and during a T5 pre-roll — its
 /// actions would merely queue against a frozen core).
+///
+/// T10: solo boards whose mode carries a garbage goal (Dig) route through
+/// the nub-down solver; the named `ultra` bot idles [`ULTRA_BOT_PACE_TICKS`]
+/// fixed steps after every hard drop so the clock (not a top-out) ends the
+/// run. Marathon boards and every versus side keep the exact legacy brain.
 // System params: every input is needed; an exclusive-system wrapper would
 // obscure the resource types.
 #[allow(clippy::too_many_arguments)]
 fn bot_drive_system(
     bot: Res<BotMode>,
     mut pending: ResMut<PendingActions>,
-    state: ResMut<BotState>,
+    mut state: ResMut<BotState>,
     core: NonSend<GameCore>,
     app_state: Res<AppState>,
     paused: Res<SimPaused>,
     countdown: Res<Countdown>,
     versus: NonSend<VersusMatch>,
 ) {
-    if !bot.0 || *app_state != AppState::Playing || paused.0 || countdown.0 > 0 || versus.active {
+    if !bot.enabled
+        || *app_state != AppState::Playing
+        || paused.0
+        || countdown.0 > 0
+        || versus.active
+    {
         return;
     }
     let snapshot = core.game.snapshot();
-    bot_side_drive(&snapshot, state.into_inner(), &mut |a| pending.push(a));
+    let dig_aware = matches!(core.active_mode.config.goal, Some(Goal::GarbageCleared));
+    let paced = bot.named == Some(ModeId::Ultra) && core.active_mode.id == ModeId::Ultra;
+    if !paced {
+        bot_side_drive_mode(
+            &snapshot,
+            state.into_inner(),
+            &mut |a| pending.push(a),
+            dig_aware,
+        );
+        return;
+    }
+    if state.drive_cooldown > 0 {
+        state.drive_cooldown -= 1;
+        return;
+    }
+    let mut dropped = false;
+    bot_side_drive_mode(
+        &snapshot,
+        &mut state,
+        &mut |a| {
+            dropped |= matches!(a, Action::HardDrop);
+            pending.push(a);
+        },
+        dig_aware,
+    );
+    if dropped {
+        state.drive_cooldown = ULTRA_BOT_PACE_TICKS;
+    }
 }
 
 /// Frame-time accumulator for `MARATHON fps_avg=...` logs (bot mode only).
@@ -501,10 +634,13 @@ fn stack_metrics(board: &Board) -> (i32, i32, i32) {
 
 /// A chosen placement: rotate `active` to `rot`, shift to `target_col`, hard
 /// drop. SRS kicks are ignored (deliberately greedy; not a perfect solver).
+/// `hold` is the T10 dig hold-fish variant: push [`Action::Hold`] instead of
+/// walking the current piece.
 #[derive(Clone, Copy, Debug)]
 struct BotMove {
     rot: Rotation,
     target_col: i32,
+    hold: bool,
 }
 
 /// All resting placements `(row, col)` of `base` (one fixed rotation) that
@@ -544,10 +680,212 @@ fn reachable_placements(board: &Board, base: PieceState) -> Vec<(i32, i32)> {
     out
 }
 
+/// T10 solver front door. `!dig_aware` boards — always the versus sides, and
+/// solo modes without a garbage goal (Marathon/Sprint/Ultra) — take the
+/// **exact** legacy greedy code path (`bot_move`, weights and tie-breaks
+/// untouched). A `dig_aware` board *without* any [`Piece::Garbage`] cell is
+/// likewise routed to `bot_move`, so the heuristic is provably inert until
+/// garbage appears. With garbage on the board, the T4 nub-down Dig heuristic
+/// takes over: fill the topmost buried row's hole (nub-down T/J/L at 180° or
+/// a vertical-I foot), hold-fish when a queued/held piece can dig now, and
+/// otherwise dump with weights that keep debris off the descent columns
+/// above still-open holes and rows 0..2 passable.
+fn bot_move_mode(snapshot: &GameSnapshot, dig_aware: bool) -> Option<BotMove> {
+    if !dig_aware || !board_has_garbage(&snapshot.board) {
+        return bot_move(snapshot);
+    }
+    let active = snapshot.active?;
+    if let Some((row, hole)) = top_buried(&snapshot.board) {
+        // 1. The active piece digs the top buried row now.
+        if let Some((rot, col)) = dig_landing(&snapshot.board, active.piece, row, hole) {
+            return Some(BotMove {
+                rot,
+                target_col: col,
+                hold: false,
+            });
+        }
+        // 2. Hold-fish: stash the active piece if something else can dig.
+        if !snapshot.hold_used {
+            let fish = snapshot
+                .next
+                .iter()
+                .any(|&p| dig_landing(&snapshot.board, p, row, hole).is_some())
+                || snapshot
+                    .hold
+                    .is_some_and(|p| dig_landing(&snapshot.board, p, row, hole).is_some());
+            if fish {
+                return Some(BotMove {
+                    rot: active.rot,
+                    target_col: active.col,
+                    hold: true,
+                });
+            }
+        }
+    }
+    // 3. Dump with the greedy weights (descent columns penalized).
+    let (rot, col) = dump_landing(&snapshot.board, active.piece).unwrap_or((Rotation::Spawn, 0));
+    Some(BotMove {
+        rot,
+        target_col: col,
+        hold: false,
+    })
+}
+
+/// `true` when any settled cell on the board is garbage (the switch that
+/// keeps Marathon/Sprint/Ultra boards on the legacy greedy path).
+fn board_has_garbage(board: &Board) -> bool {
+    (0..ROWS).any(|r| (0..COLS).any(|c| board.get(r, c) == Some(Piece::Garbage)))
+}
+
+/// Topmost row containing a `Piece::Garbage` cell + its hole column.
+/// Surviving garbage rows always keep exactly nine filled cells and one hole:
+/// dumps can only land above the band, and a dig completes the top row.
+fn top_buried(board: &Board) -> Option<(usize, usize)> {
+    for r in 0..ROWS {
+        if (0..COLS).any(|c| board.get(r, c) == Some(Piece::Garbage)) {
+            let holes: Vec<usize> = (0..COLS).filter(|&c| board.get(r, c).is_none()).collect();
+            return if holes.len() == 1 {
+                Some((r, holes[0]))
+            } else {
+                None
+            };
+        }
+    }
+    None
+}
+
+/// `(buried-cells, -cleared, cost)` scoring for ghost landings; cost uses the
+/// greedy solver's weights. `buried-cells` counts landing cells that sit
+/// above a still-open garbage row in their column — the descent-shaft harm a
+/// placement does to future digs.
+fn dig_score_landing(board: &Board, ps: &PieceState) -> (i32, i32, i32) {
+    let mut sim = board.clone();
+    sim.merge(ps);
+    let cleared = sim.full_rows().len() as i32;
+    sim.clear_full_rows();
+    let mut holes = 0;
+    let mut hts = [0i32; COLS];
+    for (c, hc) in hts.iter_mut().enumerate() {
+        for r in 0..ROWS {
+            if sim.get(r, c).is_some() {
+                *hc = (ROWS - r) as i32;
+                break;
+            }
+        }
+    }
+    for c in 0..COLS {
+        let mut seen = false;
+        for r in 0..ROWS {
+            if sim.get(r, c).is_some() {
+                seen = true;
+            } else if seen {
+                holes += 1;
+            }
+        }
+    }
+    let agg: i32 = hts.iter().sum();
+    let bump: i32 = hts.windows(2).map(|w| (w[0] - w[1]).abs()).sum();
+    let buried = ps
+        .cells()
+        .iter()
+        .filter(|&&(r, c)| {
+            r >= 0
+                && r < ROWS as i32
+                && c >= 0
+                && c < COLS as i32
+                && (r as usize + 1..ROWS).any(|rr| {
+                    board.get(rr, c as usize) == Some(Piece::Garbage)
+                        && (0..COLS).any(|cc| board.get(rr, cc).is_none())
+                })
+        })
+        .count() as i32;
+    (buried, -cleared, holes * 500 + agg * 25 + bump * 12)
+}
+
+/// All spawn-row ghost landings of `piece` that keep rows 0..2 passable.
+fn dig_landings(board: &Board, piece: Piece) -> Vec<(Rotation, i32, PieceState)> {
+    let mut out = Vec::new();
+    for rot in [Rotation::Spawn, Rotation::Cw, Rotation::R180, Rotation::Ccw] {
+        for boxcol in -3i32..(COLS as i32 + 2) {
+            let ps = PieceState {
+                piece,
+                rot,
+                row: 0,
+                col: boxcol,
+            };
+            if board.collides(&ps) {
+                continue;
+            }
+            let ghost = board::ghost_row(board, &ps);
+            let landed = PieceState { row: ghost, ..ps };
+            if landed.cells().iter().any(|&(r, _)| r < 3) {
+                continue;
+            }
+            out.push((rot, boxcol, landed));
+        }
+    }
+    out
+}
+
+/// A candidate landing: placement `(rot, boxcol)` plus its comparison key
+/// (lower wins).
+struct DigBid {
+    key: (i32, i32, i32),
+    mv: (Rotation, i32),
+}
+
+/// A dig landing puts exactly one cell into the top row's hole and completes
+/// that row (nub-down T/J/L, or a vertical I resting its foot in the hole).
+fn dig_landing(board: &Board, piece: Piece, row: usize, hole: usize) -> Option<(Rotation, i32)> {
+    let mut best: Option<DigBid> = None;
+    for (rot, boxcol, landed) in dig_landings(board, piece) {
+        if landed
+            .cells()
+            .iter()
+            .filter(|&&(r, c)| r == row as i32 && c == hole as i32)
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let mut sim = board.clone();
+        sim.merge(&landed);
+        if !sim.full_rows().contains(&row) {
+            continue;
+        }
+        let key = dig_score_landing(board, &landed);
+        if best.as_ref().is_none_or(|b| key < b.key) {
+            best = Some(DigBid {
+                key,
+                mv: (rot, boxcol),
+            });
+        }
+    }
+    best.map(|b| b.mv)
+}
+
+/// Greedy hard-drop dump (marathon weights, spawn corridor kept clear,
+/// descent-column debris avoided via [`dig_score_landing`]).
+fn dump_landing(board: &Board, piece: Piece) -> Option<(Rotation, i32)> {
+    let mut best: Option<DigBid> = None;
+    for (rot, boxcol, landed) in dig_landings(board, piece) {
+        let key = dig_score_landing(board, &landed);
+        if best.as_ref().is_none_or(|b| key < b.key) {
+            best = Some(DigBid {
+                key,
+                mv: (rot, boxcol),
+            });
+        }
+    }
+    best.map(|b| b.mv)
+}
+
 /// Greedy snapshot solver: every rotation × every *reachable* resting slot
 /// (slide+drop BFS), simulated via `merge` + clear. Dellacherie-flavoured
 /// weights: clears dominate, then holes, aggregate height, bumpiness. `None`
-/// when no placement fits (block-out imminent).
+/// when no placement fits (block-out imminent). **Locked marathon brain** —
+/// every behavior gate (versus sides, T11 lock-rate harness tests) pins this
+/// exact scoring; the T10 dig pipeline never reaches it on garbage boards.
 fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
     let active = snapshot.active?;
     let mut best: Option<((i32, i32), BotMove)> = None;
@@ -576,6 +914,7 @@ fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
                     BotMove {
                         rot,
                         target_col: col,
+                        hold: false,
                     },
                 ));
             }
@@ -584,19 +923,113 @@ fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
     best.map(|(_, mv)| mv)
 }
 
+/// Named-mode bot lifecycle (T10, `TETRIS_BOT=sprint|ultra|dig`) — the body
+/// of [`bot_marathon_system`]'s named branch.
+///
+/// * From `Title` (the shipped boot screen) press the Start-equivalent —
+///   [`start_mode_run`] with the named mode, honoring `TETRIS_SEED` and the
+///   mode's pre-roll, exactly like mode-select would.
+/// * On the terminal `AppState::GameOver` write **exactly one** machine line:
+///   `BOT mode_done mode=sprint time_ticks=<n>` / `mode=dig time_ticks=<n>`
+///   (GoalReached) or `BOT mode_done mode=ultra score=<n> ticks=<n>` (Ultra
+///   `TimeUp` — score stands either way, per PRD), exiting
+///   [`AppExit::Success`]. A Sprint/Dig top-out instead logs
+///   `BOT mode_abort mode=<name> ticks=<n>` and exits nonzero
+///   ([`AppExit::error`]) so a silent early death fails CI instead of
+///   burning the step budget.
+///
+/// Lives as a plain function (not a registered system): the plugin's system
+/// graph must stay byte-identical to the pre-T10 one — the netplay UI
+/// fixtures schedule-sensitively detect same-frame edges, and merely
+/// registering one more `Update` system flips them (verified during T10).
+fn bot_named_mode_logic(
+    target: ModeId,
+    bot_state: &mut BotState,
+    core: &mut GameCore,
+    app_state: &mut AppState,
+    countdown: &mut Countdown,
+    records: Option<&mut Records>,
+    exits: &mut MessageWriter<AppExit>,
+) {
+    let name = bot_mode_name(target);
+
+    if !bot_state.named_started {
+        if *app_state == AppState::Title {
+            info!("BOT start mode {name} from Title (Start-equivalent)");
+            bot_state.named_started = true;
+            start_mode_run(target, core, countdown, app_state, records);
+            return;
+        }
+        // The mode is already live (a QA harness started it directly — the
+        // test-side alternative when the env seed can't be pinned in-proc).
+        if *app_state == AppState::Playing && core.active_mode.id == target {
+            bot_state.named_started = true;
+        }
+    }
+
+    if bot_state.named_started && *app_state == AppState::GameOver && !bot_state.finished_logged {
+        bot_state.finished_logged = true;
+        let snapshot = core.game.snapshot();
+        let ticks = core.game.tick_count();
+        match core.game.finished_reason() {
+            Some(FinishReason::GoalReached) => {
+                info!("BOT mode_done mode={name} time_ticks={ticks}");
+                exits.write(AppExit::Success);
+            }
+            Some(FinishReason::TimeUp) => {
+                info!(
+                    "BOT mode_done mode={name} score={} ticks={ticks}",
+                    snapshot.score
+                );
+                exits.write(AppExit::Success);
+            }
+            // Ultra's score stands even on an early top-out (PRD); Sprint
+            // and Dig top-outs are CI failures.
+            Some(FinishReason::TopOut) if target == ModeId::Ultra => {
+                info!(
+                    "BOT mode_done mode=ultra score={} ticks={ticks}",
+                    snapshot.score
+                );
+                exits.write(AppExit::Success);
+            }
+            _ => {
+                info!("BOT mode_abort mode={name} ticks={ticks}");
+                exits.write(AppExit::error());
+            }
+        }
+    }
+}
+
 /// Bot lifecycle (real frames): on Game Over log per-game stats and
 /// `MARATHON game_done`, restart via the shared R path after a short delay,
 /// and exit with `AppExit::Success` once [`BOT_GAMES`] games completed.
+/// `TETRIS_BOT=sprint|ultra|dig` branches into the T10 named-mode gate
+/// ([`bot_named_mode_logic`]) instead.
+#[allow(clippy::too_many_arguments)]
 fn bot_marathon_system(
     bot: Res<BotMode>,
     mut bot_state: ResMut<BotState>,
     mut core: NonSendMut<GameCore>,
     mut app_state: ResMut<AppState>,
+    mut countdown: ResMut<Countdown>,
+    mut records: Option<ResMut<Records>>,
     time: Res<Time>,
     versus: NonSend<VersusMatch>,
     mut exits: MessageWriter<AppExit>,
 ) {
-    if !bot.0 || versus.active {
+    if !bot.enabled || versus.active {
+        return;
+    }
+    if let Some(target) = bot.named {
+        bot_named_mode_logic(
+            target,
+            bot_state.into_inner(),
+            &mut core,
+            &mut app_state,
+            &mut countdown,
+            records.as_deref_mut(),
+            &mut exits,
+        );
         return;
     }
     if *app_state == AppState::Title && !bot_state.awaiting_restart {
@@ -634,7 +1067,7 @@ fn bot_marathon_system(
 /// `MARATHON fps_avg=<x> frame_ms=<y>` from actual frame deltas (bot mode
 /// only, to keep normal runs quiet).
 fn marathon_fps_system(bot: Res<BotMode>, mut stats: ResMut<MarathonStats>, time: Res<Time>) {
-    if !bot.0 {
+    if !bot.enabled {
         return;
     }
     stats.frames += 1;
@@ -807,8 +1240,15 @@ pub struct CoreBridgePlugin;
 
 impl Plugin for CoreBridgePlugin {
     fn build(&self, app: &mut App) {
-        let bot = bot_enabled();
-        info!("core bridge: bot mode {}", if bot { "ON" } else { "off" });
+        let bot = bot_mode_from_env();
+        info!(
+            "core bridge: bot mode {}",
+            match bot.named {
+                Some(id) => bot_mode_name(id),
+                None if bot.enabled => "marathon",
+                None => "off",
+            }
+        );
         app.insert_non_send(GameCore::default())
             .init_resource::<PendingActions>()
             .init_resource::<SimPaused>()
@@ -824,7 +1264,7 @@ impl Plugin for CoreBridgePlugin {
             // assume it).
             .insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
             // T14: env seed override, human R-restart, bot marathon.
-            .insert_resource(BotMode(bot))
+            .insert_resource(bot)
             .init_resource::<BotState>()
             .init_resource::<MarathonStats>()
             // T25: 1v1 versus bridge (inactive until a match starts).
@@ -1099,7 +1539,7 @@ mod tests {
     #[test]
     fn wired_bot_bridge_full_loop_then_fresh_restart() {
         let mut app = test_app(42);
-        *app.world_mut().resource_mut::<BotMode>() = BotMode(true);
+        *app.world_mut().resource_mut::<BotMode>() = BotMode::MARATHON;
 
         // Phase 1: solver plays through the real FixedUpdate wiring until it
         // has spawned, cleared lines and leveled up.
@@ -1130,7 +1570,7 @@ mod tests {
 
         // Phase 2: dumb hard drops (bot off) pile pieces at spawn until the
         // deterministic block-out, exercising the GameOver wiring.
-        *app.world_mut().resource_mut::<BotMode>() = BotMode(false);
+        *app.world_mut().resource_mut::<BotMode>() = BotMode::OFF;
         let mut saw_game_over = false;
         for _ in 0..1000 {
             app.world_mut()
@@ -1460,6 +1900,149 @@ mod tests {
         let mv = bot_move(&snapshot).expect("I always fits somewhere");
         assert_eq!(mv.rot, Rotation::Spawn, "flat I fills the four-gap");
         assert_eq!(mv.target_col, 3, "{mv:?} fills cols 3..=6");
+    }
+
+    // ---- T10: named-mode env parsing + dig-aware solver ----
+
+    #[test]
+    fn parse_bot_value_covers_named_modes_and_rejects_junk() {
+        assert_eq!(parse_bot_value("1"), BotMode::MARATHON);
+        assert_eq!(parse_bot_value(" marathon "), BotMode::MARATHON);
+        assert_eq!(parse_bot_value("SPRINT"), BotMode::named(ModeId::Sprint));
+        assert_eq!(parse_bot_value("ultra"), BotMode::named(ModeId::Ultra));
+        assert_eq!(parse_bot_value("Dig"), BotMode::named(ModeId::Dig));
+        assert_eq!(parse_bot_value(""), BotMode::OFF);
+        assert_eq!(parse_bot_value("0"), BotMode::OFF);
+        assert_eq!(parse_bot_value("dig2"), BotMode::OFF);
+        assert_eq!(parse_bot_value("survival"), BotMode::OFF);
+    }
+
+    /// Walk a real marathon run with the solver and prove the T10 dispatch
+    /// is **inert** on garbage-free boards: every sampled snapshot yields
+    /// `bot_move_mode(snap, true) == bot_move(snap)` (same rotation, column,
+    /// and `hold == false`) — the exact decisions (and therefore lock
+    /// cadence) the versus/harness tests pin.
+    #[test]
+    fn dig_heuristic_is_inert_without_garbage_cells() {
+        let mut game = Game::new(0xB0_0D);
+        let mut samples = 0usize;
+        let mut locked_cells = 0usize;
+        for _ in 0..140 {
+            let snap = game.snapshot();
+            if snap.game_over || snap.active.is_none() {
+                break;
+            }
+            let legacy = bot_move(&snap).expect("marathon bot always fits early on");
+            let aware = bot_move_mode(&snap, true).expect("same placement on a clean board");
+            assert_eq!(aware.rot, legacy.rot, "sample {samples} rot diverged");
+            assert_eq!(
+                aware.target_col, legacy.target_col,
+                "sample {samples} col diverged"
+            );
+            assert!(!aware.hold, "sample {samples}: no hold without garbage");
+            samples += 1;
+
+            // Execute (rotate → slide → hard drop) + a few gravity ticks.
+            let active = snap.active.unwrap();
+            match (aware.rot as u32 + 4 - active.rot as u32) % 4 {
+                0 => {}
+                1 => {
+                    game.apply(Action::RotateCw);
+                }
+                2 => {
+                    game.apply(Action::Rotate180);
+                }
+                _ => {
+                    game.apply(Action::RotateCcw);
+                }
+            };
+            for _ in 0..2 * COLS + 2 {
+                let active = game.snapshot().active.unwrap();
+                if active.col == aware.target_col {
+                    break;
+                }
+                game.apply(if active.col < aware.target_col {
+                    Action::MoveRight
+                } else {
+                    Action::MoveLeft
+                });
+            }
+            game.apply(Action::HardDrop);
+            let after = game.snapshot();
+            locked_cells = (0..ROWS)
+                .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+                .filter(|(r, c)| after.board.get(*r, *c).is_some())
+                .count();
+            for _ in 0..3 {
+                game.tick();
+            }
+        }
+        assert!(samples >= 100, "expected >=100 sampled decisions");
+        assert!(locked_cells > 0, "the sampled run actually locked pieces");
+    }
+
+    /// A `Piece::Garbage` board flips the pipeline on: the T10 solver picks a
+    /// nub-down landing that **completes the topmost buried row**, where a
+    /// hold-fish or descent-safe dump applies otherwise (behavioral proof
+    /// beyond the integration test).
+    #[test]
+    fn dig_heuristic_targets_top_buried_hole_on_garbage_boards() {
+        let mut board = Board::new();
+        for r in ROWS - 2..ROWS {
+            for c in 0..COLS {
+                let hole_top = r == ROWS - 2 && c == 4;
+                let hole_bottom = r == ROWS - 1 && c == 0;
+                if !hole_top && !hole_bottom {
+                    board.set(r, c, Some(Piece::Garbage));
+                }
+            }
+        }
+        let snapshot = GameSnapshot {
+            board,
+            active: Some(PieceState {
+                piece: Piece::T,
+                rot: Rotation::Spawn,
+                row: 0,
+                col: 4,
+            }),
+            ghost_row: None,
+            hold: None,
+            hold_used: false,
+            next: Vec::new(),
+            score: 0,
+            level: 1,
+            lines: 0,
+            combo: 0,
+            b2b: false,
+            game_over: false,
+        };
+        assert!(board_has_garbage(&snapshot.board));
+        let (row, hole) = top_buried(&snapshot.board).expect("buried row detected");
+        assert_eq!((row, hole), (ROWS - 2, 4));
+        assert!(
+            dig_landing(&snapshot.board, Piece::T, row, hole).is_some(),
+            "T nub-down fills the top buried hole"
+        );
+
+        let mv = bot_move_mode(&snapshot, true).expect("placement always exists");
+        assert!(!mv.hold, "active T digs now; no hold needed");
+        let boxed = PieceState {
+            piece: Piece::T,
+            rot: mv.rot,
+            row: 0,
+            col: mv.target_col,
+        };
+        let ghost = board::ghost_row(&snapshot.board, &boxed);
+        let landed = PieceState {
+            row: ghost,
+            ..boxed
+        };
+        let mut sim = snapshot.board.clone();
+        sim.merge(&landed);
+        assert!(
+            sim.full_rows().contains(&row),
+            "dig-aware placement completes the top buried row, {mv:?}"
+        );
     }
 
     // ---- T8: ModeHudInfo refresh ----

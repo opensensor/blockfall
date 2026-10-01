@@ -9,18 +9,21 @@
 #![allow(dead_code)] // stub items are consumed by later tasks (T10–T19)
 
 mod audio;
-mod core_bridge;
+// T10: the headless bot-mode CI gates (`tests/bot_modes.rs`) drive the real
+// bridge through these modules; widened from private to `pub` (crate is a
+// binary-only workspace member — nothing outside links it).
+pub mod core_bridge;
 mod hud;
 mod input;
 mod juice;
-mod modes;
-mod records;
+pub mod modes;
+pub mod records;
 mod render;
 mod screens_menu;
 mod screens_modes;
 mod screens_settings;
 mod settings_persist;
-mod state;
+pub mod state;
 mod touch;
 
 use bevy::{
