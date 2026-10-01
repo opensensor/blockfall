@@ -1283,9 +1283,56 @@ T1 ──► T2 ──┬──────────────────�
   equivalence after swap (left-after == right-before); warning lead time;
   pending garbage moves with the board; replay determinism; no double-swap on
   asymmetric action timing.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01. Commit e7916cb (code) + (this docs commit). Core
+  `versus.rs`: Switch garbage attacks share the Garbage send/land path via a
+  private `AttackRule::garbage_attacks()` (settle + land arms widened to
+  `Garbage | Switch { .. }` — same table, byte-identical attack stream,
+  pinned by `switch_attack_stream_is_identical_to_the_garbage_rule`). Swap
+  executes inside `Match::advance_match_clock` after both sides ticked
+  (next-frame inputs not yet applied): boundary = `(swaps_done+1) *
+  interval`; `std::mem::swap(&mut left, &mut right)` + `pending.swap(0, 1)`
+  + `swaps_done += 1` ⇒ `BoardSwapped { tick }`. **Pending follows the
+  board** (owner decision — queued batches travel with the board they were
+  aimed at, not the queuer; a send created on the boundary frame settles
+  before the clock advance and thus travels). Sides stay identities:
+  top-out crowns `side.other()` even on an inherited stack. Warning:
+  `lead = match_ticks + warning_ticks`, fires when `lead >= interval &&
+  lead.is_multiple_of(interval)` — exactly once per boundary, never at tick
+  0; a warning longer than one interval rides the previous swap tick
+  (`SwapWarning` of the *next* boundary emitted before that tick's
+  `BoardSwapped`). `swap_interval_ticks == 0` is inert (no swap, no warn);
+  a crowned match's frozen clock (T19 gate) can never cross a boundary.
+  **No new `MatchSnapshot` fields** — HUD derives the countdown from
+  `match_ticks`/`swaps_done`/`rule` alone. App: Switch button in the 1v1
+  rules submenu (`screens_menu.rs`, defaults `SWITCH_SWAP_INTERVAL_TICKS =
+  1_800`, `SWITCH_WARNING_TICKS = 180`); versus HUD Status slot doubles as
+  the match-wide `SWAP {secs}` countdown (ceil-seconds; `GARBAGE_COLOR`
+  inside the warning window, white plain countdown, `FINISHED_COLOR`
+  otherwise; precedence ladder badge > swap > FINISHED — `hud.rs`). Bridge
+  tests pin the full swap through `advance_match_clock` incl. bot-vs-bot
+  crown through a boundary. **DEVIATION**: the 4th rules button shifted
+  submenu geometry (rules Back now overlaps the title Settings row), so the
+  two pre-existing click-through canaries in `screens_menu.rs` tap 11 px
+  below the title Settings rect via a guarded `click_through_probe`
+  (assert-fails loudly if layout shifts again) — same tests, updated tap
+  premise. TDD RED: 11 of the 12 new core Switch tests failed against the
+  T19 placeholder (`switch_rule_is_a_no_attack_placeholder`: no attacks, no
+  warnings, no swaps; only `switch_warning_never_fires_at_tick_zero` passed
+  vacuously) → GREEN. Validation: tetris-core 199 lib + 6 + 3 + 5 green
+  (marathon golden untouched), app 508 + 7 green, `cargo test --workspace`
+  green, clippy `--workspace --all-targets -- -D warnings` clean (fixed 2
+  lints: `is_multiple_of`, `div_ceil`), `cargo fmt --all --check` clean.
+  One observed flake: `screens_modes` toggle canary failed once under
+  workspace load, passed in isolation + all reruns (pre-existing
+  pixel-click flake class, file untouched by T21). Not pushed. T22 note:
+  `lockstep.rs` already pipes `advance_match_clock` events into
+  `VersusEvent` (no net change needed); `protocol.rs`
+  `match_clock_is_deterministic` untouched (40 steps < first warning at
+  tick 1 620).
+- **files edited/created**: `crates/tetris-core/src/versus.rs`,
+  `crates/tetris-app/src/core_bridge/versus.rs`,
+  `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/hud.rs`
 
 ### T22: Online exposure + soak + relay e2e for Dig Duel and Switch
 - **depends_on**: [T20, T21]
