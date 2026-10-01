@@ -623,9 +623,48 @@ T1 ──► T2 ──┬──────────────────�
   the PRD says a result exists: top-out in Sprint/Dig records nothing).
 - **validation**: Headless tests per terminal reason (drive core to each
   outcome); record written/not-written assertions through `Records`.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `5161a83`. Single terminal recorder now owns all result writes:
+  `terminal_record_system` (screens_menu, Update, BEFORE `menu_button_clicks`
+  so a same-frame Retry can't skip it) fires once per GameOver entry
+  (`state.is_changed()` gate; bridge writes state in FixedUpdate so the next
+  Update sees it), folds the result via the pure table
+  `terminal_record(ModeId, FinishReason, &GameSnapshot, ticks) ->
+  Option<Record>` — `(Marathon, TopOut) | (Ultra, TimeUp|TopOut) =>
+  BestScore{score,level,lines}`; `(Sprint|Dig, GoalReached) =>
+  BestTime{game.tick_count()}`; `_ => None` — latches
+  `TerminalResult{mode, reason, ticks, new_record}` for the display layer,
+  and on improvement force-flushes `RecordsSaveQueue` (improved results hit
+  `best.json` within one frame; `best_score_view_system` keeps the title
+  Marathon view following). **T13 extension = one row**:
+  `(ModeId::Survival, FinishReason::TopOut) => Some(Record::BestTime { ticks })`.
+  Headline `result_text()`: Sprint/Dig GoalReached → `Time m:ss.hh`
+  (`format_time_ticks`), Sprint/Dig TopOut → `No result`, Ultra → `Time up`
+  / `Top out`, Marathon → empty; rendered by a new `ResultText` label whose
+  `Node.display` toggles `Flex/None`, so Marathon's screen keeps today's
+  exact layout. Best line per mode: non-Marathon GameOver reads the mode's
+  own `record_line` from `Records`; title/Marathon keep the
+  `PersistedBestScore` view verbatim. Retry: `start_new_run` → `retry_run`
+  (both GameOver Play-again and pause Restart now route through
+  `start_mode_run(active_mode.id)` — same mode, fresh seed unless
+  `TETRIS_SEED`, pre-roll re-armed; T7 board note honored). GameOver "Menu"
+  → `open_mode_select` (not Title). **Retired** interim
+  `settings_persist::best_score_system` (function + registration): it folded
+  EVERY GameOver into the Marathon `BestScore`, so Sprint/Dig top-outs
+  polluted the Marathon record — RED evidence
+  `screens_menu::tests::sprint_top_out_records_nothing_anywhere` failed
+  pre-fix with "a Sprint top-out must not touch the Marathon record (PRD: no
+  result)" on the full persistence tree, green post-retirement (plus
+  `settings_persist::tests::game_over_writes_no_record_from_settings_tree`
+  as the permanent gate: game over ⇒ no `Records` entry, no `best.json`).
+  Marathon disk regression kept green end-to-end
+  (`marathon_top_out_persists_best_score_to_disk`). Verified: app 415/415,
+  workspace 14 suites green, clippy `--workspace --all-targets -D warnings`
+  + fmt `--check` clean at the commit boundary (HEAD-pinned worktree + the
+  two files; shared-tree run incl. parallel T10 WIP also 418/418 green).
+- **files edited/created**: `crates/tetris-app/src/screens_menu.rs`,
+  `crates/tetris-app/src/settings_persist.rs` (retirement of the interim
+  recorder only — it lived there and owned the pollution)
 
 ### T10: Release-1 CI completion gates
 - **depends_on**: [T3, T4, T5]
