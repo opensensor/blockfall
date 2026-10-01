@@ -143,6 +143,12 @@ pub enum HudTextSlot {
     /// Mode goal counter — `Lines left: N` (Sprint, plus the pieces-placed
     /// tally) or `Garbage: N` (Dig). Same gate as [`Self::Clock`].
     Goal,
+    /// Survival garbage meter (T13): `GARBAGE +N` queued rows + the seconds
+    /// until the next feed row queues — the same `+N` idiom as the versus
+    /// incoming-garbage text (same garbage color), driven by
+    /// [`ModeHudInfo::feed_pending`] / [`ModeHudInfo::feed_next_row_in`].
+    /// Present only while a feed mode's [`Self::Clock`] is.
+    Feed,
     /// Big pre-roll `3`/`2`/`1` (= `ceil(countdown / 60)`), centered over
     /// the field. Present only while [`ModeHudInfo::countdown`] is nonzero;
     /// the clock and goal rows hide meanwhile.
@@ -171,6 +177,10 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
             // 3-2-1 sits over the empty field center, clear of both.
             HudTextSlot::Clock => Vec2::new(-hw + 2.4 * c, deck_y),
             HudTextSlot::Goal => Vec2::new(hw - 2.4 * c, deck_y),
+            // T13: the feed meter takes the pause-hint line (never shown in
+            // portrait), below the clock/goal deck row and clear of the
+            // field-centered 3-2-1.
+            HudTextSlot::Feed => Vec2::new(0.0, deck_y - 2.6 * c),
             HudTextSlot::Countdown => {
                 Vec2::new(0.0, (anchor.field_top + anchor.field_bottom) * 0.5)
             }
@@ -185,13 +195,15 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
         HudTextSlot::PauseHint => anchor.field_top - 18.0 * c,
         // T8: clock/goal stack in the right panel below the next queue
         // (below even a 6-slot queue, above the window bottom); the 3-2-1
-        // centers over the field.
+        // centers over the field. T13: the Survival feed meter stacks one
+        // row further down.
         HudTextSlot::Clock => anchor.field_top - 18.5 * c,
         HudTextSlot::Goal => anchor.field_top - 21.0 * c,
+        HudTextSlot::Feed => anchor.field_top - 23.5 * c,
         HudTextSlot::Countdown => (anchor.field_top + anchor.field_bottom) * 0.5,
     };
     let x = match slot {
-        HudTextSlot::Clock | HudTextSlot::Goal => anchor.right_panel_x,
+        HudTextSlot::Clock | HudTextSlot::Goal | HudTextSlot::Feed => anchor.right_panel_x,
         HudTextSlot::Countdown => 0.0,
         _ => anchor.left_panel_x,
     };
@@ -288,7 +300,8 @@ pub struct HudText {
 pub struct HudFixture(pub Option<GameSnapshot>);
 
 /// Pooled text entities (combo/b2b come and go with snapshot flags; the T8
-/// clock/goal/countdown texts come and go with `ModeHudInfo`).
+/// clock/goal/countdown texts and the T13 feed meter come and go with
+/// `ModeHudInfo`).
 #[derive(Resource, Default)]
 pub struct HudTextEntities {
     score: Option<Entity>,
@@ -299,6 +312,7 @@ pub struct HudTextEntities {
     pause_hint: Option<Entity>,
     clock: Option<Entity>,
     goal: Option<Entity>,
+    feed: Option<Entity>,
     countdown: Option<Entity>,
 }
 
@@ -359,6 +373,7 @@ fn slot_entity(entities: &mut HudTextEntities, slot: HudTextSlot) -> &mut Option
         HudTextSlot::PauseHint => &mut entities.pause_hint,
         HudTextSlot::Clock => &mut entities.clock,
         HudTextSlot::Goal => &mut entities.goal,
+        HudTextSlot::Feed => &mut entities.feed,
         HudTextSlot::Countdown => &mut entities.countdown,
     }
 }
@@ -377,6 +392,7 @@ fn slot_text(slot: HudTextSlot, snapshot: &GameSnapshot) -> Option<String> {
         | HudTextSlot::PauseHint
         | HudTextSlot::Clock
         | HudTextSlot::Goal
+        | HudTextSlot::Feed
         | HudTextSlot::Countdown => return None,
     };
     Some(text)
@@ -418,7 +434,11 @@ fn spawn_text(
                 font_size: bevy::text::FontSize::Px(font_size),
                 ..default()
             },
-            TextColor::WHITE,
+            // T13: the feed meter borrows the versus pending-garbage color.
+            TextColor(match slot {
+                HudTextSlot::Feed => GARBAGE_COLOR,
+                _ => Color::WHITE,
+            }),
             Transform::from_xyz(center.x, center.y, 0.5),
         ))
         .id()
@@ -464,16 +484,29 @@ fn sync_text_slot(
     }
 }
 
-/// Resolve the three `ModeHudInfo`-driven slot texts for this frame
-/// (`None` = slot absent): pre-roll countdown wins (clock/goal hide),
-/// otherwise a mode with a goal/clock shows `TIME` (count-down when the
-/// mode has a clock budget) and its goal row.
-fn mode_slot_texts(info: &ModeHudInfo) -> (Option<String>, Option<String>, Option<String>) {
+/// Resolve the four `ModeHudInfo`-driven slot texts for this frame
+/// (`None` = slot absent): pre-roll countdown wins (clock/goal/feed hide),
+/// otherwise a mode with a goal/clock/feed shows `TIME` (count-down when the
+/// mode has a clock budget), its goal row, and — for feed modes — the
+/// queued-garbage meter (`+N` rows + next-row seconds, T13).
+fn mode_slot_texts(
+    info: &ModeHudInfo,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     if info.countdown > 0 {
-        return (None, None, Some(info.countdown.div_ceil(60).to_string()));
+        return (
+            None,
+            None,
+            Some(info.countdown.div_ceil(60).to_string()),
+            None,
+        );
     }
     if !info.show_hud {
-        return (None, None, None);
+        return (None, None, None, None);
     }
     let clock = info.clock_limit.map_or_else(
         || modes::format_time_ticks(info.clock_ticks),
@@ -487,12 +520,17 @@ fn mode_slot_texts(info: &ModeHudInfo) -> (Option<String>, Option<String>, Optio
         (None, Some(rows)) => Some(format!("Garbage: {rows}")),
         (None, None) => None,
     };
-    (Some(format!("TIME\n{clock}")), goal, None)
+    let feed = info.feed_pending.map(|pending| {
+        let next_secs = info.feed_next_row_in.unwrap_or(0) as f32 / 60.0;
+        format!("GARBAGE +{pending}\nNEXT {next_secs:.1}s")
+    });
+    (Some(format!("TIME\n{clock}")), goal, None, feed)
 }
 
 /// Score/level/lines always present; combo/b2b only while active; pause
-/// hint reflects the live pause chord; the mode clock/goal/countdown rows
-/// follow [`ModeHudInfo`] (hidden for modes without a goal or clock).
+/// hint reflects the live pause chord; the mode clock/goal/feed/countdown
+/// rows follow [`ModeHudInfo`] (hidden for modes with no goal, clock or
+/// feed).
 #[allow(clippy::too_many_arguments)]
 fn sync_hud_texts(
     mut commands: Commands,
@@ -523,6 +561,7 @@ fn sync_hud_texts(
         entities.pause_hint,
         entities.clock,
         entities.goal,
+        entities.feed,
         entities.countdown,
     ]
     .into_iter()
@@ -574,11 +613,12 @@ fn sync_hud_texts(
     // T8 mode feed: bridge-written resource; apps without the bridge fall
     // back to the hidden-marathon default (read-only here, never mutated).
     let mode = mode.map(|info| *info).unwrap_or_default();
-    let (clock, goal, countdown) = mode_slot_texts(&mode);
+    let (clock, goal, countdown, feed) = mode_slot_texts(&mode);
     for (slot, want) in [
         (HudTextSlot::Clock, clock),
         (HudTextSlot::Goal, goal),
         (HudTextSlot::Countdown, countdown),
+        (HudTextSlot::Feed, feed),
     ] {
         let slot_ref = slot_entity(&mut entities, slot);
         sync_text_slot(&mut commands, slot, want, slot_ref, &anchor, &mut texts);
@@ -2036,6 +2076,85 @@ mod tests {
         );
     }
 
+    /// Survival fixture (T13): count-up clock (like Sprint) plus the
+    /// queued-garbage meter — the versus `+N` idiom — with the next-row
+    /// seconds, fed from `ModeHudInfo.feed_pending` / `feed_next_row_in`.
+    #[test]
+    fn survival_fixture_shows_feed_meter() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        inject_mode(
+            &mut app,
+            ModeHudInfo {
+                mode_id: ModeId::Survival,
+                clock_ticks: 660,
+                show_hud: true,
+                feed_pending: Some(2),
+                feed_next_row_in: Some(120),
+                ..ModeHudInfo::default()
+            },
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some(format!("TIME\n{}", modes::format_time_ticks(660))),
+            "Survival counts up like Sprint (no clock budget)"
+        );
+        let feed = text_of(&mut app, HudTextSlot::Feed).expect("survival feed meter");
+        assert!(feed.contains("+2"), "queued count: {feed}");
+        assert!(feed.contains("2.0s"), "next-row countdown: {feed}");
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Goal),
+            None,
+            "Survival has no goal row (no goal)"
+        );
+
+        inject_mode(
+            &mut app,
+            ModeHudInfo {
+                mode_id: ModeId::Survival,
+                clock_ticks: 300,
+                show_hud: true,
+                feed_pending: Some(0),
+                feed_next_row_in: Some(300),
+                ..ModeHudInfo::default()
+            },
+        );
+        let idle = text_of(&mut app, HudTextSlot::Feed).expect("feed meter stays up");
+        assert!(idle.contains("+0"), "quiet queue still reads +0: {idle}");
+        assert!(idle.contains("5.0s"), "300 ticks = 5.0 s: {idle}");
+    }
+
+    /// The feed slot follows the gate: marathon (no feed, hidden HUD) never
+    /// renders it, and the pre-roll hides it just like clock/goal.
+    #[test]
+    fn feed_slot_follows_the_feed_gate() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[Action::HardDrop]);
+        assert_eq!(text_of(&mut app, HudTextSlot::Feed), None);
+        assert_eq!(text_of(&mut app, HudTextSlot::Clock), None);
+
+        inject_mode(
+            &mut app,
+            ModeHudInfo {
+                mode_id: ModeId::Survival,
+                show_hud: true,
+                countdown: 90,
+                feed_pending: Some(3),
+                feed_next_row_in: Some(60),
+                ..ModeHudInfo::default()
+            },
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Countdown).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Feed),
+            None,
+            "pre-roll hides the feed meter"
+        );
+    }
+
     #[test]
     fn pre_roll_shows_big_countdown_and_hides_clock() {
         let mut app = hud_app(1);
@@ -2187,5 +2306,32 @@ mod tests {
         );
         assert!((big.x).abs() < EPS, "landscape 3-2-1 centered");
         assert!(big.y < anchor.field_top && big.y > anchor.field_bottom);
+    }
+
+    /// T13: the feed meter stacks below the goal row (landscape) / under the
+    /// deck row (portrait), above the window bottom and clear of the
+    /// field-centered 3-2-1.
+    #[test]
+    fn feed_slot_layout_clears_the_field_bounds() {
+        render::set_portrait_override(Some(true));
+        let anchor = hud_anchor(1080.0, 2404.0);
+        let feed = hud_text_center(&anchor, HudTextSlot::Feed);
+        let deck = hud_text_center(&anchor, HudTextSlot::Combo);
+        let big = hud_text_center(&anchor, HudTextSlot::Countdown);
+        assert!(anchor.portrait);
+        assert!(feed.y < deck.y, "feed line below the deck row");
+        assert!(feed.y < big.y, "clear of the field-centered 3-2-1");
+        render::set_portrait_override(None);
+
+        let anchor = hud_anchor(1280.0, 720.0);
+        let feed = hud_text_center(&anchor, HudTextSlot::Feed);
+        let goal = hud_text_center(&anchor, HudTextSlot::Goal);
+        assert_eq!(feed.x, anchor.right_panel_x, "right panel column");
+        assert!(feed.y < goal.y, "feed stacks below the goal row");
+        assert!(
+            feed.y > anchor.field_bottom,
+            "{feed:?} above the window bottom ({})",
+            anchor.field_bottom
+        );
     }
 }

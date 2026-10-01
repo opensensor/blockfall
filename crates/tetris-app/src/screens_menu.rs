@@ -204,9 +204,8 @@ pub fn open_settings(state: &mut AppState) {
 /// by `(mode, terminal reason)`. Anything the table omits records **nothing**
 /// — that is the whole Sprint/Dig top-out rule ("a top-out gives no
 /// result"), and unshipped modes (Zen, Bot Ladder, …) simply have no row
-/// yet. **T13 extends this table with exactly one row**:
-/// `(ModeId::Survival, FinishReason::TopOut) => Some(Record::BestTime { ticks })`
-/// ("the result is time survived").
+/// yet. Survival's row (T13) is the lone top-out-that-records: the survived
+/// time *is* the result.
 #[must_use]
 pub fn terminal_record(
     id: ModeId,
@@ -226,6 +225,9 @@ pub fn terminal_record(
         }),
         // Sprint/Dig: a time exists only when the goal was reached.
         (ModeId::Sprint | ModeId::Dig, FinishReason::GoalReached) => Some(Record::BestTime { ticks }),
+        // Survival (T13): the result is the time survived — the top-out
+        // *is* the finish, so its ticks are the record.
+        (ModeId::Survival, FinishReason::TopOut) => Some(Record::BestTime { ticks }),
         _ => None,
     }
 }
@@ -242,8 +244,11 @@ pub fn result_text(id: ModeId, reason: Option<FinishReason>, ticks: u64) -> Stri
         (ModeId::Sprint | ModeId::Dig, Some(FinishReason::TopOut)) => "No result".to_string(),
         (ModeId::Ultra, Some(FinishReason::TimeUp)) => "Time up".to_string(),
         (ModeId::Ultra, Some(FinishReason::TopOut)) => "Top out".to_string(),
-        // T13 (Survival) extends: `(ModeId::Survival, Some(TopOut))` shows
-        // the survived time exactly like the Sprint/Dig goal row.
+        // Survival (T13): the survived time, same line as the Sprint/Dig
+        // goal row — the top-out *is* the finish.
+        (ModeId::Survival, Some(FinishReason::TopOut)) => {
+            format!("Time {}", format_time_ticks(ticks))
+        }
         _ => String::new(),
     }
 }
@@ -1567,12 +1572,18 @@ mod tests {
             terminal_record(ModeId::Ultra, FinishReason::TopOut, &snapshot, 10),
             Some(best_score)
         );
-        // T13's extension point: Survival (and every other unshipped mode)
-        // records nothing until its one row lands in the table.
+        // Survival (T13): the result is the survived time — a top-out records
+        // it (`BestTime`); foreign reasons for Survival record nothing.
         assert_eq!(
             terminal_record(ModeId::Survival, FinishReason::TopOut, &snapshot, 10),
+            Some(Record::BestTime { ticks: 10 })
+        );
+        assert_eq!(
+            terminal_record(ModeId::Survival, FinishReason::TimeUp, &snapshot, 10),
             None
         );
+        // Zen and the other unshipped modes record nothing until their own
+        // rows land.
         assert_eq!(
             terminal_record(ModeId::Zen, FinishReason::TimeUp, &snapshot, 10),
             None
@@ -1604,6 +1615,12 @@ mod tests {
         assert_eq!(
             result_text(ModeId::Ultra, Some(FinishReason::TopOut), 100),
             "Top out"
+        );
+        // Survival (T13): top-out shows the survived time (same line shape
+        // as the Sprint/Dig completion row).
+        assert_eq!(
+            result_text(ModeId::Survival, Some(FinishReason::TopOut), 9835),
+            format!("Time {}", crate::modes::format_time_ticks(9835))
         );
         // Marathon keeps today's exact layout: no headline row.
         assert_eq!(
@@ -2895,10 +2912,11 @@ mod tests {
     // ---- T9: terminal recording matrix + interim recorder retirement ----
 
     use crate::core_bridge::{start_mode_run, Countdown};
-    use crate::records::{self, Record, Records, DIG, MARATHON, SPRINT, ULTRA};
+    use crate::records::{self, Record, Records, DIG, MARATHON, SPRINT, SURVIVAL, ULTRA};
     use crate::settings_persist::{CONFIG_DIR_ENV, ENV_LOCK};
     use tetris_core::game::Game;
     use tetris_core::mode::{BlockOutBehavior, FinishReason, Goal, ModeConfig};
+    use tetris_core::piece::Piece;
 
     struct TempDir(std::path::PathBuf);
 
@@ -3178,6 +3196,98 @@ mod tests {
         let records = app.world().resource::<Records>();
         assert!(records.record_for(DIG).is_none());
         assert!(records.record_for(MARATHON).is_none());
+    }
+
+    /// Survival top-out (T13): the survived time is the result — `BestTime`
+    /// lands under the Survival key, the headline and best line show it in
+    /// the Sprint-completion shape, and the Marathon record stays untouched.
+    /// The bot survives the feed (garbage rows land on its gravity-only
+    /// locks, ≥ 30 s on the clock) before the rising stack buries it — the
+    /// only Survival terminal.
+    #[test]
+    fn survival_top_out_records_best_time_and_shows_time() {
+        let mut app = menu_test_app();
+        {
+            let world = app.world_mut();
+            let mut state = world.remove_resource::<AppState>().unwrap();
+            let mut countdown = world.remove_resource::<Countdown>().unwrap();
+            let mut records = world.remove_resource::<Records>();
+            {
+                let mut core = world.non_send_mut::<GameCore>();
+                start_mode_run(
+                    ModeId::Survival,
+                    core.as_mut(),
+                    &mut countdown,
+                    &mut state,
+                    records.as_mut(),
+                );
+            }
+            world.insert_resource(state);
+            world.insert_resource(countdown);
+            if let Some(records) = records {
+                world.insert_resource(records);
+            }
+        }
+        // No inputs at all: gravity locks pieces, the feed buries them.
+        let mut garbage_seen = 0usize;
+        for _ in 0..12_000 {
+            app.world_mut().run_schedule(FixedUpdate);
+            let board = &app.world().non_send::<GameCore>().game.snapshot().board;
+            let rows = (0..tetris_core::board::ROWS)
+                .filter(|&r| {
+                    (0..tetris_core::board::COLS).any(|c| board.get(r, c) == Some(Piece::Garbage))
+                })
+                .count();
+            garbage_seen = garbage_seen.max(rows);
+            if app_state(&app) == AppState::GameOver {
+                break;
+            }
+        }
+        assert_eq!(app_state(&app), AppState::GameOver, "feed pile-up");
+        app.update();
+        assert!(
+            garbage_seen >= 4,
+            "the feed landed at least one batch of rows: {garbage_seen}"
+        );
+
+        let ticks = {
+            let core = app.world().non_send::<GameCore>();
+            assert_eq!(
+                core.game.finished_reason(),
+                Some(FinishReason::TopOut),
+                "Survival's only terminal is a top-out"
+            );
+            core.game.tick_count()
+        };
+        assert!(
+            ticks >= 1800,
+            "the bot survived at least 30 s of feed: {ticks} ticks"
+        );
+        let records = app.world().resource::<Records>();
+        assert_eq!(
+            records.record_for(SURVIVAL),
+            Some(&Record::BestTime { ticks }),
+            "the survived time is the Survival record"
+        );
+        assert!(
+            records.record_for(MARATHON).is_none(),
+            "a Survival run must not touch the Marathon record"
+        );
+        app.update();
+        let time = crate::modes::format_time_ticks(ticks);
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            format!("Time {time}"),
+            "headline shows the time survived"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<BestText>(e).is_some()),
+            format!("Best {time}")
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "NEW RECORD!"
+        );
     }
 
     /// Ultra clock expiry: BestScore recorded, `Time up` headline, marker.

@@ -13,7 +13,7 @@
 //! gates stepping on them so core tick 0 == first playable frame (see
 //! [`crate::core_bridge::Countdown`]).
 
-use tetris_core::mode::{BlockOutBehavior, Goal, ModeConfig, StartBoard};
+use tetris_core::mode::{BlockOutBehavior, GarbageFeed, Goal, ModeConfig, StartBoard};
 
 use crate::records::{self, ModeKey};
 
@@ -50,7 +50,7 @@ pub enum ModeId {
     Ultra,
     /// Dig through 10 rows of buried garbage at fixed level 1.
     Dig,
-    /// Outlast an accelerating garbage feed (R2, feed lands in T12).
+    /// Outlast a rising garbage feed until it buries you (R2, T12+T13).
     Survival,
     /// Endless relaxation; a block-out wipes the stack (R2, T14).
     Zen,
@@ -111,10 +111,13 @@ pub fn mode_config(id: ModeId) -> ModeConfig {
             on_block_out: BlockOutBehavior::End,
             ..ModeConfig::default()
         },
-        // Placeholder until T12 adds the `GarbageFeed` field: plays as plain
-        // marathon progression. T13 refines it to feed + no goal + marathon
-        // gravity.
-        ModeId::Survival => ModeConfig::default(),
+        // Survival (T12/T13 shipped): marathon progression, no goal/clock —
+        // the core's timed garbage feed queues a rising row every interval
+        // and lands queued rows on each lock until the stack buries you.
+        ModeId::Survival => ModeConfig {
+            garbage_feed: Some(GarbageFeed::default()),
+            ..ModeConfig::default()
+        },
         // T14 refines the wipe behavior (until then `WipeAndContinue`
         // behaves like `End` in the core) and adds the lifetime-lines HUD.
         ModeId::Zen => ModeConfig {
@@ -165,7 +168,7 @@ pub fn description(id: ModeId) -> &'static str {
         ModeId::Sprint => "Clear 40 lines as fast as you can.",
         ModeId::Ultra => "Six minutes. Highest score wins.",
         ModeId::Dig => "Dig through ten rows of buried garbage.",
-        ModeId::Survival => "Outlast an accelerating garbage feed.",
+        ModeId::Survival => "Outlast the ever-rising garbage feed.",
         ModeId::Zen => "Relax: a top-out just wipes the stack.",
         ModeId::BotLadder => "Climb eight bots, each faster than the last.",
         ModeId::Daily => "One seeded mode per day. Everyone gets the same one.",
@@ -174,14 +177,15 @@ pub fn description(id: ModeId) -> &'static str {
     }
 }
 
-/// `true` for the modes Release 1 ships (Marathon, Sprint, Ultra, Dig).
+/// `true` for the shipped modes (R1's four solo modes plus Survival, T13).
 /// Later tasks flip this for their own mode — the **only** catalogue edit
-/// they need, no new rows.
+/// they need, no new rows; the mode-select list filters `ModeId::ALL`
+/// through this flag.
 #[must_use]
 pub fn is_shipped(id: ModeId) -> bool {
     matches!(
         id,
-        ModeId::Marathon | ModeId::Sprint | ModeId::Ultra | ModeId::Dig
+        ModeId::Marathon | ModeId::Sprint | ModeId::Ultra | ModeId::Dig | ModeId::Survival
     )
 }
 
@@ -260,19 +264,35 @@ mod tests {
         assert_eq!(pre_roll_ticks(ModeId::Ultra), 0);
     }
 
+    /// The shipped set as of R2: the four Release-1 solo modes plus Survival
+    /// (T13). The mode-select screen (T7) filters `ModeId::ALL` through this
+    /// flag — shipping a mode is the **only** catalogue edit needed; the row
+    /// list stays data-driven (`screens_modes::rows_are_data_driven…`).
     #[test]
-    fn is_shipped_covers_release_one_only() {
-        assert!(is_shipped(ModeId::Marathon));
-        assert!(is_shipped(ModeId::Sprint));
-        assert!(is_shipped(ModeId::Ultra));
-        assert!(is_shipped(ModeId::Dig));
-        for id in ModeId::ALL {
-            if !matches!(
-                id,
-                ModeId::Marathon | ModeId::Sprint | ModeId::Ultra | ModeId::Dig
-            ) {
-                assert!(!is_shipped(id), "{id:?} must not ship in R1 yet");
-            }
+    fn is_shipped_matches_the_shipped_set() {
+        let shipped: Vec<ModeId> = ModeId::ALL
+            .iter()
+            .copied()
+            .filter(|id| is_shipped(*id))
+            .collect();
+        assert_eq!(
+            shipped,
+            vec![
+                ModeId::Marathon,
+                ModeId::Sprint,
+                ModeId::Ultra,
+                ModeId::Dig,
+                ModeId::Survival,
+            ]
+        );
+        for id in [
+            ModeId::Zen,
+            ModeId::BotLadder,
+            ModeId::Daily,
+            ModeId::DigDuel,
+            ModeId::Switch,
+        ] {
+            assert!(!is_shipped(id), "{id:?} is not shipped yet");
         }
     }
 
@@ -309,6 +329,17 @@ mod tests {
             Some(StartBoard::BuriedGarbage { rows: 10 })
         );
         assert!(!dig.levels_advance);
+
+        // Survival (T13): marathon progression + the T12 garbage feed,
+        // no goal and no clock.
+        let survival = mode_config(ModeId::Survival);
+        assert_eq!(survival.garbage_feed, Some(GarbageFeed::default()));
+        assert_eq!(survival.goal, None);
+        assert_eq!(survival.clock_ticks, None);
+        assert!(
+            survival.levels_advance,
+            "Survival uses marathon progression"
+        );
 
         assert_eq!(mode_config(ModeId::Marathon), ModeConfig::default());
     }

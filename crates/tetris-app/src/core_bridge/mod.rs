@@ -1134,10 +1134,12 @@ fn core_bridge_system(
 /// - `clock_ticks`: `Game::tick_count()` — 0 during a pre-roll (core frozen),
 ///   first playable frame is 1.
 /// - `clock_limit`: `ModeConfig::clock_ticks` (Ultra 7 200; `None` counts up).
-/// - `show_hud`: the mode has a goal *or* a clock — Marathon stays `false`
-///   and renders neither clock nor goal row.
-/// - `feed_pending` / `feed_next_row_in`: reserved for T13 (Survival garbage
-///   feed, filled by T12); `swap_in`: reserved for T21 (Switch swap timer).
+/// - `show_hud`: the mode has a goal, a clock *or* a garbage feed —
+///   Marathon stays `false` and renders neither clock nor goal row.
+/// - `feed_pending` / `feed_next_row_in`: Survival feed queue (T13) — rows
+///   queued and not yet landed (`Game::pending_garbage()`) and ticks to the
+///   next queue event (`Game::ticks_to_next_row()`); `None` without a
+///   `garbage_feed` config. `swap_in`: reserved for T21 (Switch swap timer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
 pub struct ModeHudInfo {
     /// The mode this feed describes (catalogue id of `GameCore::active_mode`).
@@ -1157,9 +1159,11 @@ pub struct ModeHudInfo {
     pub pieces_placed: u32,
     /// `true` when the mode asks for a clock/goal row.
     pub show_hud: bool,
-    /// Reserved (T13): queued garbage rows pending on this board.
+    /// Survival feed (T13): queued rows not yet landed
+    /// (`Game::pending_garbage()`); `None` without a feed config.
     pub feed_pending: Option<u32>,
-    /// Reserved (T13): ticks until the next feed row lands.
+    /// Survival feed (T13): ticks until the next queue event
+    /// (`Game::ticks_to_next_row()`); `None` without a feed config.
     pub feed_next_row_in: Option<u64>,
     /// Reserved (T21): ticks until the next whole-game swap.
     pub swap_in: Option<u64>,
@@ -1219,9 +1223,15 @@ fn mode_hud_refresh_system(
     };
     hud.garbage_left =
         matches!(config.goal, Some(Goal::GarbageCleared)).then(|| core.game.garbage_rows_left());
-    hud.show_hud = config.goal.is_some() || config.clock_ticks.is_some();
-    // Reserved fields (T13 survival feed / T21 swap timer) stay `None` until
-    // their tasks fill them from the feed/swap state.
+    hud.show_hud =
+        config.goal.is_some() || config.clock_ticks.is_some() || config.garbage_feed.is_some();
+    // T13: the Survival feed queue rides the same refresh; a mode without a
+    // `garbage_feed` config keeps both fields `None` (Marathon regression
+    // guard). `ticks_to_next_row` is `None` only without a feed.
+    let has_feed = config.garbage_feed.is_some();
+    hud.feed_pending = has_feed.then(|| core.game.pending_garbage());
+    hud.feed_next_row_in = has_feed.then(|| core.game.ticks_to_next_row()).flatten();
+    // `swap_in` stays reserved for T21's swap timer.
 }
 
 /// Spawns the primary 2D camera if no other plugin stub has one yet (render
@@ -2091,6 +2101,87 @@ mod tests {
         assert_eq!(hud.garbage_left, Some(modes::DIG_GARBAGE_ROWS));
         assert_eq!(hud.lines_left, None);
         assert!(hud.show_hud);
+
+        // Survival (T13): no goal, no clock — the *feed* switches the HUD on
+        // and arms both queue fields.
+        start_mode(&mut app, ModeId::Survival);
+        fixed_step(&mut app);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.mode_id, ModeId::Survival);
+        assert!(hud.show_hud, "a mode with a feed shows a HUD");
+        assert_eq!(hud.lines_left, None);
+        assert_eq!(hud.garbage_left, None);
+        assert_eq!(hud.clock_limit, None, "Survival counts up");
+        assert_eq!(hud.feed_pending, Some(0), "queue starts empty");
+        assert!(
+            hud.feed_next_row_in.is_some(),
+            "feed arms the next-row countdown"
+        );
+    }
+
+    /// T13: the Survival feed fields track the core queue every step — the
+    /// first row queues at the interval **before any lock**, the countdown
+    /// ticks down, and the lock lands the queued rows on the board.
+    #[test]
+    fn mode_hud_survival_feed_queues_counts_down_and_lands() {
+        let mut app = test_app(0x73);
+        start_mode(&mut app, ModeId::Survival);
+        assert_eq!(
+            app.world().resource::<Countdown>().0,
+            0,
+            "Survival has no pre-roll"
+        );
+
+        // 305 gravity-only steps: the tick-300 queue event fired, nothing
+        // has locked yet (level-1 gravity needs far longer to land a piece).
+        for _ in 0..305 {
+            fixed_step(&mut app);
+        }
+        let hud = mode_hud(&app);
+        assert!(hud.show_hud);
+        assert_eq!(hud.pieces_placed, 0, "no locks happened");
+        assert!(
+            hud.feed_pending >= Some(1),
+            "queued garbage before any lock: {:?}",
+            hud.feed_pending
+        );
+        let early = hud.feed_next_row_in.expect("feed armed");
+        for _ in 0..3 {
+            fixed_step(&mut app);
+        }
+        let later = mode_hud(&app).feed_next_row_in.expect("feed armed");
+        assert!(
+            later < early,
+            "next-row countdown counts down: {later} < {early}"
+        );
+
+        // First lock: the queued row lands (pending drops, garbage appears).
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::HardDrop);
+        fixed_step(&mut app);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.pieces_placed, 1);
+        assert_eq!(hud.feed_pending, Some(0), "the queued row landed");
+        assert!(
+            board_has_garbage(&snapshot(&app).board),
+            "the landed feed row sits on the board"
+        );
+    }
+
+    /// Marathon regression (T13): without a feed config the reserved fields
+    /// stay `None` and `show_hud` stays `false` even past the feed interval.
+    #[test]
+    fn mode_hud_feed_fields_stay_none_without_feed() {
+        let mut app = test_app(0x74);
+        for _ in 0..350 {
+            fixed_step(&mut app);
+        }
+        let hud = mode_hud(&app);
+        assert_eq!(hud.mode_id, ModeId::Marathon);
+        assert!(!hud.show_hud);
+        assert_eq!(hud.feed_pending, None);
+        assert_eq!(hud.feed_next_row_in, None);
     }
 
     #[test]
