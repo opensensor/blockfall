@@ -44,8 +44,9 @@ use tetris_core::game::GameSnapshot;
 use tetris_core::piece::{Piece, Rotation};
 use tetris_core::versus::Side;
 
-use crate::core_bridge::{GameCore, VersusMatch};
+use crate::core_bridge::{GameCore, ModeHudInfo, VersusMatch};
 use crate::input::{Bind, BindSlot, KeyBindings};
+use crate::modes;
 use crate::render::{self, GHOST_ALPHA, VISIBLE_ROWS};
 use crate::state::Settings;
 
@@ -135,6 +136,17 @@ pub enum HudTextSlot {
     B2B,
     /// Pause chord hint reflecting the current [`KeyBindings`] pause slot.
     PauseHint,
+    /// Mode clock (`TIME` + `m:ss.hh` from [`crate::modes::format_time_ticks`],
+    /// count-down for clock-budgeted modes like Ultra). Present only while
+    /// [`ModeHudInfo::show_hud`] is set and the pre-roll countdown is done.
+    Clock,
+    /// Mode goal counter — `Lines left: N` (Sprint, plus the pieces-placed
+    /// tally) or `Garbage: N` (Dig). Same gate as [`Self::Clock`].
+    Goal,
+    /// Big pre-roll `3`/`2`/`1` (= `ceil(countdown / 60)`), centered over
+    /// the field. Present only while [`ModeHudInfo::countdown`] is nonzero;
+    /// the clock and goal rows hide meanwhile.
+    Countdown,
 }
 
 /// World-space center of a text slot: left panel column (landscape) or the
@@ -154,6 +166,14 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
             HudTextSlot::Combo => Vec2::new(-3.4 * c, deck_y),
             HudTextSlot::B2B => Vec2::new(3.4 * c, deck_y),
             HudTextSlot::PauseHint => Vec2::new(0.0, deck_y - 2.6 * c),
+            // T8: clock/goal join the deck row at the outer margins (the
+            // pause hint it would share is never shown in portrait); the
+            // 3-2-1 sits over the empty field center, clear of both.
+            HudTextSlot::Clock => Vec2::new(-hw + 2.4 * c, deck_y),
+            HudTextSlot::Goal => Vec2::new(hw - 2.4 * c, deck_y),
+            HudTextSlot::Countdown => {
+                Vec2::new(0.0, (anchor.field_top + anchor.field_bottom) * 0.5)
+            }
         };
     }
     let y = match slot {
@@ -163,8 +183,19 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
         HudTextSlot::Combo => anchor.field_top - 13.0 * c,
         HudTextSlot::B2B => anchor.field_top - 15.0 * c,
         HudTextSlot::PauseHint => anchor.field_top - 18.0 * c,
+        // T8: clock/goal stack in the right panel below the next queue
+        // (below even a 6-slot queue, above the window bottom); the 3-2-1
+        // centers over the field.
+        HudTextSlot::Clock => anchor.field_top - 18.5 * c,
+        HudTextSlot::Goal => anchor.field_top - 21.0 * c,
+        HudTextSlot::Countdown => (anchor.field_top + anchor.field_bottom) * 0.5,
     };
-    Vec2::new(anchor.left_panel_x, y)
+    let x = match slot {
+        HudTextSlot::Clock | HudTextSlot::Goal => anchor.right_panel_x,
+        HudTextSlot::Countdown => 0.0,
+        _ => anchor.left_panel_x,
+    };
+    Vec2::new(x, y)
 }
 
 /// World-space center of the hold box.
@@ -256,7 +287,8 @@ pub struct HudText {
 #[derive(Resource, Default, Clone)]
 pub struct HudFixture(pub Option<GameSnapshot>);
 
-/// Pooled text entities (combo/b2b come and go with snapshot flags).
+/// Pooled text entities (combo/b2b come and go with snapshot flags; the T8
+/// clock/goal/countdown texts come and go with `ModeHudInfo`).
 #[derive(Resource, Default)]
 pub struct HudTextEntities {
     score: Option<Entity>,
@@ -265,6 +297,9 @@ pub struct HudTextEntities {
     combo: Option<Entity>,
     b2b: Option<Entity>,
     pause_hint: Option<Entity>,
+    clock: Option<Entity>,
+    goal: Option<Entity>,
+    countdown: Option<Entity>,
 }
 
 /// Pooled preview root entities.
@@ -322,6 +357,9 @@ fn slot_entity(entities: &mut HudTextEntities, slot: HudTextSlot) -> &mut Option
         HudTextSlot::Combo => &mut entities.combo,
         HudTextSlot::B2B => &mut entities.b2b,
         HudTextSlot::PauseHint => &mut entities.pause_hint,
+        HudTextSlot::Clock => &mut entities.clock,
+        HudTextSlot::Goal => &mut entities.goal,
+        HudTextSlot::Countdown => &mut entities.countdown,
     }
 }
 
@@ -333,7 +371,13 @@ fn slot_text(slot: HudTextSlot, snapshot: &GameSnapshot) -> Option<String> {
         HudTextSlot::Lines => format!("LINES\n{}", snapshot.lines),
         HudTextSlot::Combo if snapshot.combo > 0 => format!("COMBO x{}", snapshot.combo),
         HudTextSlot::B2B if snapshot.b2b => "B2B".to_string(),
-        HudTextSlot::Combo | HudTextSlot::B2B | HudTextSlot::PauseHint => return None,
+        // Mode slots are driven by `ModeHudInfo`, not the snapshot.
+        HudTextSlot::Combo
+        | HudTextSlot::B2B
+        | HudTextSlot::PauseHint
+        | HudTextSlot::Clock
+        | HudTextSlot::Goal
+        | HudTextSlot::Countdown => return None,
     };
     Some(text)
 }
@@ -392,6 +436,7 @@ fn sync_text_slot(
     let center = hud_text_center(anchor, slot);
     let font_size = match slot {
         HudTextSlot::Score | HudTextSlot::Level | HudTextSlot::Lines => anchor.cell * 0.45,
+        HudTextSlot::Countdown => anchor.cell * 2.2,
         _ => anchor.cell * 0.36,
     };
     let font_size = font_size.max(8.0);
@@ -419,13 +464,41 @@ fn sync_text_slot(
     }
 }
 
+/// Resolve the three `ModeHudInfo`-driven slot texts for this frame
+/// (`None` = slot absent): pre-roll countdown wins (clock/goal hide),
+/// otherwise a mode with a goal/clock shows `TIME` (count-down when the
+/// mode has a clock budget) and its goal row.
+fn mode_slot_texts(info: &ModeHudInfo) -> (Option<String>, Option<String>, Option<String>) {
+    if info.countdown > 0 {
+        return (None, None, Some(info.countdown.div_ceil(60).to_string()));
+    }
+    if !info.show_hud {
+        return (None, None, None);
+    }
+    let clock = info.clock_limit.map_or_else(
+        || modes::format_time_ticks(info.clock_ticks),
+        |limit| modes::format_time_ticks(limit.saturating_sub(info.clock_ticks)),
+    );
+    let goal = match (info.lines_left, info.garbage_left) {
+        (Some(lines), _) => Some(format!(
+            "Lines left: {lines}\nPieces: {}",
+            info.pieces_placed
+        )),
+        (None, Some(rows)) => Some(format!("Garbage: {rows}")),
+        (None, None) => None,
+    };
+    (Some(format!("TIME\n{clock}")), goal, None)
+}
+
 /// Score/level/lines always present; combo/b2b only while active; pause
-/// hint reflects the live pause chord.
+/// hint reflects the live pause chord; the mode clock/goal/countdown rows
+/// follow [`ModeHudInfo`] (hidden for modes without a goal or clock).
 #[allow(clippy::too_many_arguments)]
 fn sync_hud_texts(
     mut commands: Commands,
     core: Option<NonSend<GameCore>>,
     fixture: Option<Res<HudFixture>>,
+    mode: Option<Res<ModeHudInfo>>,
     bindings: Option<Res<KeyBindings>>,
     windows: Query<&Window>,
     mut entities: ResMut<HudTextEntities>,
@@ -448,6 +521,9 @@ fn sync_hud_texts(
         entities.combo,
         entities.b2b,
         entities.pause_hint,
+        entities.clock,
+        entities.goal,
+        entities.countdown,
     ]
     .into_iter()
     .flatten()
@@ -494,6 +570,19 @@ fn sync_hud_texts(
         &anchor,
         &mut texts,
     );
+
+    // T8 mode feed: bridge-written resource; apps without the bridge fall
+    // back to the hidden-marathon default (read-only here, never mutated).
+    let mode = mode.map(|info| *info).unwrap_or_default();
+    let (clock, goal, countdown) = mode_slot_texts(&mode);
+    for (slot, want) in [
+        (HudTextSlot::Clock, clock),
+        (HudTextSlot::Goal, goal),
+        (HudTextSlot::Countdown, countdown),
+    ] {
+        let slot_ref = slot_entity(&mut entities, slot);
+        sync_text_slot(&mut commands, slot, want, slot_ref, &anchor, &mut texts);
+    }
 }
 
 /// Spawn one next-queue preview root with its four mini cells.
@@ -1813,5 +1902,290 @@ mod tests {
             let _ = app.world_mut().try_run_schedule(Update);
         }
         assert_eq!(app.world().entities().len(), before, "no versus HUD leaks");
+    }
+
+    // ------------------------------------------------------------------
+    // T8: mode HUD — clock, goal counter, pre-roll 3-2-1
+    // ------------------------------------------------------------------
+
+    use crate::core_bridge::{start_mode_run, Countdown, ModeHudInfo};
+    use crate::modes::{self, ModeId};
+
+    /// Fixture injection (extended `HudFixture` pattern, T8): write the
+    /// bridge-owned [`ModeHudInfo`] directly and re-render — no fixed step,
+    /// so the live-bridge refresh never clobbers the injected values.
+    fn inject_mode(app: &mut App, info: ModeHudInfo) {
+        *app.world_mut().resource_mut::<ModeHudInfo>() = info;
+        let _ = app.world_mut().try_run_schedule(Update);
+    }
+
+    fn sprint_fixture(app: &mut App, clock_ticks: u64) {
+        inject_mode(
+            app,
+            ModeHudInfo {
+                mode_id: ModeId::Sprint,
+                clock_ticks,
+                show_hud: true,
+                lines_left: Some(37),
+                pieces_placed: 5,
+                ..ModeHudInfo::default()
+            },
+        );
+    }
+
+    fn ultra_fixture(app: &mut App, clock_ticks: u64) -> ModeHudInfo {
+        let info = ModeHudInfo {
+            mode_id: ModeId::Ultra,
+            clock_ticks,
+            clock_limit: Some(modes::ULTRA_CLOCK_TICKS),
+            show_hud: true,
+            ..ModeHudInfo::default()
+        };
+        inject_mode(app, info);
+        info
+    }
+
+    #[test]
+    fn marathon_shows_no_clock_or_goal_rows() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[Action::HardDrop]);
+        assert_eq!(text_of(&mut app, HudTextSlot::Clock), None);
+        assert_eq!(text_of(&mut app, HudTextSlot::Goal), None);
+        assert_eq!(text_of(&mut app, HudTextSlot::Countdown), None);
+
+        // Even an explicitly hidden fixture keeps the slots absent.
+        inject_mode(&mut app, ModeHudInfo::default());
+        assert_eq!(text_of(&mut app, HudTextSlot::Clock), None);
+        assert_eq!(text_of(&mut app, HudTextSlot::Goal), None);
+    }
+
+    #[test]
+    fn sprint_clock_delegates_to_format_time_ticks() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        // Pin the plan's examples through the label wiring (the truncation
+        // math itself is covered by `modes::tests`).
+        for (ticks, want) in [(0_u64, "0:00.00"), (9_835, "2:43.91"), (10_235, "2:50.58")] {
+            sprint_fixture(&mut app, ticks);
+            assert_eq!(
+                text_of(&mut app, HudTextSlot::Clock),
+                Some(format!("TIME\n{want}")),
+                "elapsed clock at {ticks} ticks"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_fixture_shows_lines_left_and_pieces() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        sprint_fixture(&mut app, 6_600);
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some("TIME\n1:50.00".to_string())
+        );
+        let goal = text_of(&mut app, HudTextSlot::Goal).expect("sprint goal row");
+        assert!(goal.contains("Lines left: 37"), "{goal}");
+        assert!(goal.contains("Pieces: 5"), "{goal}");
+    }
+
+    #[test]
+    fn ultra_fixture_counts_down_to_the_tenth() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        ultra_fixture(&mut app, 6_600);
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some("TIME\n0:10.00".to_string()),
+            "6 600 elapsed of 7 200 → 10 s remaining"
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Goal),
+            None,
+            "Ultra shows no goal row (score already shown)"
+        );
+        ultra_fixture(&mut app, 7_199);
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some("TIME\n0:00.01".to_string()),
+            "7 199 elapsed → 1 tick remaining, truncated"
+        );
+    }
+
+    #[test]
+    fn dig_fixture_shows_garbage_rows_left() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        inject_mode(
+            &mut app,
+            ModeHudInfo {
+                mode_id: ModeId::Dig,
+                clock_ticks: 1_500,
+                show_hud: true,
+                garbage_left: Some(3),
+                ..ModeHudInfo::default()
+            },
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Goal),
+            Some("Garbage: 3".into())
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some(format!("TIME\n{}", modes::format_time_ticks(1_500)))
+        );
+    }
+
+    #[test]
+    fn pre_roll_shows_big_countdown_and_hides_clock() {
+        let mut app = hud_app(1);
+        frame(&mut app, &[]);
+        inject_mode(
+            &mut app,
+            ModeHudInfo {
+                mode_id: ModeId::Sprint,
+                show_hud: true,
+                lines_left: Some(modes::SPRINT_GOAL_LINES),
+                countdown: 180,
+                ..ModeHudInfo::default()
+            },
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Countdown).as_deref(),
+            Some("3"),
+            "180 pre-roll steps → 3"
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            None,
+            "clock hidden during pre-roll"
+        );
+        assert_eq!(text_of(&mut app, HudTextSlot::Goal), None);
+        for (count, want) in [(120_u32, "2"), (121, "3"), (61, "2"), (60, "1"), (1, "1")] {
+            inject_mode(
+                &mut app,
+                ModeHudInfo {
+                    mode_id: ModeId::Sprint,
+                    show_hud: true,
+                    countdown: count,
+                    ..ModeHudInfo::default()
+                },
+            );
+            assert_eq!(
+                text_of(&mut app, HudTextSlot::Countdown).as_deref(),
+                Some(want),
+                "ceil({count}/60)"
+            );
+        }
+        inject_mode(&mut app, ModeHudInfo::default());
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Countdown),
+            None,
+            "0 → normal HUD"
+        );
+    }
+
+    #[test]
+    fn live_sprint_refresh_tracks_core_and_pre_roll() {
+        let mut app = hud_app(0xA17);
+        app.world_mut()
+            .resource_scope::<AppState, ()>(|world, mut state| {
+                let mut countdown = world.remove_resource::<Countdown>().unwrap();
+                {
+                    let mut core = world.non_send_mut::<GameCore>();
+                    start_mode_run(
+                        ModeId::Sprint,
+                        core.as_mut(),
+                        &mut countdown,
+                        state.as_mut(),
+                        None,
+                    );
+                }
+                world.insert_resource(countdown);
+            });
+        // The first fixed step burns pre-roll 180 → 179 (core frozen).
+        frame(&mut app, &[]);
+        {
+            let hud = app.world().resource::<ModeHudInfo>();
+            assert_eq!(hud.mode_id, ModeId::Sprint);
+            assert_eq!(hud.countdown, 179);
+            assert_eq!(hud.lines_left, Some(modes::SPRINT_GOAL_LINES));
+            assert!(hud.show_hud);
+            assert_eq!(hud.clock_ticks, 0, "core frozen during the pre-roll");
+            assert_eq!(hud.feed_pending, None);
+            assert_eq!(hud.feed_next_row_in, None);
+            assert_eq!(hud.swap_in, None);
+        }
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Countdown).as_deref(),
+            Some("3")
+        );
+
+        // 179 more steps drain the pre-roll: the 180th step is the first
+        // playable frame (core tick 0 → steps 1 == clock_ticks 1).
+        for _ in 0..179 {
+            frame(&mut app, &[]);
+        }
+        {
+            let hud = app.world().resource::<ModeHudInfo>();
+            let core = app.world().non_send::<GameCore>();
+            assert_eq!(hud.countdown, 0);
+            assert_eq!(
+                hud.clock_ticks, core.steps,
+                "clock_ticks == core steps after pre-roll"
+            );
+            assert_eq!(core.steps, 1);
+        }
+        assert_eq!(text_of(&mut app, HudTextSlot::Countdown), None);
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Clock),
+            Some("TIME\n0:00.01".to_string()),
+            "core tick 1 renders as 0:00.01 (truncated)"
+        );
+
+        frame(&mut app, &[Action::HardDrop]);
+        {
+            let hud = app.world().resource::<ModeHudInfo>();
+            assert_eq!(hud.pieces_placed, 1, "PieceLocked events counted");
+            assert_eq!(hud.clock_ticks, app.world().non_send::<GameCore>().steps);
+        }
+    }
+
+    #[test]
+    fn mode_slots_avoid_the_countdown_center() {
+        render::set_portrait_override(Some(true));
+        let anchor = hud_anchor(1080.0, 2404.0);
+        let clock = hud_text_center(&anchor, HudTextSlot::Clock);
+        let goal = hud_text_center(&anchor, HudTextSlot::Goal);
+        let big = hud_text_center(&anchor, HudTextSlot::Countdown);
+        assert!(anchor.portrait);
+        assert!(clock.x < goal.x);
+        assert!((clock.y - goal.y).abs() < EPS, "same deck row");
+        assert!(
+            (clock.y - hud_text_center(&anchor, HudTextSlot::Combo).y).abs() < EPS,
+            "clock/goal share the combo/deck row"
+        );
+        assert!(
+            big.y < anchor.field_top && big.y > anchor.field_bottom,
+            "3-2-1 centered over the field, clear of the deck row"
+        );
+        render::set_portrait_override(None);
+
+        let anchor = hud_anchor(1280.0, 720.0);
+        let clock = hud_text_center(&anchor, HudTextSlot::Clock);
+        let goal = hud_text_center(&anchor, HudTextSlot::Goal);
+        let big = hud_text_center(&anchor, HudTextSlot::Countdown);
+        assert_eq!(clock.x, anchor.right_panel_x, "right panel below the queue");
+        assert_eq!(goal.x, anchor.right_panel_x);
+        // Below the tallest possible next queue (6 slots) …
+        assert!(clock.y < next_center(&anchor, 5).y);
+        // … and above the window bottom.
+        assert!(
+            goal.y > anchor.field_bottom,
+            "{goal:?} vs {:?}",
+            anchor.field_bottom
+        );
+        assert!((big.x).abs() < EPS, "landscape 3-2-1 centered");
+        assert!(big.y < anchor.field_top && big.y > anchor.field_bottom);
     }
 }

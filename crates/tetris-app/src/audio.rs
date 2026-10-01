@@ -19,7 +19,8 @@ use bevy_kira_audio::prelude::{AudioApp, AudioChannel, AudioControl, AudioSource
 
 use tetris_core::event::GameEvent;
 
-use crate::core_bridge::{CoreEvent, SimPaused};
+use crate::core_bridge::{CoreEvent, ModeHudInfo, SimPaused};
+use crate::modes::ModeId;
 use crate::state::{AppState, Settings};
 
 /// Linear-gain multiplier applied to BGM while ducked (paused / frozen).
@@ -110,8 +111,10 @@ pub fn sfx_for_event(event: &GameEvent) -> Option<EventSfx> {
     use GameEvent::*;
     Some(match event {
         PieceSpawned { .. } | ScoreChanged { .. } => return None,
-        // T2 terminal events: kept silent until T8 wires their cues (Ultra
-        // warning / goal fanfare); the arm keeps the match exhaustive.
+        // T2 terminal events: kept silent until T9 wires their result-screen
+        // fanfares; the arm keeps the match exhaustive. (The T8 Ultra
+        // last-10-s warning is *not* an event — see
+        // [`ultra_warning_system`].)
         GoalReached { .. } | TimeUp { .. } => return None,
         PieceLocked { .. } => EventSfx {
             label: "lock",
@@ -209,6 +212,14 @@ impl SfxDirector {
         Some(mapped)
     }
 
+    /// Count an edge-triggered, non-`GameEvent` cue (e.g. the T8 Ultra
+    /// last-10-s warning): bumps the per-label counter for headless
+    /// assertion **without** queueing a WAV — placeholder path until a
+    /// fitting warning asset ships (see [`ultra_warning_system`]).
+    pub fn note_edge_cue(&mut self, label: &'static str) {
+        *self.plays.entry(label).or_insert(0) += 1;
+    }
+
     /// Update Settings volumes and recompute effective gains.
     pub fn set_gains(&mut self, master: f32, sfx: f32, music: f32) {
         self.master_volume = master;
@@ -254,7 +265,12 @@ enum AudioSet {
 fn add_logic_systems(app: &mut App) {
     app.add_systems(
         Update,
-        (sfx_dispatch, sync_settings, update_duck)
+        (
+            sfx_dispatch,
+            sync_settings,
+            update_duck,
+            ultra_warning_system,
+        )
             .chain()
             .in_set(AudioSet::Director),
     );
@@ -278,6 +294,58 @@ fn sync_settings(settings: Res<Settings>, mut director: ResMut<SfxDirector>) {
 
 fn update_duck(paused: Res<SimPaused>, state: Res<AppState>, mut director: ResMut<SfxDirector>) {
     director.set_ducked(paused.0 || *state != AppState::Playing);
+}
+
+/// Ultra warning window in fixed steps: the final 10 s of the score-attack
+/// clock (remaining ≤ 600, i.e. `clock_ticks` reaching 6 600 of 7 200).
+pub const ULTRA_WARNING_TICKS: u64 = 600;
+
+/// `SfxDirector::plays` label for the Ultra last-10-s warning edge.
+pub const ULTRA_WARNING_LABEL: &str = "ultra-warning";
+
+/// Edge-detect the Ultra clock crossing into the last ten seconds and fire
+/// the warning **exactly once per run** (plan T8).
+///
+/// Asset decision: the shipped cue set (`assets/generate.py`) is a family of
+/// functional blips — no urgent/alarm tone exists, and the two "urgent-
+/// feeling" cues are wrong at T-10s (the `GameOver` 440→110 Hz sweep would
+/// read as "run ended", `Tetris`/`LevelUp` read as reward). Rather than
+/// mislead the player, this fires a placeholder `info!` log behind the edge
+/// and counts it via [`SfxDirector::note_edge_cue`] so headless tests can
+/// assert exactly-once; the audible cue is a **manual_check** item pending a
+/// dedicated warning WAV (queue it here with
+/// `director.pending_sfx.push_back(...)` once it ships).
+///
+/// The edge tracks remaining ticks (`clock_limit - clock_ticks`), so a mode
+/// restart (remaining jumping back above the window) re-arms automatically;
+/// observing an already-inside window at first sight (no previous sample)
+/// fires once, never repeats while inside.
+fn ultra_warning_system(
+    hud: Option<Res<ModeHudInfo>>,
+    mut director: ResMut<SfxDirector>,
+    mut previous: Local<Option<u64>>,
+) {
+    let hud = match hud {
+        Some(hud) if hud.mode_id == ModeId::Ultra && hud.clock_limit.is_some() => hud,
+        _ => {
+            *previous = None;
+            return;
+        }
+    };
+    let remaining = hud
+        .clock_limit
+        .unwrap_or_default()
+        .saturating_sub(hud.clock_ticks);
+    let inside = remaining <= ULTRA_WARNING_TICKS;
+    let crossed = inside && previous.is_none_or(|prev| prev > ULTRA_WARNING_TICKS);
+    if crossed {
+        director.note_edge_cue(ULTRA_WARNING_LABEL);
+        info!(
+            "ULTRA warning: 10 s remaining (clock_ticks={})",
+            hud.clock_ticks
+        );
+    }
+    *previous = Some(remaining);
 }
 
 /// Linear gain to Kira channel volume (raw decibels); `<= 0.001` silences.
@@ -665,5 +733,87 @@ mod tests {
             director.pending_sfx.is_empty(),
             "Kira system drains the queue without enabled output"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T8: Ultra last-10-s warning (edge-detected off ModeHudInfo)
+    // ------------------------------------------------------------------
+
+    use crate::core_bridge::ModeHudInfo;
+    use crate::modes::{ModeId, ULTRA_CLOCK_TICKS};
+
+    fn ultra_hud(clock_ticks: u64) -> ModeHudInfo {
+        ModeHudInfo {
+            mode_id: ModeId::Ultra,
+            clock_ticks,
+            clock_limit: Some(ULTRA_CLOCK_TICKS),
+            show_hud: true,
+            ..ModeHudInfo::default()
+        }
+    }
+
+    fn warning_plays(app: &App) -> u32 {
+        app.world()
+            .resource::<SfxDirector>()
+            .plays
+            .get(ULTRA_WARNING_LABEL)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn ultra_warning_fires_exactly_once_on_the_last_ten_seconds() {
+        let mut app = logic_app();
+        app.insert_resource(ultra_hud(6_599));
+        app.update();
+        assert_eq!(
+            warning_plays(&app),
+            0,
+            "601 ticks remaining is not yet the window"
+        );
+
+        // Crossing: remaining 601 → 600 (clock_ticks reaches 6 600).
+        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(6_600);
+        app.update();
+        assert_eq!(warning_plays(&app), 1, "edge into the last 10 s fires once");
+
+        // Staying inside the window never re-fires.
+        for ticks in [6_601, 6_900, 7_199, ULTRA_CLOCK_TICKS] {
+            *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(ticks);
+            app.update();
+        }
+        assert_eq!(warning_plays(&app), 1, "no repeats inside the window");
+
+        // A fresh run (remaining jumps back above the window) re-arms.
+        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(0);
+        app.update();
+        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(6_600);
+        app.update();
+        assert_eq!(warning_plays(&app), 2, "restart re-arms the warning edge");
+    }
+
+    #[test]
+    fn other_modes_never_fire_the_ultra_warning() {
+        let mut app = logic_app();
+        app.insert_resource(ModeHudInfo {
+            mode_id: ModeId::Sprint,
+            clock_ticks: 6_600,
+            show_hud: true,
+            lines_left: Some(0),
+            ..ModeHudInfo::default()
+        });
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(warning_plays(&app), 0, "Sprint has no count-down clock");
+    }
+
+    #[test]
+    fn missing_mode_hud_info_is_inert() {
+        let mut app = logic_app();
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(warning_plays(&app), 0);
     }
 }

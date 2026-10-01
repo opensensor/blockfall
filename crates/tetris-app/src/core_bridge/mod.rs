@@ -51,7 +51,7 @@ use tetris_core::actions::Action;
 use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
-use tetris_core::mode::ModeConfig;
+use tetris_core::mode::{Goal, ModeConfig};
 use tetris_core::piece::{PieceState, Rotation};
 
 use crate::modes::{self, ModeId};
@@ -691,6 +691,106 @@ fn core_bridge_system(
     }
 }
 
+/// Per-frame HUD feed for the mode-aware widgets (T8). The bridge writes it
+/// every fixed step **after** [`core_bridge_system`] (see
+/// [`mode_hud_refresh_system`]); HUD systems only read it. `GameSnapshot`
+/// gains **no** fields — this resource is the wire-stable carrier for
+/// clock/goal data (plan constraint 1).
+///
+/// Field notes for later tasks:
+/// - `clock_ticks`: `Game::tick_count()` — 0 during a pre-roll (core frozen),
+///   first playable frame is 1.
+/// - `clock_limit`: `ModeConfig::clock_ticks` (Ultra 7 200; `None` counts up).
+/// - `show_hud`: the mode has a goal *or* a clock — Marathon stays `false`
+///   and renders neither clock nor goal row.
+/// - `feed_pending` / `feed_next_row_in`: reserved for T13 (Survival garbage
+///   feed, filled by T12); `swap_in`: reserved for T21 (Switch swap timer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
+pub struct ModeHudInfo {
+    /// The mode this feed describes (catalogue id of `GameCore::active_mode`).
+    pub mode_id: ModeId,
+    /// Elapsed core ticks (`Game::tick_count()`).
+    pub clock_ticks: u64,
+    /// Count-down budget when the mode has one (`ModeConfig::clock_ticks`).
+    pub clock_limit: Option<u64>,
+    /// Remaining pre-roll steps ([`Countdown`] mirror); `0` once playable.
+    pub countdown: u32,
+    /// Sprint: `goal - lines` remaining; `None` without a lines goal.
+    pub lines_left: Option<u32>,
+    /// Dig: rows of garbage left (`Game::garbage_rows_left()`); `None`
+    /// without the garbage goal.
+    pub garbage_left: Option<usize>,
+    /// Pieces locked since this mode's start (from `PieceLocked` events).
+    pub pieces_placed: u32,
+    /// `true` when the mode asks for a clock/goal row.
+    pub show_hud: bool,
+    /// Reserved (T13): queued garbage rows pending on this board.
+    pub feed_pending: Option<u32>,
+    /// Reserved (T13): ticks until the next feed row lands.
+    pub feed_next_row_in: Option<u64>,
+    /// Reserved (T21): ticks until the next whole-game swap.
+    pub swap_in: Option<u64>,
+}
+
+impl Default for ModeHudInfo {
+    fn default() -> Self {
+        Self {
+            mode_id: ModeId::Marathon,
+            clock_ticks: 0,
+            clock_limit: None,
+            countdown: 0,
+            lines_left: None,
+            garbage_left: None,
+            pieces_placed: 0,
+            show_hud: false,
+            feed_pending: None,
+            feed_next_row_in: None,
+            swap_in: None,
+        }
+    }
+}
+
+/// Refresh [`ModeHudInfo`] from the core getters every fixed step. Runs
+/// **after** [`core_bridge_system`] in `FixedUpdate` — same slot discipline
+/// as the bridge itself, so the very `Update` render pass that follows reads
+/// the post-step values.
+///
+/// `pieces_placed` reset: watches `GameCore::steps == 0`. Both `restart_with`
+/// and `start_mode` zero `steps` *before* the next step, while this system's
+/// same-step position behind the bridge means the first playable frame
+/// already reports `steps == 1` — so the fresh-run sentinel is unambiguous
+/// (pre-roll frames re-report 0, which is correct: nothing has locked yet).
+fn mode_hud_refresh_system(
+    core: NonSend<GameCore>,
+    countdown: Res<Countdown>,
+    mut events: MessageReader<CoreEvent>,
+    mut hud: ResMut<ModeHudInfo>,
+) {
+    let locks = events
+        .read()
+        .filter(|CoreEvent(event)| matches!(event, GameEvent::PieceLocked { .. }))
+        .count() as u32;
+    hud.pieces_placed = if core.steps == 0 {
+        locks
+    } else {
+        hud.pieces_placed + locks
+    };
+    let config = &core.active_mode.config;
+    hud.mode_id = core.active_mode.id;
+    hud.clock_ticks = core.game.tick_count();
+    hud.clock_limit = config.clock_ticks;
+    hud.countdown = countdown.0;
+    hud.lines_left = match config.goal {
+        Some(Goal::Lines(target)) => Some(target.saturating_sub(core.game.snapshot().lines)),
+        _ => None,
+    };
+    hud.garbage_left =
+        matches!(config.goal, Some(Goal::GarbageCleared)).then(|| core.game.garbage_rows_left());
+    hud.show_hud = config.goal.is_some() || config.clock_ticks.is_some();
+    // Reserved fields (T13 survival feed / T21 swap timer) stay `None` until
+    // their tasks fill them from the feed/swap state.
+}
+
 /// Spawns the primary 2D camera if no other plugin stub has one yet (render
 /// logic itself is T11's; this keeps the shipped app displayable).
 fn spawn_primary_camera(mut commands: Commands, cameras: Query<&Camera2d>) {
@@ -715,6 +815,9 @@ impl Plugin for CoreBridgePlugin {
             // T5: the solo-start pre-roll budget (defaults to 0 — legacy
             // behavior; the mode id itself rides on `GameCore::active_mode`).
             .init_resource::<Countdown>()
+            // T8: the bridge-written HUD feed (clock/goal/pre-roll data;
+            // `GameSnapshot` must not grow — wire stability rule).
+            .init_resource::<ModeHudInfo>()
             .add_message::<CoreEvent>()
             // Overwrite TimePlugin's default 64 Hz clock: the core contract
             // is 60 Hz (gravity, lock delay, DAS/ARR tick conversions all
@@ -753,6 +856,12 @@ impl Plugin for CoreBridgePlugin {
             .add_systems(
                 FixedUpdate,
                 (countdown_system, bot_drive_system).before(core_bridge_system),
+            )
+            // T8: HUD feed refreshed right after the step (never before),
+            // so Update always renders post-step values.
+            .add_systems(
+                FixedUpdate,
+                mode_hud_refresh_system.after(core_bridge_system),
             );
     }
 }
@@ -1351,5 +1460,73 @@ mod tests {
         let mv = bot_move(&snapshot).expect("I always fits somewhere");
         assert_eq!(mv.rot, Rotation::Spawn, "flat I fills the four-gap");
         assert_eq!(mv.target_col, 3, "{mv:?} fills cols 3..=6");
+    }
+
+    // ---- T8: ModeHudInfo refresh ----
+
+    fn mode_hud(app: &App) -> ModeHudInfo {
+        *app.world().resource::<ModeHudInfo>()
+    }
+
+    #[test]
+    fn mode_hud_defaults_to_hidden_marathon() {
+        let app = test_app(0x70);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.mode_id, ModeId::Marathon);
+        assert!(!hud.show_hud, "Marathon renders no clock/goal row");
+        assert_eq!(hud.lines_left, None);
+        assert_eq!(hud.garbage_left, None);
+        assert_eq!(hud.clock_limit, None);
+        assert_eq!(hud.feed_pending, None);
+        assert_eq!(hud.feed_next_row_in, None);
+        assert_eq!(hud.swap_in, None);
+    }
+
+    #[test]
+    fn mode_hud_refresh_reads_getters_per_mode() {
+        let mut app = test_app(0x71);
+        start_mode(&mut app, ModeId::Sprint);
+        fixed_step(&mut app);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.mode_id, ModeId::Sprint);
+        assert!(hud.show_hud);
+        assert_eq!(hud.lines_left, Some(modes::SPRINT_GOAL_LINES));
+        assert_eq!(hud.garbage_left, None);
+        assert_eq!(hud.clock_limit, None, "Sprint counts up");
+        assert_eq!(hud.countdown, 179);
+
+        start_mode(&mut app, ModeId::Ultra);
+        fixed_step(&mut app);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.clock_limit, Some(modes::ULTRA_CLOCK_TICKS));
+        assert_eq!(hud.clock_ticks, 1, "refreshed from game.tick_count()");
+        assert_eq!(hud.lines_left, None);
+
+        start_mode(&mut app, ModeId::Dig);
+        fixed_step(&mut app);
+        let hud = mode_hud(&app);
+        assert_eq!(hud.garbage_left, Some(modes::DIG_GARBAGE_ROWS));
+        assert_eq!(hud.lines_left, None);
+        assert!(hud.show_hud);
+    }
+
+    #[test]
+    fn mode_hud_counts_piece_locks_and_resets_on_new_run() {
+        let mut app = test_app(0x72);
+        for _ in 0..3 {
+            app.world_mut()
+                .resource_mut::<PendingActions>()
+                .push(Action::HardDrop);
+            fixed_step(&mut app);
+        }
+        assert_eq!(mode_hud(&app).pieces_placed, 3, "one per PieceLocked event");
+
+        start_mode(&mut app, ModeId::Sprint);
+        fixed_step(&mut app);
+        assert_eq!(
+            mode_hud(&app).pieces_placed,
+            0,
+            "steps == 0 resets the count"
+        );
     }
 }
