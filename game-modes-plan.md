@@ -149,9 +149,53 @@ T1 ──► T2 ──┬──────────────────�
   and freezes; `clock_ticks: 100` emits `TimeUp` at tick 100 even with no
   pieces placed; buried-garbage start board satisfies the no-adjacent-hole
   invariant over 100 seeds. T1 golden test still passes.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `0e5e63b`. New `mode.rs`: `ModeConfig {
+  start_level: u32, levels_advance: bool, goal: Option<Goal>, clock_ticks:
+  Option<u64>, start_board: Option<StartBoard>, on_block_out:
+  BlockOutBehavior }` (all serde; `Default` == Marathon), `Goal::Lines(u32)
+  | GarbageCleared`, `StartBoard::BuriedGarbage { rows }` +
+  `StartBoard::build(seed)` (holes from splitmix64 `seed ^ 0xFF51AFD2AFEDDAB9`,
+  redraw-if-equal-previous ⇒ no adjacent-row shared hole; `rows` clamped to
+  20 so hidden spawn rows stay empty — first-piece spawn verified live for
+  100 seeds; also usable directly by T20 for identical duel boards),
+  `BlockOutBehavior::End | WipeAndContinue` (plumbed only — until T14 wires
+  the wipe it acts like End), `FinishReason { TopOut, GoalReached, TimeUp }`.
+  `game.rs`: `Game::with_config(seed, &ModeConfig)` (`new` delegates with
+  the default); `ticks: u64` incremented once per live `tick()` (stops when
+  frozen), `tick_count()`; `finished: Option<FinishReason>` is the internal
+  terminal flag — `tick`/`apply` gate on `finished.is_some()`; block-out
+  sets `game_over` + `finished = TopOut` together (snapshot unchanged),
+  goal/clock set `finished` with `game_over == false`. Goal evaluated
+  post-line-clear in `lock_and_spawn` (both `Lines` and `GarbageCleared`
+  fire — T3 risk reduced), skipping the next spawn (active stays `None`);
+  clock evaluated end-of-`tick()` (`ticks >= n`), top-out/goal win when
+  concurrent; `levels_advance=false` suppresses level changes + `LevelUp`
+  (level pinned ⇒ gravity naturally `interval_for(start_level)` from tick
+  0 — verified descent at exactly 12 ticks for level 5). `event.rs`:
+  `GameEvent::GoalReached { tick }` / `TimeUp { tick }` **appended**
+  (indices 10/11; bincode canary green). New getters: `finished_reason()`,
+  `garbage_rows_left()`, `tick_count()`. 16 new tests (bit-identical
+  default==new incl. bincode bytes, fixed-level, both goals, clock at tick
+  100 with zero pieces, 100-seed buried-board invariants, terminal-reason
+  exposure); `cargo test -p tetris-core` 162 passed (marathon golden
+  included); RED first captured (E0433/E0599 on unresolved T2 API), then
+  GREEN. Gotchas: (a) `tetris-app/src/audio.rs::sfx_for_event` is an
+  exhaustive `GameEvent` match — appending the T2 variants broke app
+  compilation; a minimal 2-arm silent fix (`GoalReached | TimeUp => return
+  None`) is in the working tree but deliberately **unstaged** per the T2
+  staging rule — whoever lands the next app-crate commit must include it
+  (or T5/T8 re-derive it); proper cue mapping is T8's. (b) `TimeUp` freeze
+  keeps the active piece in the snapshot (`TimeUp` ≠ top-out visually);
+  goal/top-out freeze with `active == None`. (c) `Goal::GarbageCleared`
+  with no garbage at start fires on the first lock — configs pairing it
+  must set a buried `StartBoard` (documented on the variant). (d) `ticks`
+  does not advance once frozen (a clock-frozen game's `tick_count()` stays
+  `== clock_ticks`).
+- **files edited/created**: `crates/tetris-core/src/mode.rs` (new),
+  `crates/tetris-core/src/game.rs`, `crates/tetris-core/src/event.rs`,
+  `crates/tetris-core/src/lib.rs` (+ unstaged: minimal
+  `crates/tetris-app/src/audio.rs` compile arm, see log)
 
 ### T3: Core Dig mechanics
 - **depends_on**: [T2]
