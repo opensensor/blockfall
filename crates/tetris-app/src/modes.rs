@@ -173,17 +173,17 @@ pub fn description(id: ModeId) -> &'static str {
         ModeId::Dig => "Dig through ten rows of buried garbage.",
         ModeId::Survival => "Outlast the ever-rising garbage feed.",
         ModeId::Zen => "No goals, no game over: a top-out just wipes the stack.",
-        ModeId::BotLadder => "Climb eight bots, each faster than the last.",
+        ModeId::BotLadder => "Beat eight bots of rising speed.",
         ModeId::Daily => "One seeded mode per day. Everyone gets the same one.",
         ModeId::DigDuel => "Race a rival through the same garbage.",
         ModeId::Switch => "Entire boards swap on a timer.",
     }
 }
 
-/// `true` for the shipped modes (R1's four solo modes plus Survival (T13)
-/// and Zen (T14)). Later tasks flip this for their own mode — the **only**
-/// catalogue edit they need, no new rows; the mode-select list filters
-/// `ModeId::ALL` through this flag.
+/// `true` for the shipped modes (R1's four solo modes plus Survival (T13),
+/// Zen (T14) and Bot Ladder (T16)). Later tasks flip this for their own
+/// mode — the **only** catalogue edit they need, no new rows; the
+/// mode-select list filters `ModeId::ALL` through this flag.
 #[must_use]
 pub fn is_shipped(id: ModeId) -> bool {
     matches!(
@@ -194,6 +194,7 @@ pub fn is_shipped(id: ModeId) -> bool {
             | ModeId::Dig
             | ModeId::Survival
             | ModeId::Zen
+            | ModeId::BotLadder
     )
 }
 
@@ -273,9 +274,9 @@ mod tests {
     }
 
     /// The shipped set as of R2: the four Release-1 solo modes plus Survival
-    /// (T13) and Zen (T14). The mode-select screen (T7) filters `ModeId::ALL`
-    /// through this flag — shipping a mode is the **only** catalogue edit
-    /// needed; the row list stays data-driven
+    /// (T13), Zen (T14) and Bot Ladder (T16). The mode-select screen (T7)
+    /// filters `ModeId::ALL` through this flag — shipping a mode is the
+    /// **only** catalogue edit needed; the row list stays data-driven
     /// (`screens_modes::rows_are_data_driven…`).
     #[test]
     fn is_shipped_matches_the_shipped_set() {
@@ -293,14 +294,10 @@ mod tests {
                 ModeId::Dig,
                 ModeId::Survival,
                 ModeId::Zen,
+                ModeId::BotLadder,
             ]
         );
-        for id in [
-            ModeId::BotLadder,
-            ModeId::Daily,
-            ModeId::DigDuel,
-            ModeId::Switch,
-        ] {
+        for id in [ModeId::Daily, ModeId::DigDuel, ModeId::Switch] {
             assert!(!is_shipped(id), "{id:?} is not shipped yet");
         }
     }

@@ -19,6 +19,7 @@ mod juice;
 pub mod modes;
 pub mod records;
 mod render;
+mod screens_ladder;
 mod screens_menu;
 mod screens_modes;
 mod screens_settings;
@@ -37,6 +38,7 @@ use hud::HudPlugin;
 use input::InputPlugin;
 use juice::JuicePlugin;
 use render::RenderPlugin;
+use screens_ladder::BotLadderPlugin;
 use screens_menu::MenuScreensPlugin;
 use screens_modes::ModeSelectPlugin;
 use screens_settings::SettingsScreenPlugin;
@@ -69,6 +71,7 @@ pub fn main() {
             HudPlugin,
             MenuScreensPlugin,
             ModeSelectPlugin,
+            BotLadderPlugin,
             SettingsScreenPlugin,
             AudioPlugin,
             JuicePlugin,

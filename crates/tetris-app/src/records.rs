@@ -191,6 +191,18 @@ impl Records {
     }
 }
 
+/// Highest bot-ladder rung beaten (0 when none, and also 0 for a foreign
+/// record variant stored under [`BOT_LADDER`]). The single source of the
+/// ladder unlock rule: rung `n` is playable iff `n <= highest + 1`
+/// (consumed by [`crate::screens_ladder`], T16).
+#[must_use]
+pub fn highest_beaten_rung(records: &Records) -> u32 {
+    match records.record_for(BOT_LADDER) {
+        Some(Record::HighestRung { rung }) => *rung,
+        _ => 0,
+    }
+}
+
 /// Legacy `best.json`: a bare `{score, level, lines}` object.
 #[derive(Debug, Deserialize)]
 struct LegacyBest {
@@ -601,6 +613,29 @@ mod tests {
             records.record_for(BOT_LADDER),
             Some(&Record::HighestRung { rung: 4 })
         );
+    }
+
+    /// T16 ladder unlock helper: rung `n` playable iff `n <= highest + 1`;
+    /// missing or foreign records under the key read as 0 (rung 1 open).
+    #[test]
+    fn highest_beaten_rung_reads_the_ladder_frontier() {
+        let empty = Records::default();
+        assert_eq!(highest_beaten_rung(&empty), 0);
+
+        let mut records = Records::default();
+        records.record_run(BOT_LADDER, Record::HighestRung { rung: 3 });
+        assert_eq!(highest_beaten_rung(&records), 3);
+
+        let mut foreign = Records::default();
+        foreign.record_run(
+            BOT_LADDER,
+            Record::BestScore {
+                score: 1,
+                level: 1,
+                lines: 1,
+            },
+        );
+        assert_eq!(highest_beaten_rung(&foreign), 0);
     }
 
     #[test]

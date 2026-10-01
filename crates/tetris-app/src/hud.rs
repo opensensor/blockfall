@@ -49,6 +49,8 @@ use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::modes;
 use crate::records::{Record, Records};
 use crate::render::{self, GHOST_ALPHA, VISIBLE_ROWS};
+use crate::screens_ladder::{ladder_badge_text, LadderOrigin};
+use crate::screens_menu::VersusFlow;
 use crate::state::Settings;
 use tetris_core::event::GameEvent;
 
@@ -1214,10 +1216,14 @@ type VersusMiniQuery<'w, 's> = Query<
 
 /// Reposition and refill the versus HUD from the match snapshot every
 /// `Update` (root visibility itself is owned by the screens-menu sync).
+/// A ladder-origin match (T16) re-targets the Status slot to the
+/// `RUNG n/8` badge — while a Garbage-rule ladder runs, the slot's
+/// original `FINISHED` race badge can never be live anyway.
 #[allow(clippy::too_many_arguments)]
 fn sync_versus_hud(
     versus: Option<NonSend<VersusMatch>>,
     fixture: Option<Res<VersusHudFixture>>,
+    flow: Option<Res<VersusFlow>>,
     windows: Query<&Window>,
     mut texts: VersusTextQuery,
     mut previews: VersusPreviewQuery,
@@ -1233,6 +1239,12 @@ fn sync_versus_hud(
         return;
     };
     let [left, right] = versus_panel_anchors(size.x, size.y);
+    // Ladder badge (T16): rung of the live match, if any (the flow marker
+    // is app-side; VersusMatch knows nothing about the campaign).
+    let ladder_rung = flow.and_then(|flow| match flow.ladder {
+        LadderOrigin::Match { rung } => Some(rung),
+        _ => None,
+    });
 
     for (meta, mut text, mut font, mut transform) in texts.iter_mut() {
         let anchor = if meta.side == Side::Left { left } else { right };
@@ -1258,7 +1270,10 @@ fn sync_versus_hud(
             VersusHudSlot::Lines => format!("LINES\n{}", game.lines),
             VersusHudSlot::Level => format!("LEVEL\n{}", game.level),
             VersusHudSlot::Pending => versus_pending_text(pending),
-            VersusHudSlot::Status => versus_status_text(finished),
+            VersusHudSlot::Status => match ladder_rung {
+                Some(rung) => ladder_badge_text(rung),
+                None => versus_status_text(finished),
+            },
         };
         if text.0 != content {
             text.0 = content;
@@ -2005,6 +2020,70 @@ mod tests {
             let _ = app.world_mut().try_run_schedule(Update);
         }
         assert_eq!(app.world().entities().len(), before, "no versus HUD leaks");
+    }
+
+    /// T16: a ladder-origin match re-targets the Status slot to the
+    /// `RUNG n/8` badge on both sides; without the flow marker (or without
+    /// the resource at all, as every pre-T16 tree) the slot stays silent /
+    /// race-driven exactly as before.
+    #[test]
+    fn versus_hud_status_shows_ladder_rung_badge() {
+        let mut app = versus_hud_app(5);
+        app.insert_resource(VersusFlow {
+            ladder: LadderOrigin::Match { rung: 3 },
+            ..Default::default()
+        });
+        app.world_mut()
+            .resource_scope::<crate::state::AppState, ()>(|world, state| {
+                world.resource_scope::<VersusWinner, ()>(|world, winner| {
+                    let versus = world.non_send_mut::<VersusMatch>();
+                    start_versus(
+                        versus.into_inner(),
+                        winner.into_inner(),
+                        state.into_inner(),
+                        AttackRule::Garbage,
+                        Controller::Human,
+                        Controller::Bot,
+                    );
+                });
+            });
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Status),
+            "RUNG 3/8"
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Status),
+            "RUNG 3/8"
+        );
+
+        // Leaving the ladder flow (match still live) restores the plain
+        // Status slot (empty while a Garbage match runs).
+        app.world_mut().resource_mut::<VersusFlow>().ladder = LadderOrigin::Closed;
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Status),
+            ""
+        );
+    }
+
+    /// T16: `FINISHED` race badges keep working when no ladder flow is
+    /// marked (the badge override is strictly ladder-gated).
+    #[test]
+    fn versus_hud_finished_badge_survives_the_ladder_badge() {
+        let mut app = versus_hud_app(6);
+        let mut snapshot = fixture_match(AttackRule::Race { target_lines: 4 });
+        snapshot.finished = (true, false);
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot);
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Status),
+            "FINISHED"
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Status),
+            ""
+        );
     }
 
     // ------------------------------------------------------------------

@@ -78,14 +78,15 @@ use crate::core_bridge::net::online_ui::{
 };
 use crate::core_bridge::net::{NetRole, NetSession, NetStatus};
 use crate::core_bridge::{
-    end_versus, start_mode_run, start_versus, Controller, Countdown, GameCore, SimPaused,
-    VersusMatch, VersusWinner,
+    end_versus, start_mode_run, start_versus, start_versus_with_cooldown, Controller, Countdown,
+    GameCore, SimPaused, VersusMatch, VersusWinner,
 };
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
 use crate::modes::{format_time_ticks, mode_key, ModeId};
 use crate::records::{Record, Records};
+use crate::screens_ladder::{rung_cooldown, LadderOrigin};
 use crate::screens_modes::{open_mode_select, record_line};
 use crate::settings_persist::PersistedBestScore;
 use crate::state::{AppState, CaptureOrder, RebindingCapture};
@@ -310,6 +311,13 @@ pub enum VersusStage {
 
 /// Title 1v1 submenu flow state: current [`VersusStage`] plus the rule
 /// picked on the way through (only meaningful from [`VersusStage::Opponent`]).
+///
+/// The Bot Ladder (T16) hangs its campaign flow on this same resource (no
+/// new resources — house resource-count discipline): [`VersusFlow::ladder`]
+/// marks the screen open, a match's rung, or closed, arming the
+/// record-on-crowning fold, the HUD rung badge and the ladder-aware
+/// Rematch/Menu overlay behavior. Plain 1v1 / netplay flows never leave it
+/// `Closed`, so they stay untouched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
 pub struct VersusFlow {
     /// Which submenu (if any) is showing.
@@ -317,6 +325,9 @@ pub struct VersusFlow {
     /// Rule selected in the rules step; defaults to
     /// [`AttackRule::default`] until the player picks one.
     pub rule: AttackRule,
+    /// Bot Ladder campaign state ([`LadderOrigin::Closed`] for every
+    /// non-ladder flow). See [`crate::screens_ladder`].
+    pub ladder: LadderOrigin,
 }
 
 /// Advance the flow one step back: Opponent → Rules → Title.
@@ -368,6 +379,48 @@ pub fn versus_to_title(
 ) {
     release_sim(sim, freeze);
     end_versus(versus, winner, state);
+}
+
+/// Winner overlay "Menu" on a **ladder-origin** match (T16): tear the match
+/// down like [`versus_to_title`] but land on the ladder screen instead of
+/// the title, and drop the `Match` marker back to `Screen` so neither the
+/// HUD badge nor a stray crown can re-arm the record fold after leaving.
+pub fn versus_to_ladder(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    state: &mut AppState,
+    sim: &mut SimPaused,
+    freeze: &JuiceFreeze,
+    flow: &mut VersusFlow,
+) {
+    release_sim(sim, freeze);
+    end_versus(versus, winner, state);
+    *state = AppState::ModeSelect;
+    flow.ladder = LadderOrigin::Screen;
+}
+
+/// Winner overlay "Rematch" on a **ladder-origin** match (T16): restart the
+/// same rung — Garbage, human left, bot right, the rung's cooldown —
+/// instead of the default-pace `rematch_versus`, which would silently
+/// re-arm rung 8 at rung 4's 60-tick default.
+pub fn rematch_ladder(
+    versus: &mut VersusMatch,
+    winner: &mut VersusWinner,
+    state: &mut AppState,
+    sim: &mut SimPaused,
+    freeze: &JuiceFreeze,
+    rung: u32,
+) {
+    release_sim(sim, freeze);
+    start_versus_with_cooldown(
+        versus,
+        winner,
+        state,
+        AttackRule::Garbage,
+        Controller::Human,
+        Controller::Bot,
+        [0, rung_cooldown(rung)],
+    );
 }
 
 /// Overlay headline for a crowned match: "BOT WINS" when the winning side
@@ -604,6 +657,14 @@ fn sync_versus_menu_visibility(
         flow.stage = VersusStage::Title;
         flow.rule = AttackRule::default();
     }
+    // T16 hygiene: the ladder screen only ever shows inside ModeSelect; any
+    // other state while its marker is set means we left it behind — close
+    // it so a later plain 1v1 can never inherit the ladder flow. A `Match`
+    // marker belongs to a live/crowned ladder match (which plays inside
+    // `Playing`) and is cleared by the overlay/pause-teardown handlers.
+    if flow.ladder == LadderOrigin::Screen && *state != AppState::ModeSelect {
+        flow.ladder = LadderOrigin::Closed;
+    }
     for (mut vis, rules) in roots.iter_mut() {
         let wanted = if (rules && flow.stage == VersusStage::Rules)
             || (!rules && flow.stage == VersusStage::Opponent && *state == AppState::Title)
@@ -685,7 +746,9 @@ struct MenuClickParams<'w, 's> {
     sim: ResMut<'w, SimPaused>,
     freeze: Res<'w, JuiceFreeze>,
     quit: ResMut<'w, QuitRequested>,
-    flow: Res<'w, VersusFlow>,
+    // T16: "Quit to Title" on a live ladder match walks back to the ladder
+    // screen (clears the flow marker), so this handler needs write access.
+    flow: ResMut<'w, VersusFlow>,
     versus: Option<NonSendMut<'w, VersusMatch>>,
     winner: Option<ResMut<'w, VersusWinner>>,
     records: Option<ResMut<'w, Records>>,
@@ -744,15 +807,32 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                     // versus HUD root shows for the whole duration of an
                     // active match, so a live match left running keeps its
                     // full-screen root visible over the title and swallows
-                    // every subsequent menu click.
+                    // every subsequent menu click. A ladder-origin match
+                    // (T16) walks back to the ladder screen instead, same
+                    // teardown, different landing.
+                    let mut ladder_return = false;
                     if let (Some(versus), Some(winner)) =
                         (params.versus.as_deref_mut(), params.winner.as_deref_mut())
                     {
                         if versus.active {
-                            end_versus(versus, winner, &mut params.state);
+                            if matches!(params.flow.ladder, LadderOrigin::Match { .. }) {
+                                versus_to_ladder(
+                                    versus,
+                                    winner,
+                                    &mut params.state,
+                                    &mut params.sim,
+                                    &params.freeze,
+                                    &mut params.flow,
+                                );
+                                ladder_return = true;
+                            } else {
+                                end_versus(versus, winner, &mut params.state);
+                            }
                         }
                     }
-                    goto_title(&mut params.state, &mut params.sim, &params.freeze);
+                    if !ladder_return {
+                        goto_title(&mut params.state, &mut params.sim, &params.freeze);
+                    }
                 } else if quit {
                     quit_now();
                 }
@@ -883,29 +963,58 @@ fn versus_button_clicks(mut params: VersusClickParams) {
         }
 
         if match_over && !net_in_match {
+            // T16: a ladder-origin crown keeps the campaign context — Rematch
+            // re-arms the *rung's* bot pace, Menu walks back to the ladder
+            // screen. Both handlers clear the `Match` marker's cooldown
+            // assumptions by construction, so a plain (default-pace)
+            // re-entry can never mask the next rung.
+            let ladder_rung = match params.flow.ladder {
+                LadderOrigin::Match { rung } => Some(rung),
+                _ => None,
+            };
             if rematch {
                 if let (Some(versus), Some(winner)) =
                     (params.versus.as_deref_mut(), params.winner.as_deref_mut())
                 {
-                    rematch_versus(
-                        versus,
-                        winner,
-                        &mut params.state,
-                        &mut params.sim,
-                        &params.freeze,
-                    );
+                    match ladder_rung {
+                        Some(rung) => rematch_ladder(
+                            versus,
+                            winner,
+                            &mut params.state,
+                            &mut params.sim,
+                            &params.freeze,
+                            rung,
+                        ),
+                        None => rematch_versus(
+                            versus,
+                            winner,
+                            &mut params.state,
+                            &mut params.sim,
+                            &params.freeze,
+                        ),
+                    }
                 }
             } else if menu {
                 if let (Some(versus), Some(winner)) =
                     (params.versus.as_deref_mut(), params.winner.as_deref_mut())
                 {
-                    versus_to_title(
-                        versus,
-                        winner,
-                        &mut params.state,
-                        &mut params.sim,
-                        &params.freeze,
-                    );
+                    match ladder_rung {
+                        Some(_rung) => versus_to_ladder(
+                            versus,
+                            winner,
+                            &mut params.state,
+                            &mut params.sim,
+                            &params.freeze,
+                            &mut params.flow,
+                        ),
+                        None => versus_to_title(
+                            versus,
+                            winner,
+                            &mut params.state,
+                            &mut params.sim,
+                            &params.freeze,
+                        ),
+                    }
                 }
             }
         }

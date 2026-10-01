@@ -20,6 +20,10 @@
 //! Row press runs the shared T5 bridge path [`start_mode_run`] (seed
 //! resolution via `TETRIS_SEED`, pre-roll re-arm, play-count bump) into
 //! [`AppState::Playing`]; the overlay then hides with the state change.
+//! The one exception is Bot Ladder (T16): its row opens the ladder screen
+//! (a ModeSelect-internal flow on
+//! [`VersusFlow`](crate::screens_menu::VersusFlow) — the list hides behind
+//! it) instead of starting a solo run.
 //! Back (and Escape) walk to [`AppState::Title`] via
 //! [`goto_title`](crate::screens_menu::goto_title); the 1v1 / Online /
 //! Settings / Quit entries stay on the Title screen (reachable by Back), so
@@ -48,8 +52,9 @@ use crate::juice::JuiceFreeze;
 use crate::modes::{description, display_name, format_time_ticks, is_shipped, mode_key, ModeId};
 use crate::records::{Record, Records};
 use crate::render;
+use crate::screens_ladder::LadderOrigin;
 use crate::screens_menu::{
-    goto_title, label_node, menu_button, release_sim, BUTTON_BG, PANEL_BG, RECORD_COLOR,
+    goto_title, label_node, menu_button, release_sim, VersusFlow, BUTTON_BG, PANEL_BG, RECORD_COLOR,
 };
 use crate::state::{AppState, RebindingCapture};
 
@@ -339,9 +344,13 @@ fn build_mode_select_ui(mut commands: Commands, windows: Query<&Window>, records
 
 fn sync_mode_select_visibility(
     state: Res<AppState>,
+    flow: Res<VersusFlow>,
     mut roots: Query<&mut Visibility, With<ModeSelectRoot>>,
 ) {
-    let wanted = if *state == AppState::ModeSelect {
+    // The ladder screen (T16) rides inside `AppState::ModeSelect`; when its
+    // flow marker is set the list itself hides behind it (the ladder root's
+    // own sync in `screens_ladder` shows on the inverse condition).
+    let wanted = if *state == AppState::ModeSelect && flow.ladder == LadderOrigin::Closed {
         Visibility::Visible
     } else {
         Visibility::Hidden
@@ -392,6 +401,7 @@ struct ModeSelectClickParams<'w, 's> {
     sim: ResMut<'w, SimPaused>,
     freeze: Res<'w, JuiceFreeze>,
     records: Option<ResMut<'w, Records>>,
+    flow: ResMut<'w, VersusFlow>,
 }
 
 fn mode_select_clicks(mut params: ModeSelectClickParams) {
@@ -403,6 +413,13 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
             continue;
         }
         if let Some(row) = row {
+            // Bot Ladder (T16) is not a solo bridge run: its row opens the
+            // ladder screen (a ModeSelect-internal flow on `VersusFlow`)
+            // instead of starting a `Game`.
+            if row.id == ModeId::BotLadder {
+                crate::screens_ladder::open_ladder(&mut params.state, &mut params.flow);
+                return;
+            }
             start_mode_row(
                 row.id,
                 params.core.as_mut(),
@@ -433,6 +450,7 @@ struct ModeSelectKeyParams<'w> {
     core: NonSendMut<'w, GameCore>,
     countdown: ResMut<'w, Countdown>,
     records: Option<ResMut<'w, Records>>,
+    flow: ResMut<'w, VersusFlow>,
 }
 
 fn mode_select_key_system(mut params: ModeSelectKeyParams) {
@@ -440,6 +458,15 @@ fn mode_select_key_system(mut params: ModeSelectKeyParams) {
         return;
     }
     let Some(keys) = params.keys else { return };
+    if params.flow.ladder != LadderOrigin::Closed {
+        // Ladder screen (T16) shows instead of the list: Escape walks it
+        // back to the list; the row keys belong to the ladder's own click
+        // system, so Enter is inert here.
+        if keys.just_pressed(KeyCode::Escape) {
+            params.flow.ladder = LadderOrigin::Closed;
+        }
+        return;
+    }
     if keys.just_pressed(KeyCode::Escape) {
         goto_title(&mut params.state, &mut params.sim, &params.freeze);
     } else if keys.just_pressed(KeyCode::Enter) {
@@ -531,7 +558,11 @@ impl Plugin for ModeSelectPlugin {
             .init_resource::<SimPaused>()
             .init_resource::<JuiceFreeze>()
             .init_resource::<RebindingCapture>()
-            .init_resource::<Records>();
+            .init_resource::<Records>()
+            // T16: the ladder flow marker lives on the title flow resource;
+            // the row routing and the list-hiding gate read it (defensive
+            // init — no-op when MenuScreensPlugin already registered it).
+            .init_resource::<VersusFlow>();
         if !app.world().contains_resource::<Countdown>() {
             app.init_resource::<Countdown>();
         }
@@ -780,19 +811,19 @@ mod tests {
 
         // The row renderer itself is catalogue-driven, not a fixed menu:
         // feeding it a hypothetical catalogue (a flipped `is_shipped`, e.g.
-        // Bot Ladder in R3) renders exactly those rows. T14 note: the
-        // hypothetical was Zen until Zen shipped — it now needs a mode that
-        // is still unshipped.
+        // Daily in R3) renders exactly those rows. T16 note: the
+        // hypothetical was Bot Ladder until it shipped — it now needs a mode
+        // that is still unshipped (T17: flip to DigDuel or Switch).
         let records = Records::default();
         {
             let mut cx = app.world_mut().commands();
             cx.spawn(Node::default()).with_children(|parent| {
-                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::BotLadder], &records);
+                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::Daily], &records);
             });
         }
         app.update();
         let ids = row_ids(&mut app);
-        assert_eq!(ids.iter().filter(|id| **id == ModeId::BotLadder).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == ModeId::Daily).count(), 1);
         assert_eq!(
             ids.len(),
             expected.len() + 2,
