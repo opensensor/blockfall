@@ -110,6 +110,9 @@ pub fn sfx_for_event(event: &GameEvent) -> Option<EventSfx> {
     use GameEvent::*;
     Some(match event {
         PieceSpawned { .. } | ScoreChanged { .. } => return None,
+        // T2 terminal events: kept silent until T8 wires their cues (Ultra
+        // warning / goal fanfare); the arm keeps the match exhaustive.
+        GoalReached { .. } | TimeUp { .. } => return None,
         PieceLocked { .. } => EventSfx {
             label: "lock",
             sfx: Sfx::Lock,
