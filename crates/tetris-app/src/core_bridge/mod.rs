@@ -19,6 +19,14 @@
 //! - [`restart_run`] (T14) — shared R-restart path honoring the `TETRIS_SEED`
 //!   env seed; the plugin also hosts the `TETRIS_BOT=1` greedy solver +
 //!   marathon logger (`MARATHON fps_avg=…`, `BOT game_done …`).
+//! - **T5 solo-mode bridge** — [`start_mode_run`] (mode-aware start honoring
+//!   `TETRIS_SEED`, built on [`GameCore::start_mode`]; bumps
+//!   `Records::bump_plays` for the mode), `GameCore::active_mode` (current
+//!   `ModeId` + `ModeConfig`; `restart_on_r_system` retries this id), and
+//!   [`Countdown`] (pre-roll budget gating stepping so core tick 0 == first
+//!   playable frame). Terminal `GoalReached`/`TimeUp` events flip
+//!   `AppState::GameOver`; the exact reason comes from
+//!   `GameCore.game.finished_reason()`. Catalogue in `crate::modes`.
 //! - **T25 versus submodule** (`versus.rs`, re-exported here): `VersusMatch`
 //!   (NonSend — it owns two `Game`s), `VersusWinner`, `VersusEvent`
 //!   (`Messages`), `VersusHarness`, `Controller`, `start_versus`/`end_versus`
@@ -43,8 +51,11 @@ use tetris_core::actions::Action;
 use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
+use tetris_core::mode::ModeConfig;
 use tetris_core::piece::{PieceState, Rotation};
 
+use crate::modes::{self, ModeId};
+use crate::records::Records;
 use crate::state::AppState;
 
 mod versus;
@@ -105,16 +116,21 @@ pub struct GameCore {
     /// `Messages<CoreEvent>` on **every** fixed step — even while the step
     /// gate is closed, so T19 can freeze stepping and still let events drain.
     pub pending_events: Vec<GameEvent>,
+    /// The solo mode this run was started as (T5). Read by systems holding
+    /// `NonSend<GameCore>` (no separate resource, no borrow conflicts);
+    /// `restart_on_r_system` retries this id.
+    pub active_mode: ActiveMode,
 }
 
 impl GameCore {
-    /// Fresh run from `seed`.
+    /// Fresh run from `seed` — Marathon (the default [`ActiveMode`]).
     pub fn new(seed: u64) -> Self {
         Self {
             game: Game::new(seed),
             seed,
             steps: 0,
             pending_events: Vec::new(),
+            active_mode: ActiveMode::default(),
         }
     }
 
@@ -125,11 +141,118 @@ impl GameCore {
     }
 
     /// Deterministic variant of [`GameCore::restart`] for tests and replays.
+    /// Always Marathon (the legacy path): [`Self::active_mode`] is reset to
+    /// match, so the R retry after a title-screen restart stays consistent.
     pub fn restart_with(&mut self, seed: u64) {
         self.game = Game::new(seed);
         self.seed = seed;
         self.steps = 0;
         self.pending_events.clear();
+        self.active_mode = ActiveMode::default();
+    }
+
+    /// Start a **mode-aware** run: `Game::with_config(seed, &mode_config(id))`
+    /// (T5). Marathon's config is [`ModeConfig::default`], so this reproduces
+    /// [`GameCore::restart_with`] bit-for-bit for that mode. Seed resolution
+    /// (`TETRIS_SEED`) and the countdown/play-count bookkeeping live in the
+    /// free [`start_mode_run`], mirroring [`restart_run`].
+    pub fn start_mode(&mut self, seed: u64, id: ModeId) {
+        self.game = Game::with_config(seed, &modes::mode_config(id));
+        self.seed = seed;
+        self.steps = 0;
+        self.pending_events.clear();
+        self.active_mode = ActiveMode {
+            id,
+            config: modes::mode_config(id),
+        };
+    }
+}
+
+/// The solo mode a [`GameCore`] run was started as: the catalogue
+/// [`ModeId`] plus the [`ModeConfig`] its `Game` was built from (T8's HUD
+/// reads the goal/clock off `config` without re-deriving it from the id).
+///
+/// Lives as a field on `GameCore`, not a standalone resource: it is only
+/// meaningful together with the `!Send` game it was built for, and systems
+/// that need it already hold `NonSend<GameCore>` (plan T5 design note).
+/// `Default` is Marathon, matching [`GameCore::default`].
+#[derive(Debug, Clone)]
+pub struct ActiveMode {
+    /// Catalogue id of the live run.
+    pub id: ModeId,
+    /// The config `game` was constructed from.
+    pub config: ModeConfig,
+}
+
+impl Default for ActiveMode {
+    fn default() -> Self {
+        Self {
+            id: ModeId::Marathon,
+            config: ModeConfig::default(),
+        }
+    }
+}
+
+/// Solo-start pre-roll budget (T5): remaining fixed steps of 3-2-1 countdown
+/// before the core takes its first tick. `0` = no pre-roll (start
+/// immediately).
+///
+/// Own gate, deliberately **not** [`SimPaused`]: the pre-roll is consumed
+/// only while `AppState::Playing && !SimPaused.0`, so pausing mid-countdown
+/// freezes it and resuming continues — never cancels (plan T5). Actions
+/// arriving during the countdown stay queued in [`PendingActions`] exactly
+/// like a freeze frame. Core tick 0 == first playable frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Resource)]
+pub struct Countdown(pub u32);
+
+/// Shared mode-aware start path (T5): what T7's mode-select rows and the
+/// current-mode R retry call. Mirrors [`restart_run`]: a valid [`SEED_ENV`]
+/// seeds the run for reproducibility, otherwise a wall-clock seed. Records
+/// the mode on `core.active_mode` (via `core.start_mode`), re-arms
+/// [`Countdown`] to the mode's budget (so a Sprint retry always gets its
+/// 3-2-1), and counts the start in [`Records::bump_plays`].
+///
+/// Versus campaigns (BotLadder/DigDuel/Switch) start through `start_versus`,
+/// not here — no play bump on that path is expected.
+pub fn start_mode_run(
+    id: ModeId,
+    core: &mut GameCore,
+    countdown: &mut Countdown,
+    app_state: &mut AppState,
+    records: Option<&mut Records>,
+) -> u64 {
+    let seed = match env_seed() {
+        Some(seed) => {
+            info!("start_mode {id:?}: seed {seed} (from {SEED_ENV})");
+            seed
+        }
+        None => {
+            let seed = wall_clock_seed();
+            info!("start_mode {id:?}: seed {seed} (wall clock)");
+            seed
+        }
+    };
+    core.start_mode(seed, id);
+    countdown.0 = modes::pre_roll_ticks(id);
+    if let Some(records) = records {
+        records.bump_plays(modes::mode_key(id));
+    }
+    *app_state = AppState::Playing;
+    seed
+}
+
+/// Drains the [`Countdown`] budget one step per `FixedUpdate` while the solo
+/// run is live and unpaused (T5). Registered **before**
+/// [`core_bridge_system`], so the frame the budget hits zero is the first
+/// frame whose gate is open. `SimPaused` or a non-`Playing` state freezes
+/// the remaining budget instead of cancelling it.
+fn countdown_system(
+    mut countdown: ResMut<Countdown>,
+    app_state: Res<AppState>,
+    paused: Res<SimPaused>,
+) {
+    if countdown.0 > 0 && *app_state == AppState::Playing && !paused.0 {
+        countdown.0 -= 1;
     }
 }
 
@@ -196,16 +319,29 @@ fn seed_from_env_at_startup(mut core: NonSendMut<GameCore>) {
 
 /// R (hardcoded — `KeyBindings` in `input.rs` owns only the eight action
 /// slots plus pause and has no restart slot) restarts from Game Over (T14).
+/// Since T5 it retries the **current mode** (`core.active_mode.id`,
+/// re-arming its pre-roll) rather than raw Marathon; a default world is
+/// Marathon, so the legacy behavior is unchanged there.
 fn restart_on_r_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     core: NonSendMut<GameCore>,
     app_state: ResMut<AppState>,
+    countdown: ResMut<Countdown>,
+    mut records: Option<ResMut<Records>>,
 ) {
     // `Option<Res<...>>`: MinimalPlugins headless worlds have no
     // `InputPlugin`, mirroring T12's resource guard.
     let Some(keys) = keys else { return };
     if *app_state == AppState::GameOver && keys.just_pressed(KeyCode::KeyR) {
-        restart_run(core.into_inner(), app_state.into_inner());
+        let core = core.into_inner();
+        let id = core.active_mode.id;
+        start_mode_run(
+            id,
+            core,
+            countdown.into_inner(),
+            app_state.into_inner(),
+            records.as_deref_mut(),
+        );
     }
 }
 
@@ -309,7 +445,11 @@ fn bot_side_drive(snapshot: &GameSnapshot, state: &mut BotState, push: &mut dyn 
 /// Bot brain: every fixed step (before the bridge drains) execute the
 /// committed plan or commit a fresh greedy one for a new piece. Runs in
 /// `FixedUpdate` *before* `core_bridge_system`, so actions apply same-tick.
-/// Asleep while a versus match is active.
+/// Asleep while a versus match is active (and during a T5 pre-roll — its
+/// actions would merely queue against a frozen core).
+// System params: every input is needed; an exclusive-system wrapper would
+// obscure the resource types.
+#[allow(clippy::too_many_arguments)]
 fn bot_drive_system(
     bot: Res<BotMode>,
     mut pending: ResMut<PendingActions>,
@@ -317,9 +457,10 @@ fn bot_drive_system(
     core: NonSend<GameCore>,
     app_state: Res<AppState>,
     paused: Res<SimPaused>,
+    countdown: Res<Countdown>,
     versus: NonSend<VersusMatch>,
 ) {
-    if !bot.0 || *app_state != AppState::Playing || paused.0 || versus.active {
+    if !bot.0 || *app_state != AppState::Playing || paused.0 || countdown.0 > 0 || versus.active {
         return;
     }
     let snapshot = core.game.snapshot();
@@ -511,17 +652,23 @@ fn marathon_fps_system(bot: Res<BotMode>, mut stats: ResMut<MarathonStats>, time
 /// `FixedMain` sub-schedule run ahead of `Update`/render — never in a render
 /// or `Update` schedule). Fully frozen while a versus match is active, so
 /// the solo `CoreEvent` stream and `AppState` can never react to versus
-/// play (T25).
+/// play (T25). Also frozen while [`Countdown`] still has budget (T5
+/// pre-roll): queued actions are **held** in [`PendingActions`] exactly like
+/// a [`SimPaused`] freeze, and core tick 0 is the first playable frame.
+/// Terminal `GameEvent::GoalReached`/`TimeUp` (T2) flip `AppState::GameOver`
+/// just like `GameOver` does — the events are forwarded either way, and T9
+/// reads the exact reason from `Game::finished_reason()`.
 fn core_bridge_system(
     core: NonSendMut<GameCore>,
     mut pending: ResMut<PendingActions>,
     mut messages: MessageWriter<CoreEvent>,
     mut app_state: ResMut<AppState>,
     paused: Res<SimPaused>,
+    countdown: Res<Countdown>,
     versus: NonSend<VersusMatch>,
 ) {
     let core = core.into_inner();
-    if !paused.0 && *app_state == AppState::Playing && !versus.active {
+    if !paused.0 && countdown.0 == 0 && *app_state == AppState::Playing && !versus.active {
         for action in pending.queue.drain(..) {
             core.pending_events.extend(core.game.apply(action));
         }
@@ -529,14 +676,17 @@ fn core_bridge_system(
         core.steps += 1;
     }
 
-    let mut game_over = false;
+    let mut terminal = false;
     for event in core.pending_events.drain(..) {
-        if event == GameEvent::GameOver {
-            game_over = true;
+        if matches!(
+            event,
+            GameEvent::GameOver | GameEvent::GoalReached { .. } | GameEvent::TimeUp { .. }
+        ) {
+            terminal = true;
         }
         messages.write(CoreEvent(event));
     }
-    if game_over && *app_state == AppState::Playing {
+    if terminal && *app_state == AppState::Playing {
         *app_state = AppState::GameOver;
     }
 }
@@ -562,6 +712,9 @@ impl Plugin for CoreBridgePlugin {
         app.insert_non_send(GameCore::default())
             .init_resource::<PendingActions>()
             .init_resource::<SimPaused>()
+            // T5: the solo-start pre-roll budget (defaults to 0 — legacy
+            // behavior; the mode id itself rides on `GameCore::active_mode`).
+            .init_resource::<Countdown>()
             .add_message::<CoreEvent>()
             // Overwrite TimePlugin's default 64 Hz clock: the core contract
             // is 60 Hz (gravity, lock delay, DAS/ARR tick conversions all
@@ -597,7 +750,10 @@ impl Plugin for CoreBridgePlugin {
             )
             .add_systems(Startup, spawn_primary_camera)
             .add_systems(FixedUpdate, core_bridge_system)
-            .add_systems(FixedUpdate, bot_drive_system.before(core_bridge_system));
+            .add_systems(
+                FixedUpdate,
+                (countdown_system, bot_drive_system).before(core_bridge_system),
+            );
     }
 }
 
@@ -900,6 +1056,265 @@ mod tests {
         assert_eq!(after.lines, 0);
         assert!(!after.game_over);
         assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+    }
+
+    // ---- T5: mode-aware starts, pre-roll countdown, terminal reasons ----
+
+    use crate::modes::{self, ModeId};
+    use crate::records::Records;
+    use tetris_core::mode::FinishReason;
+
+    /// Start a mode through the shared T5 entry point, mirroring what the
+    /// mode-select screen (T7) will call from a system.
+    fn start_mode(app: &mut App, id: ModeId) {
+        let world = app.world_mut();
+        let mut state = world.remove_resource::<AppState>().unwrap();
+        let mut countdown = world.remove_resource::<Countdown>().unwrap();
+        let mut records = world.remove_resource::<Records>();
+        {
+            let mut core = world.non_send_mut::<GameCore>();
+            start_mode_run(
+                id,
+                core.as_mut(),
+                &mut countdown,
+                &mut state,
+                records.as_mut(),
+            );
+        }
+        world.insert_resource(state);
+        world.insert_resource(countdown);
+        if let Some(records) = records {
+            world.insert_resource(records);
+        }
+    }
+
+    fn countdown(app: &App) -> u32 {
+        app.world().resource::<Countdown>().0
+    }
+
+    fn steps(app: &App) -> u64 {
+        app.world().non_send::<GameCore>().steps
+    }
+
+    #[test]
+    fn sprint_start_holds_180_countdown_steps_before_first_core_tick() {
+        let mut app = test_app(0x51);
+        start_mode(&mut app, ModeId::Sprint);
+        assert_eq!(countdown(&app), 180, "Sprint pre-roll budget");
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            ModeId::Sprint
+        );
+
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::HardDrop);
+        // The pre-roll system runs before the step gate: 179 frames burn
+        // budget with the core frozen, and the frame whose decrement
+        // exhausts the budget (the 180th countdown step) is the first
+        // playable frame — core tick 0 there.
+        for _ in 0..179 {
+            fixed_step(&mut app);
+            assert_eq!(steps(&app), 0, "core frozen while pre-roll runs");
+            assert_eq!(
+                app.world().resource::<PendingActions>().queue.len(),
+                1,
+                "actions are held during the pre-roll, never dropped"
+            );
+        }
+        assert_eq!(countdown(&app), 1);
+        let run_seed = app.world().non_send::<GameCore>().seed;
+        assert_eq!(
+            snapshot(&app),
+            Game::with_config(run_seed, &modes::mode_config(ModeId::Sprint)).snapshot(),
+            "core untouched through the whole pre-roll"
+        );
+
+        fixed_step(&mut app);
+        assert_eq!(countdown(&app), 0);
+        assert_eq!(steps(&app), 1, "core tick 0 is the first playable frame");
+        assert!(
+            app.world().resource::<PendingActions>().queue.is_empty(),
+            "held action applies on the first playable frame"
+        );
+    }
+
+    #[test]
+    fn pause_during_pre_roll_freezes_then_resumes_countdown() {
+        let mut app = test_app(0x52);
+        start_mode(&mut app, ModeId::Dig);
+        for _ in 0..90 {
+            fixed_step(&mut app);
+        }
+        assert_eq!(countdown(&app), 90);
+
+        app.world_mut().resource_mut::<SimPaused>().0 = true;
+        for _ in 0..30 {
+            fixed_step(&mut app);
+        }
+        assert_eq!(
+            countdown(&app),
+            90,
+            "pause must freeze, not cancel, pre-roll"
+        );
+        assert_eq!(steps(&app), 0);
+
+        app.world_mut().resource_mut::<SimPaused>().0 = false;
+        for _ in 0..89 {
+            fixed_step(&mut app);
+        }
+        assert_eq!(countdown(&app), 1);
+        assert_eq!(steps(&app), 0);
+        fixed_step(&mut app);
+        assert_eq!(countdown(&app), 0);
+        assert_eq!(
+            steps(&app),
+            1,
+            "resumed pre-roll still ends in a playable frame"
+        );
+    }
+
+    #[test]
+    fn ultra_time_up_flips_game_over_and_exposes_terminal_reason() {
+        let mut app = test_app(0x53);
+        start_mode(&mut app, ModeId::Ultra);
+        assert_eq!(countdown(&app), 0, "Ultra has no pre-roll");
+
+        let mut saw_timeup = false;
+        for _ in 0..7300 {
+            fixed_step(&mut app);
+            if drained(&mut app)
+                .iter()
+                .any(|e| matches!(e.0, GameEvent::TimeUp { .. }))
+            {
+                saw_timeup = true;
+                break;
+            }
+        }
+        assert!(saw_timeup, "CoreEvent(TimeUp) observable on the wire");
+        assert_eq!(
+            *app.world().resource::<AppState>(),
+            AppState::GameOver,
+            "TimeUp flips AppState exactly like GameOver"
+        );
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(core.game.finished_reason(), Some(FinishReason::TimeUp));
+        assert_eq!(core.game.tick_count(), 7200);
+    }
+
+    #[test]
+    fn goal_reached_event_flips_game_over_and_forwards_too() {
+        let mut app = test_app(0x57);
+        app.world_mut()
+            .non_send_mut::<GameCore>()
+            .pending_events
+            .push(GameEvent::GoalReached { tick: 5 });
+
+        fixed_step(&mut app);
+
+        assert_eq!(*app.world().resource::<AppState>(), AppState::GameOver);
+        let events = drained(&mut app);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.0, GameEvent::GoalReached { tick: 5 })),
+            "CoreEvent forwarding preserved for terminal events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn sprint_top_out_flips_game_over_without_any_goal_event() {
+        let mut app = test_app(0x54);
+        start_mode(&mut app, ModeId::Sprint);
+        for _ in 0..180 {
+            fixed_step(&mut app);
+        }
+
+        let mut saw_goal = false;
+        let mut saw_game_over = false;
+        for _ in 0..1000 {
+            app.world_mut()
+                .resource_mut::<PendingActions>()
+                .push(Action::HardDrop);
+            fixed_step(&mut app);
+            for event in drained(&mut app) {
+                if matches!(event.0, GameEvent::GoalReached { .. }) {
+                    saw_goal = true;
+                }
+                if event.0 == GameEvent::GameOver {
+                    saw_game_over = true;
+                }
+            }
+            if saw_game_over {
+                break;
+            }
+        }
+        assert!(
+            saw_game_over,
+            "hard-drop pile-up must block out under Sprint rules"
+        );
+        assert!(!saw_goal, "top-out must not produce a goal event");
+        assert_eq!(*app.world().resource::<AppState>(), AppState::GameOver);
+        assert_eq!(
+            app.world().non_send::<GameCore>().game.finished_reason(),
+            Some(FinishReason::TopOut)
+        );
+    }
+
+    #[test]
+    fn start_mode_bumps_plays_for_the_right_mode_key() {
+        let mut app = test_app(0x55);
+        app.init_resource::<Records>();
+        for id in [
+            ModeId::Marathon,
+            ModeId::Sprint,
+            ModeId::Sprint,
+            ModeId::Dig,
+        ] {
+            start_mode(&mut app, id);
+        }
+        let records = app.world().resource::<Records>();
+        use crate::records::{DIG, MARATHON, SPRINT, ULTRA};
+        assert_eq!(records.plays(MARATHON), 1);
+        assert_eq!(records.plays(SPRINT), 2);
+        assert_eq!(records.plays(DIG), 1);
+        assert_eq!(records.plays(ULTRA), 0, "only the started modes count");
+    }
+
+    #[test]
+    fn restart_on_r_retries_the_current_mode_not_marathon() {
+        let mut app = test_app(0x56);
+        app.init_resource::<Records>();
+        start_mode(&mut app, ModeId::Sprint);
+        for _ in 0..180 {
+            fixed_step(&mut app);
+        }
+        *app.world_mut().resource_mut::<AppState>() = AppState::GameOver;
+
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        let _ = app.world_mut().try_run_schedule(Update);
+
+        assert_eq!(*app.world().resource::<AppState>(), AppState::Playing);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            ModeId::Sprint,
+            "R retries the recorded mode"
+        );
+        assert_eq!(
+            countdown(&app),
+            modes::pre_roll_ticks(ModeId::Sprint),
+            "retry re-arms the mode's pre-roll"
+        );
+        assert_eq!(steps(&app), 0);
+        assert_eq!(
+            app.world()
+                .resource::<Records>()
+                .plays(crate::records::SPRINT),
+            2
+        );
     }
 
     #[test]

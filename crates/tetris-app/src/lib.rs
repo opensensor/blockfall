@@ -13,6 +13,7 @@ mod core_bridge;
 mod hud;
 mod input;
 mod juice;
+mod modes;
 mod records;
 mod render;
 mod screens_menu;
