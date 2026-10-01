@@ -34,6 +34,15 @@
 //!   first side to the target. Racing fast is never punished, but a fast
 //!   finish alone never decides the match — the other side always gets to
 //!   play out its race.
+//! - [`AttackRule::Dig`] (T20, Dig Duel): no garbage ever travels between
+//!   the sides. Both games start from **one shared side seed** on the same
+//!   10-row buried garbage board (identical hole columns, identical piece
+//!   sequence) under the solo-Dig [`ModeConfig`] (level pinned to 1,
+//!   `Goal::GarbageCleared` — see [`dig_side_config`]). The first side whose
+//!   `garbage_rows_left()` hits 0 on a lock is crowned immediately; a
+//!   top-out loses on the spot (opponent crowned). If both sides would zero
+//!   on the same bridge frame, the first-settled side wins (fixed
+//!   Left-then-Right settle order ⇒ symmetric on both peers).
 //! - Any top-out (block-out in normal play, or garbage overflow) hands the
 //!   win to the opponent, even if that opponent already finished. Once a
 //!   winner is set, [`Match::apply`] is a no-op returning an empty batch,
@@ -51,6 +60,7 @@ use crate::actions::Action;
 use crate::board::{Board, COLS, ROWS};
 use crate::event::GameEvent;
 use crate::game::{Game, GameSnapshot};
+use crate::mode::{Goal, ModeConfig, StartBoard};
 use crate::piece::Piece;
 use crate::prng::Rng;
 
@@ -100,9 +110,19 @@ pub enum AttackRule {
         /// Cumulative cleared lines that win the match.
         target_lines: u32,
     },
-    /// Dig Duel scaffold (rule behavior lands in T20): identical buried
-    /// garbage on both boards, no attacks. Until T20 implements it, this
-    /// behaves like no-op/no-attack (see [`Match::settle`]).
+    /// Dig Duel (T20): both sides start on the **identical** 10-row buried
+    /// garbage board (same hole columns — both side games share one seed,
+    /// so the piece sequence is identical too) and no garbage ever travels
+    /// between them. First side whose `garbage_rows_left()` reaches 0 wins;
+    /// a top-out loses immediately (opponent crowned). A side game runs the
+    /// solo-Dig [`ModeConfig`] (see [`dig_side_config`]).
+    ///
+    /// Tie rule: crowning is synchronous with the settle that zeros a side,
+    /// so both sides can only "tie" inside one bridge frame — the side that
+    /// settles first there wins. The bridge order (Left settles before
+    /// Right per frame) is fixed bridge code, identical on both peers, so
+    /// the outcome is fully deterministic; see
+    /// `Match::new` and [`Match::settle`].
     Dig,
     /// Switch scaffold (rule behavior lands in T21): garbage attacks plus
     /// full board swaps every `swap_interval_ticks` of the match clock, with
@@ -123,6 +143,33 @@ impl Default for AttackRule {
         AttackRule::Race {
             target_lines: DEFAULT_RACE_LINES,
         }
+    }
+}
+
+/// Buried garbage rows on both boards of a Dig Duel (T20). Mirrors
+/// `modes::DIG_GARBAGE_ROWS` on the app side; the shared hole-column
+/// derivation is `mode::StartBoard::BuriedGarbage::build` — versus and
+/// solo Dig started from the same seed produce the same buried board
+/// (regression-tested).
+pub const DIG_DUEL_GARBAGE_ROWS: usize = 10;
+
+/// The [`ModeConfig`] each Dig Duel side game runs: the exact solo-Dig rule
+/// set (`crates/tetris-app/src/modes.rs::mode_config(ModeId::Dig)` —
+/// `start_level: 1` with `levels_advance: false`, so gravity is fixed at
+/// level 1 for the whole duel, and `Goal::GarbageCleared` freezes a side
+/// game the moment its buried rows are gone, in lockstep with the match
+/// crowning it). The buried board itself derives from the side game's seed
+/// through the shared `mode::StartBoard` generator.
+pub(crate) fn dig_side_config() -> ModeConfig {
+    ModeConfig {
+        start_level: 1,
+        levels_advance: false,
+        goal: Some(Goal::GarbageCleared),
+        clock_ticks: None,
+        start_board: Some(StartBoard::BuriedGarbage {
+            rows: DIG_DUEL_GARBAGE_ROWS,
+        }),
+        ..ModeConfig::default()
     }
 }
 
@@ -235,13 +282,29 @@ impl Match {
     /// Fresh match: per-side game seeds and the garbage-hole stream all
     /// derive from `seed` via one [`Rng`] stream (left game first, then
     /// right, then hole draws), so replays are exact.
+    ///
+    /// Dig Duel exception ([`AttackRule::Dig`]): **both** side games share
+    /// the first draw (same seed ⇒ same buried board and same piece
+    /// sequence), and each is built with [`dig_side_config`] — the solo-Dig
+    /// rule set (10 buried rows from that shared seed, level pinned to 1,
+    /// `Goal::GarbageCleared`). The hole-draw stream is never consumed
+    /// under Dig (no garbage is ever pushed).
     pub fn new(seed: u64, rule: AttackRule) -> Self {
         let mut rng = Rng::new(seed);
         let left_seed = rng.next_u64();
-        let right_seed = rng.next_u64();
+        let (left, right) = if rule == AttackRule::Dig {
+            let config = dig_side_config();
+            (
+                Game::with_config(left_seed, &config),
+                Game::with_config(left_seed, &config),
+            )
+        } else {
+            let right_seed = rng.next_u64();
+            (Game::new(left_seed), Game::new(right_seed))
+        };
         Self {
-            left: Game::new(left_seed),
-            right: Game::new(right_seed),
+            left,
+            right,
             rule,
             winner: None,
             pending: [0, 0],
@@ -411,11 +474,27 @@ impl Match {
                     }
                 }
             }
-            // Dig Duel / Switch: rule behavior lands in T20/T21. Until then
-            // both are documented no-attack placeholders: locks clear and
-            // top out normally (handled above), but no attack or swap
-            // bookkeeping happens here.
-            AttackRule::Dig | AttackRule::Switch { .. } => {}
+            AttackRule::Dig => {
+                // Dig Duel: garbage never moves between sides; the win is
+                // read off this side's own board on every settle. `Game`
+                // only ever empties garbage rows on a lock (line clears),
+                // so checking on `locked` is exhaustive — and the top-out
+                // above already returned, making "zeroed and topped out on
+                // the same lock" a top-out loss. The winner-crowning path
+                // is the same one the Garbage rule uses (set `winner`,
+                // emit `WinnerCrowned`): the match freezes from here, so
+                // the first settled zero wins even if the other side also
+                // zeroed later in the same frame (its settle is inert) —
+                // see the tie note on [`AttackRule::Dig`].
+                if locked && self.game(side).garbage_rows_left() == 0 {
+                    self.winner = Some(side);
+                    out.push(MatchEvent::WinnerCrowned { side });
+                }
+            }
+            // Switch: rule behavior lands in T21. Until then a documented
+            // no-attack placeholder: locks clear and top out normally
+            // (handled above), but no swap bookkeeping happens here.
+            AttackRule::Switch { .. } => {}
         }
         out
     }
@@ -746,36 +825,33 @@ mod tests {
         assert_eq!(snap.swaps_done, 0, "no swap logic before T21");
     }
 
-    /// T20/T21 scaffolding only: the new rules are documented no-attack
-    /// placeholders — locks clear normally, but nothing queues, swaps or
-    /// crowns beyond the standard top-out path.
+    /// T19 scaffolding (Switch half): Switch is still a documented
+    /// no-attack placeholder — locks clear normally, but nothing queues,
+    /// swaps or crowns beyond the standard top-out path. (The Dig half
+    /// became the real Dig Duel rule in T20; see the dig tests below.)
     #[test]
-    fn new_rules_are_no_attack_placeholders() {
+    fn switch_rule_is_a_no_attack_placeholder() {
         let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::I]));
-        for rule in [
-            AttackRule::Dig,
-            AttackRule::Switch {
-                swap_interval_ticks: 1_800,
-                warning_ticks: 180,
-            },
-        ] {
-            let mut m = Match::new(seed, rule);
-            setup_flat_gap(&mut m, Side::Left);
-            let ev = m.apply(Side::Left, Action::HardDrop);
-            assert_eq!(
-                ev,
-                vec![MatchEvent::PieceLocked {
-                    side: Side::Left,
-                    lines: 1
-                }],
-                "{rule:?} must neither attack nor swap before T20/T21"
-            );
-            assert_eq!(m.pending_attack(Side::Right), 0);
-            assert_eq!(m.winner(), None);
-            let mut ev = m.advance_match_clock();
-            ev.extend(m.advance_match_clock());
-            assert!(ev.is_empty(), "{rule:?} emits no clock events yet");
-        }
+        let rule = AttackRule::Switch {
+            swap_interval_ticks: 1_800,
+            warning_ticks: 180,
+        };
+        let mut m = Match::new(seed, rule);
+        setup_flat_gap(&mut m, Side::Left);
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert_eq!(
+            ev,
+            vec![MatchEvent::PieceLocked {
+                side: Side::Left,
+                lines: 1
+            }],
+            "{rule:?} must neither attack nor swap before T21"
+        );
+        assert_eq!(m.pending_attack(Side::Right), 0);
+        assert_eq!(m.winner(), None);
+        let mut ev = m.advance_match_clock();
+        ev.extend(m.advance_match_clock());
+        assert!(ev.is_empty(), "{rule:?} emits no clock events yet");
     }
 
     #[test]
@@ -1236,6 +1312,237 @@ mod tests {
         }));
         assert_eq!(m.pending_attack(Side::Right), 2);
         assert_eq!(m.winner(), None);
+    }
+
+    // ----------------------------------------------------------------
+    // T20: Dig Duel
+    // ----------------------------------------------------------------
+
+    /// Replace the side's board with a single clearable bottom garbage row
+    /// (full except columns 4-5): a hard-dropped O finishes that row and
+    /// takes `garbage_rows_left()` to zero.
+    fn setup_o_clearable_garbage(m: &mut Match, side: Side) {
+        let mut board = Board::new();
+        for c in 0..COLS {
+            if !(4..=5).contains(&c) {
+                board.set(ROWS - 1, c, Some(Piece::Garbage));
+            }
+        }
+        assert!(m.game_mut(side).install_board(board, false));
+    }
+
+    /// The first per-side game seed `Match::new` draws from `seed` (both
+    /// sides under Dig — one seed for both games).
+    fn dig_side_seed(match_seed: u64) -> u64 {
+        Rng::new(match_seed).next_u64()
+    }
+
+    #[test]
+    fn dig_duel_starts_with_identical_buried_boards_and_sequences() {
+        let m = Match::new(42, AttackRule::Dig);
+        let (ls, rs) = (m.left.snapshot(), m.right.snapshot());
+        assert_eq!(ls.board, rs.board, "same seed ⇒ same buried board");
+        let left_seq: Vec<_> = ls.active.map(|p| p.piece).into_iter().collect();
+        assert_eq!(ls.active.map(|p| p.piece), rs.active.map(|p| p.piece));
+        assert!(!left_seq.is_empty());
+        assert_eq!(m.left.peek_next(6), m.right.peek_next(6));
+        assert_eq!(m.left.garbage_rows_left(), 10, "solo-Dig depth");
+        assert_eq!(m.right.garbage_rows_left(), 10);
+        assert_eq!(ls.level, 1, "Dig gravity is fixed at level 1");
+        assert_eq!(rs.level, 1);
+        // Single source of truth: the duel board is exactly the solo-Dig
+        // buried board built from the same side seed.
+        let solo = Game::with_config(
+            dig_side_seed(42),
+            &ModeConfig {
+                start_level: 1,
+                levels_advance: false,
+                goal: Some(Goal::GarbageCleared),
+                start_board: Some(StartBoard::BuriedGarbage { rows: 10 }),
+                ..ModeConfig::default()
+            },
+        );
+        assert_eq!(
+            ls.board,
+            solo.snapshot().board,
+            "versus and solo Dig must agree on hole columns"
+        );
+        // Every buried row: exactly one hole, rest garbage.
+        for r in (ROWS - 10)..ROWS {
+            let holes = (0..COLS).filter(|&c| ls.board.get(r, c).is_none()).count();
+            assert_eq!(holes, 1, "row {r}");
+        }
+    }
+
+    /// The side-game config is the documented mirror of solo Dig's: level
+    /// pinned to 1, `Goal::GarbageCleared`, 10 buried rows, no clock/feed.
+    #[test]
+    fn dig_side_config_mirrors_solo_dig() {
+        assert_eq!(DIG_DUEL_GARBAGE_ROWS, 10, "same depth as solo Dig");
+        let c = dig_side_config();
+        assert_eq!(c.start_level, 1);
+        assert!(!c.levels_advance, "Dig gravity fixed at level 1");
+        assert_eq!(c.goal, Some(Goal::GarbageCleared));
+        assert_eq!(c.clock_ticks, None);
+        assert_eq!(
+            c.start_board,
+            Some(StartBoard::BuriedGarbage {
+                rows: DIG_DUEL_GARBAGE_ROWS
+            })
+        );
+        assert_eq!(c.on_block_out, crate::mode::BlockOutBehavior::End);
+        assert_eq!(c.garbage_feed, None);
+    }
+
+    #[test]
+    fn dig_duel_never_sends_or_lands_garbage() {
+        let mut m = Match::new(7, AttackRule::Dig);
+        let mut log = Vec::new();
+        for i in 0..20 {
+            if m.winner().is_some() {
+                break;
+            }
+            log.extend(m.apply(Side::Left, Action::HardDrop));
+            if i % 3 == 0 {
+                log.extend(m.apply(Side::Left, Action::MoveLeft));
+            }
+            log.extend(m.apply(Side::Right, Action::HardDrop));
+            log.extend(m.tick(Side::Left));
+            log.extend(m.tick(Side::Right));
+        }
+        assert!(
+            !log.iter().any(|e| matches!(
+                e,
+                MatchEvent::GarbageSent { .. } | MatchEvent::GarbageReceived { .. }
+            )),
+            "Dig Duel must never attack: {log:?}"
+        );
+        assert_eq!(m.pending_attack(Side::Left), 0);
+        assert_eq!(m.pending_attack(Side::Right), 0);
+    }
+
+    #[test]
+    fn dig_clearing_the_last_row_crowns_that_side_immediately() {
+        let seed = find_match_seed(Some(&[Piece::O]), None);
+        let mut m = Match::new(seed, AttackRule::Dig);
+        setup_o_clearable_garbage(&mut m, Side::Left);
+        setup_o_clearable_garbage(&mut m, Side::Right);
+        assert_eq!(m.left.garbage_rows_left(), 1);
+        assert_eq!(m.winner(), None, "buried rows left ⇒ match open");
+
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert_eq!(
+            ev,
+            vec![
+                MatchEvent::PieceLocked {
+                    side: Side::Left,
+                    lines: 1
+                },
+                MatchEvent::WinnerCrowned { side: Side::Left },
+            ],
+            "zero buried rows crowns on the spot"
+        );
+        assert_eq!(m.left.garbage_rows_left(), 0);
+        assert_eq!(m.winner(), Some(Side::Left));
+
+        // Frozen: the opponent never gets to answer.
+        let before = m.snapshot();
+        assert!(m.apply(Side::Right, Action::HardDrop).is_empty());
+        assert!(m.tick(Side::Right).is_empty());
+        assert_eq!(m.snapshot(), before, "match frozen after crowning");
+    }
+
+    #[test]
+    fn dig_top_out_hands_the_win_to_the_opponent() {
+        let seed = find_match_seed(Some(&[Piece::O]), None);
+        let mut m = Match::new(seed, AttackRule::Dig);
+        // Spawn-column wall added **on top of** the buried board (garbage
+        // rows stay ⇒ no zero-clear shortcut): Right's O locks on the wall,
+        // the next spawn block-outs.
+        let mut board = m.right.snapshot().board;
+        for r in 2..ROWS {
+            board.set(r, 4, Some(Piece::Z));
+            board.set(r, 5, Some(Piece::Z));
+        }
+        assert!(m.game_mut(Side::Right).install_board(board, false));
+        assert!(m.right.garbage_rows_left() > 0);
+
+        let mut log = Vec::new();
+        for _ in 0..40 {
+            log.extend(m.apply(Side::Right, Action::HardDrop));
+            if m.winner().is_some() {
+                break;
+            }
+        }
+        assert!(
+            log.contains(&MatchEvent::PlayerTopOut { side: Side::Right }),
+            "{log:?}"
+        );
+        assert!(log.contains(&MatchEvent::WinnerCrowned { side: Side::Left }));
+        assert_eq!(m.winner(), Some(Side::Left));
+    }
+
+    /// Tie rule: crowning is synchronous with the settle that zeros a side,
+    /// so within one bridge frame (Left settles before Right, fixed order on
+    /// both peers) the first-settled zero wins even when both sides would
+    /// clear their last row on that frame.
+    #[test]
+    fn dig_same_frame_double_zero_goes_to_the_first_settled_side() {
+        let seed = find_match_seed(Some(&[Piece::O]), None);
+        for first in [Side::Left, Side::Right] {
+            let mut m = Match::new(seed, AttackRule::Dig);
+            setup_o_clearable_garbage(&mut m, Side::Left);
+            setup_o_clearable_garbage(&mut m, Side::Right);
+            // One settle zeroes `first`; the other side's matching lock lands
+            // later within the same frame and must be inert.
+            let ev = m.apply(first, Action::HardDrop);
+            assert!(
+                ev.contains(&MatchEvent::WinnerCrowned { side: first }),
+                "first-settled zero must crown on its own settle: {ev:?}"
+            );
+            assert_eq!(m.winner(), Some(first));
+            assert!(m.apply(first.other(), Action::HardDrop).is_empty());
+            assert_eq!(m.winner(), Some(first), "crown is not re-decided");
+        }
+    }
+
+    #[test]
+    fn dig_replay_is_deterministic() {
+        fn replay() -> (Vec<MatchEvent>, MatchSnapshot) {
+            let seed = find_match_seed(Some(&[Piece::I, Piece::O]), None);
+            let mut m = Match::new(seed, AttackRule::Dig);
+            let mut log = Vec::new();
+            for i in 0..25 {
+                if m.winner().is_some() {
+                    break;
+                }
+                log.extend(m.apply(Side::Left, Action::HardDrop));
+                if i % 2 == 0 {
+                    log.extend(m.apply(Side::Right, Action::RotateCw));
+                }
+                log.extend(m.apply(Side::Right, Action::HardDrop));
+                for _ in 0..5 {
+                    log.extend(m.tick(Side::Left));
+                    log.extend(m.tick(Side::Right));
+                }
+                log.extend(m.advance_match_clock());
+            }
+            (log, m.snapshot())
+        }
+        let (log_a, snap_a) = replay();
+        let (log_b, snap_b) = replay();
+        assert!(!log_a.is_empty());
+        assert_eq!(log_a, log_b);
+        assert_eq!(snap_a, snap_b);
+        // Fresh duel boards start identical (divergence below is purely
+        // input-driven; the shared-seed property itself is pinned in
+        // `dig_duel_starts_with_identical_buried_boards_and_sequences`).
+        let fresh = Match::new(
+            find_match_seed(Some(&[Piece::I, Piece::O]), None),
+            AttackRule::Dig,
+        )
+        .snapshot();
+        assert_eq!(fresh.left.board, fresh.right.board);
     }
 
     #[test]

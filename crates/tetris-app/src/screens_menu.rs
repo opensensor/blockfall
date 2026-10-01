@@ -55,7 +55,8 @@
 //! ## 1 v 1 (T26)
 //!
 //! Title grows a "1 v 1" entry leading through a two-step submenu flow
-//! (rule: Garbage / Race, then opponent: Human / Bot) that launches a match
+//! (rule: Garbage / Race / Dig, then opponent: Human / Bot) that launches a
+//! match
 //! via [`start_versus`]; the flow lives in the [`VersusFlow`] resource
 //! ([`VersusStage`]) with Back buttons *and* Escape walking it back. While
 //! [`VersusWinner`] is set the [`VersusOverRoot`] overlay shows the winner
@@ -311,7 +312,7 @@ pub enum VersusStage {
     /// Plain title menu.
     #[default]
     Title,
-    /// Pick the attack rule (Garbage / Race).
+    /// Pick the attack rule (Garbage / Race / Dig).
     Rules,
     /// Pick the P2 opponent (Human / Bot); launches on choice.
     Opponent,
@@ -528,7 +529,7 @@ pub struct QuitRequested(pub bool);
 #[derive(Component)]
 pub struct OneVOneButton;
 
-/// Root of the 1v1 rule submenu (Garbage / Race); visible in
+/// Root of the 1v1 rule submenu (Garbage / Race / Dig); visible in
 /// [`AppState::Title`] while [`VersusStage::Rules`] is active.
 #[derive(Component)]
 pub struct VersusRulesRoot;
@@ -545,6 +546,10 @@ pub struct RuleGarbageButton;
 /// "Race" rule button in the rules submenu.
 #[derive(Component)]
 pub struct RuleRaceButton;
+
+/// "Dig" (Dig Duel, T20) rule button in the rules submenu.
+#[derive(Component)]
+pub struct RuleDigButton;
 
 /// "Human" opponent button: launches a local-human vs local-human match.
 #[derive(Component)]
@@ -890,6 +895,7 @@ type VersusClickQuery<'w, 's> = Query<
         Has<OneVOneButton>,
         Has<RuleGarbageButton>,
         Has<RuleRaceButton>,
+        Has<RuleDigButton>,
         Has<OpponentHumanButton>,
         Has<OpponentBotButton>,
         Has<VersusBackButton>,
@@ -927,7 +933,7 @@ fn versus_button_clicks(mut params: VersusClickParams) {
         .net
         .is_some_and(|net| net.status == NetStatus::InMatch);
 
-    for (_entity, interaction, one_v_one, garbage, race, human, bot, back, rematch, menu) in
+    for (_entity, interaction, one_v_one, garbage, race, dig, human, bot, back, rematch, menu) in
         params.buttons.iter()
     {
         if *interaction != Interaction::Pressed {
@@ -948,6 +954,9 @@ fn versus_button_clicks(mut params: VersusClickParams) {
                         params.flow.rule = AttackRule::Race {
                             target_lines: DEFAULT_RACE_LINES,
                         };
+                        params.flow.stage = VersusStage::Opponent;
+                    } else if dig {
+                        params.flow.rule = AttackRule::Dig;
                         params.flow.stage = VersusStage::Opponent;
                     } else if back {
                         versus_flow_back(&mut params.flow);
@@ -1462,6 +1471,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
             root.spawn(label_node("1 v 1 — RULE".to_string(), 40.0));
             menu_button(root, "Garbage", RuleGarbageButton);
             menu_button(root, "Race", RuleRaceButton);
+            menu_button(root, "Dig", RuleDigButton);
             menu_button(root, "Back", VersusBackButton);
         },
     );
@@ -2302,7 +2312,7 @@ mod tests {
 
     use crate::core_bridge::{start_versus, Controller, VersusMatch, VersusWinner};
     use crate::input::VersusActions;
-    use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
+    use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES, DIG_DUEL_GARBAGE_ROWS};
 
     fn flow(app: &App) -> VersusFlow {
         *app.world().resource::<VersusFlow>()
@@ -2333,9 +2343,13 @@ mod tests {
             click_button_under(app, rules_root, |world, e| {
                 world.get::<RuleGarbageButton>(e).is_some()
             });
-        } else {
+        } else if rule == "race" {
             click_button_under(app, rules_root, |world, e| {
                 world.get::<RuleRaceButton>(e).is_some()
+            });
+        } else {
+            click_button_under(app, rules_root, |world, e| {
+                world.get::<RuleDigButton>(e).is_some()
             });
         }
         assert_eq!(flow(app).stage, VersusStage::Opponent);
@@ -2386,6 +2400,37 @@ mod tests {
         );
         assert_eq!(p1, Controller::Human);
         assert_eq!(p2, Controller::Bot);
+    }
+
+    /// T20: the rules step grows a third button; picking Dig launches the
+    /// local duel (bot seat included) on identical 10-row buried boards.
+    #[test]
+    fn one_v_one_dig_flow_starts_a_dig_duel() {
+        let mut app = menu_test_app();
+        click_1v1_path(&mut app, "dig", "bot");
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active, "Dig flow starts a local versus match");
+        assert_eq!(rule, AttackRule::Dig);
+        assert_eq!(p1, Controller::Human, "P1 stays the local human");
+        assert_eq!(p2, Controller::Bot, "bot seat supported under Dig");
+        assert_eq!(app_state(&app), AppState::Playing);
+        let versus = app.world().non_send::<VersusMatch>();
+        assert_eq!(
+            versus.match_.left.garbage_rows_left(),
+            DIG_DUEL_GARBAGE_ROWS,
+            "left board buried"
+        );
+        assert_eq!(
+            versus.match_.right.garbage_rows_left(),
+            DIG_DUEL_GARBAGE_ROWS,
+            "right board buried"
+        );
+        assert_eq!(DIG_DUEL_GARBAGE_ROWS, 10, "solo-Dig depth");
+        assert_eq!(
+            versus.match_.left.snapshot().board,
+            versus.match_.right.snapshot().board,
+            "same hole columns on both boards"
+        );
     }
 
     #[test]

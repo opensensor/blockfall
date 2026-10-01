@@ -396,7 +396,18 @@ mod tests {
         assert_eq!(garbage.match_ticks, 40);
         assert_eq!(garbage.swaps_done, 0, "no swap logic before T21");
         let dig = run(99, AttackRule::Dig);
-        assert_eq!(dig.match_ticks, 40);
+        assert_eq!(dig, run(99, AttackRule::Dig));
+        // T20: Dig Duel is a live rule — this scripted sequence tops a side
+        // out before the 40-step window closes, and the T19 clock freeze
+        // stops the counter at the crown. Determinism (the contract this
+        // test guards) is checked above; the clock only needs to stay
+        // within the frozen window now.
+        assert!(
+            dig.match_ticks <= 40 && dig.winner.is_some(),
+            "dig duel: match_ticks {} winner {:?}",
+            dig.match_ticks,
+            dig.winner
+        );
         let switch = run(
             99,
             AttackRule::Switch {

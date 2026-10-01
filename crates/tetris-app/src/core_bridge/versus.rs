@@ -1343,6 +1343,67 @@ mod tests {
         panic!("bot-vs-bot match never produced a winner within 30k fixed steps");
     }
 
+    /// T20: a local human-vs-bot Dig Duel plays through to a crowned
+    /// winner. The buried duel boards are not greedy-solvable, so somebody
+    /// tops out and the opponent crowns (bot may win). Asserts SOME winner,
+    /// buried boards at start, and no garbage attack event ever.
+    #[test]
+    fn dig_duel_human_vs_bot_plays_through_to_a_crowned_winner() {
+        use tetris_core::versus::DIG_DUEL_GARBAGE_ROWS;
+        let mut app = test_app(0xD16);
+        start_in_app(
+            &mut app,
+            AttackRule::Dig,
+            Controller::Human,
+            Controller::Bot,
+        );
+        // Pin the match seed for reproducibility (`start_versus` uses the
+        // wall clock; same pattern as the T15 cooldown test).
+        let match_ = Match::new(0x5EED_0020, AttackRule::Dig);
+        app.world_mut().non_send_mut::<VersusMatch>().match_ = match_;
+        {
+            let versus = app.world().non_send::<VersusMatch>();
+            assert_eq!(
+                versus.match_.left.garbage_rows_left(),
+                DIG_DUEL_GARBAGE_ROWS,
+                "board has garbage at start"
+            );
+            assert_eq!(
+                versus.match_.right.garbage_rows_left(),
+                DIG_DUEL_GARBAGE_ROWS
+            );
+        }
+
+        let mut crowned = None;
+        let mut saw_attack = false;
+        for _ in 0..30_000 {
+            // Human seat never stops dropping; the greedy dump buries it.
+            push_side(&mut app, Side::Left, &[Action::HardDrop]);
+            fixed_step(&mut app);
+            for e in drained_versus(&mut app) {
+                if matches!(
+                    e.0,
+                    MatchEvent::GarbageSent { .. } | MatchEvent::GarbageReceived { .. }
+                ) {
+                    saw_attack = true;
+                }
+                if let MatchEvent::WinnerCrowned { side } = e.0 {
+                    crowned = Some(side);
+                }
+            }
+            if crowned.is_some() {
+                break;
+            }
+        }
+        assert!(!saw_attack, "Dig Duel never exchanges garbage");
+        let winner = crowned.expect("Dig Duel must crown a winner (top-out or first dig-out)");
+        assert_eq!(
+            *app.world().resource::<VersusWinner>(),
+            VersusWinner(Some(winner)),
+            "the crowning reaches the overlay-facing resource"
+        );
+    }
+
     #[test]
     fn harness_restarts_after_a_match_and_exits_after_two() {
         // Drive the harness logic directly (no env var): first crowned match

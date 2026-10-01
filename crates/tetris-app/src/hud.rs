@@ -39,10 +39,10 @@
 use bevy::prelude::*;
 use bevy::window::Window;
 
-use tetris_core::board::COLS;
+use tetris_core::board::{COLS, ROWS};
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::{Piece, Rotation};
-use tetris_core::versus::Side;
+use tetris_core::versus::{AttackRule, Side, DIG_DUEL_GARBAGE_ROWS};
 
 use crate::core_bridge::{CoreEvent, GameCore, ModeHudInfo, VersusMatch};
 use crate::input::{Bind, BindSlot, KeyBindings};
@@ -999,6 +999,8 @@ pub enum VersusHudSlot {
     /// `LEVEL` + value.
     Level,
     /// `+N` incoming-garbage indicator (empty text when nothing pending).
+    /// Under the Dig rule (T20) it doubles as the buried-board `DUG n/10`
+    /// progress counter instead.
     Pending,
     /// `FINISHED` badge for a side that completed a Race target (empty
     /// text while it still races or tops out).
@@ -1061,6 +1063,23 @@ fn versus_pending_text(pending: u32) -> String {
     } else {
         String::new()
     }
+}
+
+/// Rows of the snapshot's board that still contain a [`Piece::Garbage`]
+/// cell — the HUD-side mirror of the core's `Game::garbage_rows_left()`
+/// (`GameSnapshot` exposes the board, not the getter).
+fn buried_rows_left(game: &GameSnapshot) -> usize {
+    (0..ROWS)
+        .filter(|&r| (0..COLS).any(|c| game.board.get(r, c) == Some(Piece::Garbage)))
+        .count()
+}
+
+/// Dig Duel progress label (T20): rows dug of the shared 10-row buried
+/// board. Reuses the Pending slot — under Dig no garbage ever travels, so
+/// the `+N` meter is structurally dead there.
+fn versus_dug_text(rows_left: usize) -> String {
+    let dug = DIG_DUEL_GARBAGE_ROWS.saturating_sub(rows_left);
+    format!("DUG {dug}/{DIG_DUEL_GARBAGE_ROWS}")
 }
 
 /// `FINISHED` badge text for a side that completed a Race target (empty
@@ -1269,7 +1288,13 @@ fn sync_versus_hud(
             VersusHudSlot::Score => format!("SCORE\n{}", game.score),
             VersusHudSlot::Lines => format!("LINES\n{}", game.lines),
             VersusHudSlot::Level => format!("LEVEL\n{}", game.level),
-            VersusHudSlot::Pending => versus_pending_text(pending),
+            VersusHudSlot::Pending => match snapshot.rule {
+                // Dig Duel: the pending meter doubles as the shared buried
+                // board's dug-rows counter (no garbage ever travels under
+                // Dig). Garbage/Race keep the `+N` incoming indicator.
+                AttackRule::Dig => versus_dug_text(buried_rows_left(game)),
+                _ => versus_pending_text(pending),
+            },
             VersusHudSlot::Status => match ladder_rung {
                 Some(rung) => ladder_badge_text(rung),
                 None => versus_status_text(finished),
@@ -1914,6 +1939,43 @@ mod tests {
             }
         }
         assert_eq!(next_visible, 2, "exactly two next previews per side");
+    }
+
+    /// T20: under the Dig rule the pending slot flips to the buried-board
+    /// `DUG n/10` counter — the `+N` queue read is suppressed (Dig never
+    /// sends), and the counter follows each side's own board.
+    #[test]
+    fn versus_hud_shows_dug_rows_under_dig_rule() {
+        let mut app = versus_hud_app(1);
+        let mut snapshot = fixture_match(AttackRule::Dig);
+        snapshot.pending = (0, 3); // never shown under Dig
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot.clone());
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Pending),
+            "DUG 0/10"
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Pending),
+            "DUG 0/10"
+        );
+
+        // Clear the left board's bottom buried row: only that side's
+        // counter moves.
+        let mut dug = snapshot;
+        for c in 0..COLS {
+            dug.left.board.set(ROWS - 1, c, None);
+        }
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(dug);
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Pending),
+            "DUG 1/10"
+        );
+        assert_eq!(
+            versus_text_of(&mut app, Side::Right, VersusHudSlot::Pending),
+            "DUG 0/10"
+        );
     }
 
     #[test]
