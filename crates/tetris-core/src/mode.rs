@@ -98,9 +98,12 @@ pub enum BlockOutBehavior {
     /// Freeze the game and emit `GameEvent::GameOver` (Marathon et al.).
     #[default]
     End,
-    /// Plumb-only (T2): Zen's wipe-and-continue behavior is **wired in T14**
-    /// (stack cleared, colliding piece respawned, `GameEvent::StackWiped`).
-    /// Until then it behaves exactly like [`BlockOutBehavior::End`].
+    /// Zen's wipe-and-continue behavior (wired in T14): the whole stack is
+    /// cleared, the colliding piece re-spawns at its spawn state, and
+    /// [`GameEvent::StackWiped`](crate::event::GameEvent::StackWiped) is
+    /// emitted before the re-spawn's `PieceSpawned`. The game never freezes:
+    /// `game_over` stays `false` and `finished_reason()` stays `None`;
+    /// score/lines/level/combo/B2B keep their values.
     WipeAndContinue,
 }
 

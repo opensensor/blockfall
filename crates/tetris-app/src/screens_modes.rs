@@ -780,17 +780,19 @@ mod tests {
 
         // The row renderer itself is catalogue-driven, not a fixed menu:
         // feeding it a hypothetical catalogue (a flipped `is_shipped`, e.g.
-        // Zen in R2) renders exactly those rows.
+        // Bot Ladder in R3) renders exactly those rows. T14 note: the
+        // hypothetical was Zen until Zen shipped — it now needs a mode that
+        // is still unshipped.
         let records = Records::default();
         {
             let mut cx = app.world_mut().commands();
             cx.spawn(Node::default()).with_children(|parent| {
-                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::Zen], &records);
+                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::BotLadder], &records);
             });
         }
         app.update();
         let ids = row_ids(&mut app);
-        assert_eq!(ids.iter().filter(|id| **id == ModeId::Zen).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == ModeId::BotLadder).count(), 1);
         assert_eq!(
             ids.len(),
             expected.len() + 2,

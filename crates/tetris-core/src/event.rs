@@ -89,4 +89,15 @@ pub enum GameEvent {
         /// Logical tick the clock expired on (`== clock_ticks`).
         tick: u64,
     },
+    /// Zen block-out (T14): a spawn collision under
+    /// [`BlockOutBehavior::WipeAndContinue`](crate::mode::BlockOutBehavior)
+    /// wiped the **whole** settled stack and play continues — the colliding
+    /// piece re-spawned in the same batch. Emitted immediately *before* the
+    /// re-spawn's `PieceSpawned`; never accompanied by `GameOver`. Score,
+    /// lines, level, combo and B2B are untouched by the wipe itself (the
+    /// lock that led here follows the normal rules).
+    StackWiped {
+        /// Logical tick (`Game::tick_count()`) the wipe happened on.
+        tick: u64,
+    },
 }

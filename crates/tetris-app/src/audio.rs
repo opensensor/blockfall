@@ -152,6 +152,10 @@ pub fn sfx_for_event(event: &GameEvent) -> Option<EventSfx> {
             label: "game-over",
             sfx: Sfx::GameOver,
         },
+        // T14 Zen stack wipe: kept silent — no fitting WAV asset exists and
+        // a wipe is deliberately calm (PRD "relax"). The arm keeps the match
+        // exhaustive.
+        StackWiped { .. } => return None,
     })
 }
 

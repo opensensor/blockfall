@@ -203,9 +203,11 @@ pub fn open_settings(state: &mut AppState) {
 /// PRD §"records" terminal matrix (T9): what a finished run is worth, keyed
 /// by `(mode, terminal reason)`. Anything the table omits records **nothing**
 /// — that is the whole Sprint/Dig top-out rule ("a top-out gives no
-/// result"), and unshipped modes (Zen, Bot Ladder, …) simply have no row
-/// yet. Survival's row (T13) is the lone top-out-that-records: the survived
-/// time *is* the result.
+/// result"), and unshipped modes (Bot Ladder, …) simply have no row yet.
+/// Survival's row (T13) is the lone top-out-that-records: the survived time
+/// *is* the result. Zen (T14) is shipped with no row on purpose: a
+/// `WipeAndContinue` run never terminates, so its only record is the
+/// continuous `LifetimeLines` accumulator, never this matrix.
 #[must_use]
 pub fn terminal_record(
     id: ModeId,
@@ -1582,10 +1584,22 @@ mod tests {
             terminal_record(ModeId::Survival, FinishReason::TimeUp, &snapshot, 10),
             None
         );
-        // Zen and the other unshipped modes record nothing until their own
-        // rows land.
+        // Zen (T14, shipped) intentionally has **no row**: wipe-on-block-out
+        // means it never reaches a terminal state, and its record is the
+        // continuous `LifetimeLines` accumulator folded by the bridge, not
+        // a terminal fold. The other unshipped modes record nothing until
+        // their own rows land.
         assert_eq!(
             terminal_record(ModeId::Zen, FinishReason::TimeUp, &snapshot, 10),
+            None
+        );
+        assert_eq!(
+            terminal_record(ModeId::Zen, FinishReason::TopOut, &snapshot, 10),
+            None,
+            "Zen writes no BestScore/BestTime — the matrix keeps no Zen row"
+        );
+        assert_eq!(
+            terminal_record(ModeId::Zen, FinishReason::GoalReached, &snapshot, 10),
             None
         );
     }
@@ -1942,6 +1956,46 @@ mod tests {
         click_button_under(&mut app, pause_root, |world, e| {
             world.get::<QuitToTitleButton>(e).is_some()
         });
+        assert_eq!(app_state(&app), AppState::Title);
+        assert_eq!(*app.world().resource::<SimPaused>(), SimPaused(false));
+    }
+
+    /// T14: a Zen run has **no terminal** (a block-out wipes the stack and
+    /// continues), so pause → "Quit to title" is its only exit — and it must
+    /// behave exactly like every other mode's pause exit: no GameOver flip,
+    /// the sim released on the way out.
+    #[test]
+    fn zen_never_ends_and_pause_quit_returns_to_title() {
+        let mut app = menu_test_app();
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.start_mode(7, ModeId::Zen);
+        }
+        set_state(&mut app, AppState::Playing);
+
+        // Pile pieces until an `End`-mode run would have blocked out long
+        // ago (see `force_game_over`): Zen wipes instead — `Playing` forever.
+        for _ in 0..600 {
+            app.world_mut()
+                .resource_mut::<crate::core_bridge::PendingActions>()
+                .push(tetris_core::actions::Action::HardDrop);
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+        assert_eq!(app_state(&app), AppState::Playing, "Zen never tops out");
+        {
+            let core = app.world().non_send::<GameCore>();
+            assert!(core.game.finished_reason().is_none());
+            assert!(!core.game.snapshot().game_over);
+        }
+
+        // Exit path: pause → "Quit to title".
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app_state(&app), AppState::Paused);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<PauseRoot>(e).is_some(),
+            |world, e| world.get::<QuitToTitleButton>(e).is_some(),
+        );
         assert_eq!(app_state(&app), AppState::Title);
         assert_eq!(*app.world().resource::<SimPaused>(), SimPaused(false));
     }

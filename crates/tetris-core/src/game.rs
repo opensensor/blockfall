@@ -6,7 +6,9 @@
 //! injects one discrete player action in the same frame. Both return the
 //! [`GameEvent`]s the transition produced (empty when nothing observable
 //! happened). Block-out at spawn ends the game; afterwards every call is a
-//! no-op returning no events.
+//! no-op returning no events — except under
+//! [`BlockOutBehavior::WipeAndContinue`](crate::mode::BlockOutBehavior)
+//! (Zen, T14), where a block-out wipes the stack and play continues.
 //!
 //! T-spin bookkeeping per T7: `last_action_was_rotation` is set by a
 //! successful rotation and cleared by any successful player move/drop;
@@ -23,7 +25,7 @@ use crate::event::GameEvent;
 use crate::gravity;
 use crate::hold::HoldSlot;
 use crate::lock::LockTimer;
-use crate::mode::{FinishReason, GarbageFeed, Goal, ModeConfig};
+use crate::mode::{BlockOutBehavior, FinishReason, GarbageFeed, Goal, ModeConfig};
 use crate::piece::{spawn_state, Piece, PieceState};
 use crate::prng::Rng;
 use crate::score::ScoreState;
@@ -399,20 +401,44 @@ impl Game {
         self.board.collides(&down)
     }
 
-    /// Place `piece` at its spawn state; block-out ends the game instead.
-    /// Re-arms lock timer, gravity counter and T-spin history. The hold flag
-    /// is *not* cleared here: a hold-swap keeps it armed for the swapped-in
-    /// piece; only the lock path ([`Game::lock_and_spawn`]) re-arms it.
+    /// Place `piece` at its spawn state. Re-arms lock timer, gravity counter
+    /// and T-spin history. The hold flag is *not* cleared here: a hold-swap
+    /// keeps it armed for the swapped-in piece; only the lock path
+    /// ([`Game::lock_and_spawn`]) re-arms it.
     ///
-    /// `BlockOutBehavior::WipeAndContinue` is plumbed through `config` but
-    /// behaves like `End` until T14 wires the Zen wipe here.
+    /// On a spawn collision the config's [`BlockOutBehavior`] decides
+    /// (T14 wired `WipeAndContinue`):
+    /// - [`BlockOutBehavior::End`]: block-out — `active` cleared,
+    ///   `game_over` set, `finished == TopOut`, `GameEvent::GameOver`
+    ///   emitted (unchanged Marathon behavior).
+    /// - [`BlockOutBehavior::WipeAndContinue`] (Zen): the **whole stack** is
+    ///   wiped (owner decision — not just the rows above the piece's
+    ///   clearance), any pending feed garbage is reset defensively (the Zen
+    ///   catalogue carries no feed), and the colliding piece is re-spawned
+    ///   at its spawn state — a spawn state always fits an empty board.
+    ///   `GameEvent::StackWiped` is emitted immediately before the
+    ///   re-spawn's `PieceSpawned`. `game_over`/`finished` stay unset and
+    ///   score/lines/level **and** combo/B2B keep their values: the wipe is
+    ///   not a lock, so it never scores, never clears (no `LineCleared` /
+    ///   `PerfectClear`), and never resets chains.
     fn spawn(&mut self, piece: Piece, ev: &mut Vec<GameEvent>) {
         self.lock_timer = LockTimer::new();
         self.gravity_elapsed = 0;
         self.last_action_was_rotation = false;
         self.last_kick_index = 0;
         let st = spawn_state(piece);
-        if self.board.collides(&st) {
+        if self.board.collides(&st) && self.config.on_block_out == BlockOutBehavior::WipeAndContinue
+        {
+            // Zen wipe (T14): clear everything, keep every counter, and
+            // re-spawn the blocked piece — it always fits a cleared board.
+            self.board = Board::new();
+            if let Some(feed) = self.feed.as_mut() {
+                feed.pending = 0;
+            }
+            ev.push(GameEvent::StackWiped { tick: self.ticks });
+            self.active = Some(st);
+            ev.push(GameEvent::PieceSpawned { piece, state: st });
+        } else if self.board.collides(&st) {
             self.active = None;
             self.game_over = true;
             self.finished = Some(FinishReason::TopOut);
@@ -1035,24 +1061,262 @@ mod tests {
         assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
     }
 
-    #[test]
-    fn wipe_and_continue_plumbs_as_end_for_now() {
-        // T14 wires the actual wipe; until then the variant behaves like
-        // End so the plumbing is exercised here.
-        let config = ModeConfig {
+    // ------------------------------------------------------------------
+    // T14: Zen — wipe-and-continue block-out
+    // ------------------------------------------------------------------
+
+    /// Zen catalogue shape (the app's `modes::mode_config(Zen)` core twin):
+    /// fixed level 1, no goal, no clock, block-outs wipe the stack.
+    fn zen_config() -> ModeConfig {
+        ModeConfig {
+            start_level: 1,
+            levels_advance: false,
+            goal: None,
+            clock_ticks: None,
+            start_board: None,
             on_block_out: BlockOutBehavior::WipeAndContinue,
-            ..ModeConfig::default()
-        };
-        let mut g = Game::with_config(3, &config);
-        for r in 3..ROWS {
-            g.board.set(r, 4, Some(Piece::S));
-            g.board.set(r, 5, Some(Piece::S));
+            garbage_feed: None,
         }
-        g.active = Some(spawn_state(Piece::O));
+    }
+
+    /// Arm a guaranteed spawn collision for the *next* piece: every spawn
+    /// state includes cell `(1, 4)`, so a single settled cell there blocks
+    /// any dealt piece.
+    fn arm_spawn_collision(g: &mut Game) {
+        g.board.set(1, 4, Some(Piece::Z));
+    }
+
+    #[test]
+    fn t14_blockout_wipes_the_stack_and_play_continues() {
+        // Every spawn state covers cell (1, 4): the test's arming trick.
+        for piece in Piece::ALL {
+            let mut probe = Board::new();
+            probe.set(1, 4, Some(Piece::Z));
+            assert!(
+                probe.collides(&spawn_state(piece)),
+                "{piece:?} must collide with the armed spawn cell"
+            );
+        }
+
+        let mut g = Game::with_config(3, &zen_config());
+        arm_spawn_collision(&mut g);
         let ev = g.apply(Action::HardDrop);
-        assert!(ev.contains(&GameEvent::GameOver));
+        assert!(
+            !ev.contains(&GameEvent::GameOver),
+            "WipeAndContinue must never end the game: {ev:?}"
+        );
+        assert!(
+            !g.snapshot().game_over,
+            "Zen must never set the game_over flag"
+        );
+        assert_eq!(g.finished_reason(), None, "a wipe is not a terminal");
+
+        // Event order: StackWiped immediately before the re-spawn's
+        // PieceSpawned, and never a line-clear/PF for the wipe itself.
+        let wiped = ev
+            .iter()
+            .position(|e| matches!(e, GameEvent::StackWiped { .. }))
+            .expect("StackWiped emitted");
+        assert!(
+            matches!(ev.get(wiped + 1), Some(GameEvent::PieceSpawned { .. })),
+            "StackWiped directly precedes PieceSpawned: {ev:?}"
+        );
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, GameEvent::LineCleared { .. } | GameEvent::PerfectClear)),
+            "a wipe is not a line clear: {ev:?}"
+        );
+
+        let after = g.snapshot();
+        assert!(
+            after.board.is_empty(),
+            "the whole stack is wiped: {:?}",
+            after.board
+        );
+        assert!(after.active.is_some(), "the colliding piece re-spawns");
+        assert_eq!(after.active.unwrap().row, 0);
+
+        // Play continues: further actions and ticks behave normally.
+        let mut later = Vec::new();
+        for _ in 0..240 {
+            later.extend(g.apply(Action::HardDrop));
+            later.extend(g.tick());
+        }
+        assert!(!later.contains(&GameEvent::GameOver), "still no game over");
+        assert_eq!(g.finished_reason(), None);
+        assert!(g.snapshot().active.is_some());
+    }
+
+    #[test]
+    fn t14_wipe_keeps_score_lines_level_and_chains() {
+        // The hold path blocks the *next* spawn without any lock, so the
+        // wipe's "keeps all counters" rule is observed unpolluted by lock
+        // scoring. Combo/B2B decision (T14): the wipe keeps them as-is —
+        // chain resets belong to lock rules only.
+        let mut g = Game::with_config(3, &zen_config());
+        g.score.total = 4321;
+        g.score.b2b = true;
+        g.score.combo = 4;
+        g.lines = 37;
+        arm_spawn_collision(&mut g);
+        let ev = g.apply(Action::Hold);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, GameEvent::HoldPerformed { .. })),
+            "hold swap happened: {ev:?}"
+        );
+        assert!(
+            ev.iter().any(|e| matches!(e, GameEvent::StackWiped { .. })),
+            "the swapped-in piece blocked out and wiped: {ev:?}"
+        );
+        assert!(!ev.contains(&GameEvent::GameOver));
+        let s = g.snapshot();
+        assert_eq!(s.score, 4321, "wipe never scores or clears score");
+        assert_eq!(s.lines, 37, "wipe adds no lines");
+        assert_eq!(s.level, 1);
+        assert_eq!(s.combo, 3, "PRD combo = chain - 1, kept untouched");
+        assert!(s.b2b, "back-to-back is kept across a wipe");
+        assert!(s.board.is_empty());
+        assert!(!s.game_over);
+        assert_eq!(g.finished_reason(), None);
+    }
+
+    #[test]
+    fn t14_multiple_wipes_keep_the_game_alive() {
+        let mut g = Game::with_config(9, &zen_config());
+        let mut wipes = 0;
+        let mut events_all: Vec<GameEvent> = Vec::new();
+        for _ in 0..3 {
+            arm_spawn_collision(&mut g);
+            let ev = g.apply(Action::HardDrop);
+            wipes += ev
+                .iter()
+                .filter(|e| matches!(e, GameEvent::StackWiped { .. }))
+                .count();
+            assert!(!ev.contains(&GameEvent::GameOver));
+            events_all.extend(ev);
+            // Between wipes, normal play resumes: pieces lock again.
+            for _ in 0..30 {
+                events_all.extend(g.apply(Action::HardDrop));
+                events_all.extend(g.tick());
+            }
+            assert!(!g.snapshot().board.is_empty(), "play refilled the board");
+        }
+        assert_eq!(wipes, 3, "repeated wipes all fired");
+        assert!(!events_all.contains(&GameEvent::GameOver));
+        assert!(g.snapshot().active.is_some());
+        assert_eq!(g.finished_reason(), None);
+    }
+
+    #[test]
+    fn t14_tick_count_keeps_counting_through_wipes() {
+        let mut g = Game::with_config(5, &zen_config());
+        for _ in 0..10 {
+            assert_eq!(g.tick().len(), 0);
+        }
+        let before = g.tick_count();
+        assert_eq!(before, 10);
+        arm_spawn_collision(&mut g);
+        g.apply(Action::HardDrop);
+        // The wipe did not freeze anything: ticks keep advancing.
+        for i in 1..=20 {
+            g.tick();
+            assert_eq!(g.tick_count(), before + i);
+        }
+        assert_eq!(g.finished_reason(), None);
+    }
+
+    #[test]
+    fn t14_replay_determinism_across_wipes() {
+        let run = |seed: u64| {
+            let mut g = Game::with_config(seed, &zen_config());
+            let mut events = Vec::new();
+            let mut snaps = Vec::new();
+            for cycle in 0..4 {
+                for _ in 0..25 {
+                    events.extend(g.apply(Action::MoveLeft));
+                    events.extend(g.apply(Action::RotateCw));
+                    events.extend(g.apply(Action::SoftDrop));
+                    events.extend(g.tick());
+                    snaps.push(g.snapshot());
+                    events.extend(g.apply(Action::MoveRight));
+                    events.extend(g.apply(Action::HardDrop));
+                    snaps.push(g.snapshot());
+                }
+                if cycle % 2 == 1 {
+                    arm_spawn_collision(&mut g);
+                    events.extend(g.apply(Action::HardDrop));
+                    snaps.push(g.snapshot());
+                }
+            }
+            (events, snaps)
+        };
+        let (e1, s1) = run(4242);
+        let (e2, s2) = run(4242);
+        assert_eq!(e1, e2, "event streams must match across wipes");
+        assert_eq!(s1, s2, "snapshots must match across wipes");
+        assert!(
+            e1.iter()
+                .filter(|e| matches!(e, GameEvent::StackWiped { .. }))
+                .count()
+                >= 2,
+            "the scripted replay must actually wipe (twice)"
+        );
+    }
+
+    #[test]
+    fn t14_end_behavior_parity_same_script_ends_the_game() {
+        // The identical forced-block-out script under `End` (the Marathon
+        // default) must still terminate exactly as before: one GameOver,
+        // frozen game, board NOT wiped.
+        let mut g = Game::with_config(3, &ModeConfig::default());
+        arm_spawn_collision(&mut g);
+        let ev = g.apply(Action::HardDrop);
+        assert!(
+            ev.contains(&GameEvent::GameOver),
+            "End config keeps the block-out: {ev:?}"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, GameEvent::StackWiped { .. })),
+            "End never wipes: {ev:?}"
+        );
         assert!(g.snapshot().game_over);
         assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+        assert!(!g.snapshot().board.is_empty(), "End keeps the stack");
+        let ticks = g.tick_count();
+        for _ in 0..60 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+        }
+        assert_eq!(g.tick_count(), ticks, "frozen after block-out (End)");
+    }
+
+    #[test]
+    fn t14_wipe_resets_pending_feed_garbage_defensively() {
+        // WipeAndContinue + a feed is not a shipped combination (Zen has no
+        // feed); the wipe still clears the queue defensively. The hold path
+        // blocks the spawn without a lock, so no feed landing confuses the
+        // assertion.
+        let config = ModeConfig {
+            on_block_out: BlockOutBehavior::WipeAndContinue,
+            garbage_feed: Some(GarbageFeed::default()),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(11, &config);
+        for _ in 0..300 {
+            g.tick();
+            pin_airborne(&mut g);
+        }
+        assert_eq!(g.pending_garbage(), 1, "one row queued, none landed");
+        arm_spawn_collision(&mut g);
+        let ev = g.apply(Action::Hold);
+        assert!(
+            ev.iter().any(|e| matches!(e, GameEvent::StackWiped { .. })),
+            "hold re-spawn must block out and wipe: {ev:?}"
+        );
+        assert_eq!(g.pending_garbage(), 0, "the wipe reset the queue");
+        assert!(g.snapshot().board.is_empty());
+        assert!(!g.snapshot().game_over);
     }
 
     #[test]

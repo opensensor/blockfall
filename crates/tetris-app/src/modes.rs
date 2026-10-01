@@ -35,11 +35,12 @@ pub const DIG_GARBAGE_ROWS: usize = 10;
 
 /// Every mode the game knows about — the full ten-mode catalogue (T5).
 ///
-/// The four Release-1 solo modes are shipped; the rest carry placeholder or
-/// best-effort configs that their own tasks refine (see each
-/// [`mode_config`] arm). Versus campaigns/rules (BotLadder, DigLadder →
-/// DigDuel, Switch) never start through the solo bridge; their configs are
-/// unused there.
+/// The four Release-1 solo modes plus Survival (T13) and Zen (T14) are
+/// shipped; the rest carry placeholder or best-effort configs that their
+/// own tasks refine (T16 Bot Ladder, T17 Daily, T20 Dig Duel, T21
+/// Switch). Versus campaigns/rules (BotLadder, DigLadder → DigDuel,
+/// Switch) never start through the solo bridge; their configs are unused
+/// there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModeId {
     /// Endless marathon with the classic level curve (the legacy mode).
@@ -118,8 +119,10 @@ pub fn mode_config(id: ModeId) -> ModeConfig {
             garbage_feed: Some(GarbageFeed::default()),
             ..ModeConfig::default()
         },
-        // T14 refines the wipe behavior (until then `WipeAndContinue`
-        // behaves like `End` in the core) and adds the lifetime-lines HUD.
+        // Zen (T14 shipped): the core's `WipeAndContinue` block-out — a
+        // stack that blocks the spawn wipes everything and keeps playing;
+        // fixed level 1, no goal, no clock. The HUD rides the lifetime-lines
+        // counter (`Records::LifetimeLines`, keyed `records::ZEN`).
         ModeId::Zen => ModeConfig {
             start_level: 1,
             levels_advance: false,
@@ -169,7 +172,7 @@ pub fn description(id: ModeId) -> &'static str {
         ModeId::Ultra => "Six minutes. Highest score wins.",
         ModeId::Dig => "Dig through ten rows of buried garbage.",
         ModeId::Survival => "Outlast the ever-rising garbage feed.",
-        ModeId::Zen => "Relax: a top-out just wipes the stack.",
+        ModeId::Zen => "No goals, no game over: a top-out just wipes the stack.",
         ModeId::BotLadder => "Climb eight bots, each faster than the last.",
         ModeId::Daily => "One seeded mode per day. Everyone gets the same one.",
         ModeId::DigDuel => "Race a rival through the same garbage.",
@@ -177,15 +180,20 @@ pub fn description(id: ModeId) -> &'static str {
     }
 }
 
-/// `true` for the shipped modes (R1's four solo modes plus Survival, T13).
-/// Later tasks flip this for their own mode — the **only** catalogue edit
-/// they need, no new rows; the mode-select list filters `ModeId::ALL`
-/// through this flag.
+/// `true` for the shipped modes (R1's four solo modes plus Survival (T13)
+/// and Zen (T14)). Later tasks flip this for their own mode — the **only**
+/// catalogue edit they need, no new rows; the mode-select list filters
+/// `ModeId::ALL` through this flag.
 #[must_use]
 pub fn is_shipped(id: ModeId) -> bool {
     matches!(
         id,
-        ModeId::Marathon | ModeId::Sprint | ModeId::Ultra | ModeId::Dig | ModeId::Survival
+        ModeId::Marathon
+            | ModeId::Sprint
+            | ModeId::Ultra
+            | ModeId::Dig
+            | ModeId::Survival
+            | ModeId::Zen
     )
 }
 
@@ -265,9 +273,10 @@ mod tests {
     }
 
     /// The shipped set as of R2: the four Release-1 solo modes plus Survival
-    /// (T13). The mode-select screen (T7) filters `ModeId::ALL` through this
-    /// flag — shipping a mode is the **only** catalogue edit needed; the row
-    /// list stays data-driven (`screens_modes::rows_are_data_driven…`).
+    /// (T13) and Zen (T14). The mode-select screen (T7) filters `ModeId::ALL`
+    /// through this flag — shipping a mode is the **only** catalogue edit
+    /// needed; the row list stays data-driven
+    /// (`screens_modes::rows_are_data_driven…`).
     #[test]
     fn is_shipped_matches_the_shipped_set() {
         let shipped: Vec<ModeId> = ModeId::ALL
@@ -283,10 +292,10 @@ mod tests {
                 ModeId::Ultra,
                 ModeId::Dig,
                 ModeId::Survival,
+                ModeId::Zen,
             ]
         );
         for id in [
-            ModeId::Zen,
             ModeId::BotLadder,
             ModeId::Daily,
             ModeId::DigDuel,
@@ -340,6 +349,15 @@ mod tests {
             survival.levels_advance,
             "Survival uses marathon progression"
         );
+
+        // Zen (T14): relaxation rules — fixed level 1, no goal, no clock,
+        // and the core wipes the stack instead of ending on a block-out.
+        let zen = mode_config(ModeId::Zen);
+        assert_eq!(zen.on_block_out, BlockOutBehavior::WipeAndContinue);
+        assert_eq!(zen.goal, None);
+        assert_eq!(zen.clock_ticks, None);
+        assert_eq!(zen.start_level, 1);
+        assert!(!zen.levels_advance, "Zen stays at level 1");
 
         assert_eq!(mode_config(ModeId::Marathon), ModeConfig::default());
     }

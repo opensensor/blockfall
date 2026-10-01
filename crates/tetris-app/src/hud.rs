@@ -44,11 +44,13 @@ use tetris_core::game::GameSnapshot;
 use tetris_core::piece::{Piece, Rotation};
 use tetris_core::versus::Side;
 
-use crate::core_bridge::{GameCore, ModeHudInfo, VersusMatch};
+use crate::core_bridge::{CoreEvent, GameCore, ModeHudInfo, VersusMatch};
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::modes;
+use crate::records::{Record, Records};
 use crate::render::{self, GHOST_ALPHA, VISIBLE_ROWS};
 use crate::state::Settings;
+use tetris_core::event::GameEvent;
 
 /// Panel gap between the playfield edge and the panel, in cell units.
 const PANEL_GAP: f32 = 0.75;
@@ -149,6 +151,13 @@ pub enum HudTextSlot {
     /// [`ModeHudInfo::feed_pending`] / [`ModeHudInfo::feed_next_row_in`].
     /// Present only while a feed mode's [`Self::Clock`] is.
     Feed,
+    /// Zen lifetime lines (T14): `LIFETIME` + the all-time line total
+    /// (`Records::LifetimeLines`, updated on every Zen `LineCleared` by
+    /// [`zen_lifetime_lines_system`]; session lines are the normal `LINES`
+    /// stat). Present only while a Zen run is live (no goal/clock/feed, so
+    /// the slot shares the Survival feed meter's position — the two are
+    /// never visible together).
+    Lifetime,
     /// Big pre-roll `3`/`2`/`1` (= `ceil(countdown / 60)`), centered over
     /// the field. Present only while [`ModeHudInfo::countdown`] is nonzero;
     /// the clock and goal rows hide meanwhile.
@@ -179,8 +188,9 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
             HudTextSlot::Goal => Vec2::new(hw - 2.4 * c, deck_y),
             // T13: the feed meter takes the pause-hint line (never shown in
             // portrait), below the clock/goal deck row and clear of the
-            // field-centered 3-2-1.
-            HudTextSlot::Feed => Vec2::new(0.0, deck_y - 2.6 * c),
+            // field-centered 3-2-1. T14: the Zen lifetime counter takes the
+            // same line — the feed is never visible in Zen.
+            HudTextSlot::Feed | HudTextSlot::Lifetime => Vec2::new(0.0, deck_y - 2.6 * c),
             HudTextSlot::Countdown => {
                 Vec2::new(0.0, (anchor.field_top + anchor.field_bottom) * 0.5)
             }
@@ -196,14 +206,17 @@ pub fn hud_text_center(anchor: &HudAnchor, slot: HudTextSlot) -> Vec2 {
         // T8: clock/goal stack in the right panel below the next queue
         // (below even a 6-slot queue, above the window bottom); the 3-2-1
         // centers over the field. T13: the Survival feed meter stacks one
-        // row further down.
+        // row further down. T14: the Zen lifetime counter shares that row —
+        // Zen has no clock/goal/feed, so they never coexist.
         HudTextSlot::Clock => anchor.field_top - 18.5 * c,
         HudTextSlot::Goal => anchor.field_top - 21.0 * c,
-        HudTextSlot::Feed => anchor.field_top - 23.5 * c,
+        HudTextSlot::Feed | HudTextSlot::Lifetime => anchor.field_top - 23.5 * c,
         HudTextSlot::Countdown => (anchor.field_top + anchor.field_bottom) * 0.5,
     };
     let x = match slot {
-        HudTextSlot::Clock | HudTextSlot::Goal | HudTextSlot::Feed => anchor.right_panel_x,
+        HudTextSlot::Clock | HudTextSlot::Goal | HudTextSlot::Feed | HudTextSlot::Lifetime => {
+            anchor.right_panel_x
+        }
         HudTextSlot::Countdown => 0.0,
         _ => anchor.left_panel_x,
     };
@@ -300,8 +313,8 @@ pub struct HudText {
 pub struct HudFixture(pub Option<GameSnapshot>);
 
 /// Pooled text entities (combo/b2b come and go with snapshot flags; the T8
-/// clock/goal/countdown texts and the T13 feed meter come and go with
-/// `ModeHudInfo`).
+/// clock/goal/countdown texts, the T13 feed meter and the T14 Zen lifetime
+/// counter come and go with `ModeHudInfo`).
 #[derive(Resource, Default)]
 pub struct HudTextEntities {
     score: Option<Entity>,
@@ -313,6 +326,7 @@ pub struct HudTextEntities {
     clock: Option<Entity>,
     goal: Option<Entity>,
     feed: Option<Entity>,
+    lifetime: Option<Entity>,
     countdown: Option<Entity>,
 }
 
@@ -374,6 +388,7 @@ fn slot_entity(entities: &mut HudTextEntities, slot: HudTextSlot) -> &mut Option
         HudTextSlot::Clock => &mut entities.clock,
         HudTextSlot::Goal => &mut entities.goal,
         HudTextSlot::Feed => &mut entities.feed,
+        HudTextSlot::Lifetime => &mut entities.lifetime,
         HudTextSlot::Countdown => &mut entities.countdown,
     }
 }
@@ -393,6 +408,7 @@ fn slot_text(slot: HudTextSlot, snapshot: &GameSnapshot) -> Option<String> {
         | HudTextSlot::Clock
         | HudTextSlot::Goal
         | HudTextSlot::Feed
+        | HudTextSlot::Lifetime
         | HudTextSlot::Countdown => return None,
     };
     Some(text)
@@ -528,9 +544,9 @@ fn mode_slot_texts(
 }
 
 /// Score/level/lines always present; combo/b2b only while active; pause
-/// hint reflects the live pause chord; the mode clock/goal/feed/countdown
-/// rows follow [`ModeHudInfo`] (hidden for modes with no goal, clock or
-/// feed).
+/// hint reflects the live pause chord; the mode clock/goal/countdown rows
+/// follow [`ModeHudInfo`] (hidden for modes with no goal, clock or feed),
+/// and the Zen run adds the T14 lifetime-lines row from [`Records`].
 #[allow(clippy::too_many_arguments)]
 fn sync_hud_texts(
     mut commands: Commands,
@@ -538,6 +554,7 @@ fn sync_hud_texts(
     fixture: Option<Res<HudFixture>>,
     mode: Option<Res<ModeHudInfo>>,
     bindings: Option<Res<KeyBindings>>,
+    records: Option<Res<Records>>,
     windows: Query<&Window>,
     mut entities: ResMut<HudTextEntities>,
     mut texts: TextQuery,
@@ -562,6 +579,7 @@ fn sync_hud_texts(
         entities.clock,
         entities.goal,
         entities.feed,
+        entities.lifetime,
         entities.countdown,
     ]
     .into_iter()
@@ -614,14 +632,55 @@ fn sync_hud_texts(
     // back to the hidden-marathon default (read-only here, never mutated).
     let mode = mode.map(|info| *info).unwrap_or_default();
     let (clock, goal, countdown, feed) = mode_slot_texts(&mode);
+    // T14 Zen: session lines are the regular `LINES` stat; the lifetime
+    // total comes from `Records` (missing entry ⇒ 0). Zen has no goal/clock
+    // so the slot never clashes with clock/goal/feed.
+    let lifetime = if mode.mode_id == modes::ModeId::Zen && mode.countdown == 0 {
+        let total = records
+            .as_deref()
+            .and_then(|records| records.record_for(crate::records::ZEN))
+            .and_then(|record| match record {
+                Record::LifetimeLines { total } => Some(*total),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Some(format!("LIFETIME\n{total}"))
+    } else {
+        None
+    };
     for (slot, want) in [
         (HudTextSlot::Clock, clock),
         (HudTextSlot::Goal, goal),
         (HudTextSlot::Countdown, countdown),
         (HudTextSlot::Feed, feed),
+        (HudTextSlot::Lifetime, lifetime),
     ] {
         let slot_ref = slot_entity(&mut entities, slot);
         sync_text_slot(&mut commands, slot, want, slot_ref, &anchor, &mut texts);
+    }
+}
+
+/// Zen lifetime-lines bookkeeping (T14): every `LineCleared` seen during a
+/// Zen run folds into [`Records::add_lifetime_lines`] (saturating, keyed
+/// `records::ZEN`). Mutating [`Records`] dirties it for the existing
+/// debounced `records_flush_system` — no per-line disk writes, and the
+/// exit-flush catches a quit mid-debounce. Apps without `Records` or the
+/// bridge stay untouched; the reader is *drained in every mode* so its
+/// cursor never lags and never folds foreign clears into the Zen total.
+fn zen_lifetime_lines_system(
+    core: Option<NonSend<GameCore>>,
+    mut records: Option<ResMut<Records>>,
+    mut events: MessageReader<CoreEvent>,
+) {
+    let zen = core.is_some_and(|core| core.active_mode.id == modes::ModeId::Zen);
+    let mut lifetime = records.as_deref_mut();
+    for CoreEvent(event) in events.read() {
+        let GameEvent::LineCleared { lines } = event else {
+            continue;
+        };
+        if let (true, Some(lifetime)) = (zen, lifetime.as_deref_mut()) {
+            lifetime.add_lifetime_lines(*lines as u64);
+        }
     }
 }
 
@@ -1312,7 +1371,11 @@ impl Plugin for HudPlugin {
             .add_systems(
                 Update,
                 (
-                    (sync_hud_texts, sync_hud_previews).chain(),
+                    (
+                        zen_lifetime_lines_system,
+                        (sync_hud_texts, sync_hud_previews).chain(),
+                    )
+                        .chain(),
                     sync_versus_hud,
                     sync_solo_hud_visibility,
                 )
@@ -2333,5 +2396,191 @@ mod tests {
             "{feed:?} above the window bottom ({})",
             anchor.field_bottom
         );
+    }
+
+    /// Deterministic Zen line-clear driver: alternate hard drops into the
+    /// left and right walls. Seed 7 clears 4 lines within 240 drops without
+    /// ever ending the run (Zen wipes keep it alive).
+    fn drive_zen_clears(app: &mut App, seed: u64, frames: u32) {
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.start_mode(seed, modes::ModeId::Zen);
+        }
+        for i in 0..frames {
+            let actions: &[Action] = if i % 2 == 0 {
+                &[
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::HardDrop,
+                ]
+            } else {
+                &[
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::HardDrop,
+                ]
+            };
+            frame(app, actions);
+        }
+    }
+
+    fn lifetime_total(app: &App) -> Option<u64> {
+        app.world()
+            .resource::<Records>()
+            .record_for(crate::records::ZEN)
+            .and_then(|record| match record {
+                Record::LifetimeLines { total } => Some(*total),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn zen_line_clears_accumulate_lifetime_and_hud_shows_both() {
+        let mut app = hud_app(0xC0FFEE);
+        app.init_resource::<Records>();
+        drive_zen_clears(&mut app, 7, 240);
+        let snapshot = snapshot(&app);
+
+        // Zen never ends: the run that cleared lines is still live.
+        assert_eq!(snapshot.lines, 4, "deterministic scripted clears");
+        assert!(!snapshot.game_over, "Zen must never game over");
+        assert_eq!(
+            *app.world().resource::<AppState>(),
+            AppState::Playing,
+            "the bridge never flips a wiping Zen run"
+        );
+
+        // Lifetime folded exactly once per cleared line.
+        assert_eq!(lifetime_total(&app), Some(4));
+
+        // HUD: session lines (left panel) + lifetime total (right panel).
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Lines),
+            Some(format!("LINES\n{}", snapshot.lines))
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Lifetime),
+            Some("LIFETIME\n4".to_string())
+        );
+    }
+
+    #[test]
+    fn marathon_clears_never_touch_the_zen_lifetime() {
+        let mut app = hud_app(0xC0FFEE);
+        app.init_resource::<Records>();
+        // Same seed/driver but the default (Marathon) config: its line
+        // clears must not fold into the Zen counter.
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.restart_with(7);
+        }
+        for i in 0..240u32 {
+            let actions: &[Action] = if i % 2 == 0 {
+                &[
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::MoveLeft,
+                    Action::HardDrop,
+                ]
+            } else {
+                &[
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::MoveRight,
+                    Action::HardDrop,
+                ]
+            };
+            frame(&mut app, actions);
+        }
+        // Marathon clears a line with this seed before its top-out.
+        assert_eq!(snapshot(&app).lines, 1, "driver must clear lines");
+        assert_eq!(
+            lifetime_total(&app),
+            None,
+            "no Zen counter without Zen play"
+        );
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Lifetime),
+            None,
+            "the lifetime slot is Zen-only"
+        );
+    }
+
+    #[test]
+    fn zen_hud_starts_at_zero_lifetime_before_any_record() {
+        let mut app = hud_app(1);
+        app.init_resource::<Records>();
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.start_mode(1, modes::ModeId::Zen);
+        }
+        frame(&mut app, &[]);
+        assert_eq!(
+            text_of(&mut app, HudTextSlot::Lifetime),
+            Some("LIFETIME\n0".to_string())
+        );
+    }
+
+    /// Full app-exit round trip: Zen clears → `AppExit` → the records
+    /// exit-flush persists them → a fresh `Records::load` of the isolated
+    /// config dir shows the lifetime total (PRD: lifetime lines survive
+    /// sessions; the debounced writer keeps per-line cost off the disk).
+    #[test]
+    fn zen_lifetime_survives_app_exit_flush() {
+        let _env = crate::settings_persist::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "tetris-t14-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var(crate::settings_persist::CONFIG_DIR_ENV, &dir);
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(WindowPlugin {
+            primary_window: Some(Window {
+                title: "tetris T14 zen exit".into(),
+                resolution: (1280, 720).into(),
+                resizable: true,
+                visible: false,
+                ..default()
+            }),
+            ..default()
+        });
+        app.add_plugins((CoreBridgePlugin, crate::records::RecordsPlugin, HudPlugin));
+        app.insert_non_send(GameCore::new(7));
+        app.init_resource::<AppState>();
+        app.init_resource::<Settings>();
+        app.update(); // Startup: records load (empty dir, never writes)
+
+        drive_zen_clears(&mut app, 7, 240);
+        let lines = snapshot(&app).lines;
+        assert_eq!(lines, 4, "deterministic scripted clears");
+
+        // App exit: the Last-schedule exit flush persists the dirty Records.
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+
+        let loaded = crate::records::load_from(&dir);
+        assert_eq!(
+            loaded.record_for(crate::records::ZEN),
+            Some(&Record::LifetimeLines { total: 4 }),
+            "lifetime lines survive the app-exit flush"
+        );
+
+        std::env::remove_var(crate::settings_persist::CONFIG_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
