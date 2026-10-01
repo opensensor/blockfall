@@ -72,4 +72,21 @@ pub enum GameEvent {
     /// Block-out at spawn: the game is over; all further `tick`/`apply`
     /// calls are no-ops. Emitted exactly once per game.
     GameOver,
+    /// The mode's goal ([`crate::mode::Goal`]) was met at `tick`: the game
+    /// freezes exactly like a block-out, all later `tick`/`apply` calls are
+    /// no-ops. Emitted exactly once per game. Unlike `GameOver` this is a
+    /// *win*: the snapshot's `game_over` flag stays `false`; the terminal
+    /// reason lives in `Game::finished_reason()`.
+    GoalReached {
+        /// Logical tick (`Game::tick_count()`) the game froze on.
+        tick: u64,
+    },
+    /// The mode's tick clock budget was reached during the `tick()` that
+    /// emitted this event: the game freezes exactly like a block-out and all
+    /// later `tick`/`apply` calls are no-ops. Emitted exactly once per game;
+    /// the snapshot's `game_over` flag stays `false`.
+    TimeUp {
+        /// Logical tick the clock expired on (`== clock_ticks`).
+        tick: u64,
+    },
 }

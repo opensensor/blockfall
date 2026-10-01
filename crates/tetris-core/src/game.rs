@@ -23,6 +23,7 @@ use crate::event::GameEvent;
 use crate::gravity;
 use crate::hold::HoldSlot;
 use crate::lock::LockTimer;
+use crate::mode::{FinishReason, Goal, ModeConfig};
 use crate::piece::{spawn_state, Piece, PieceState};
 use crate::score::ScoreState;
 use crate::srs::{self, RotateDir};
@@ -38,7 +39,8 @@ pub const NEXT_PREVIEW: usize = 5;
 pub struct GameSnapshot {
     /// Settled cells.
     pub board: Board,
-    /// Active piece placement (`None` only after `game_over`).
+    /// Active piece placement (`None` only after the game froze via
+    /// `game_over` or `GoalReached`; a `TimeUp` freeze keeps the piece).
     pub active: Option<PieceState>,
     /// Ghost landing row for the active piece (`None` with no active piece).
     pub ghost_row: Option<i32>,
@@ -79,25 +81,50 @@ pub struct Game {
     last_action_was_rotation: bool,
     last_kick_index: u8,
     game_over: bool,
+    /// Active rule set (T2); `new` runs [`ModeConfig::default`] (Marathon).
+    config: ModeConfig,
+    /// Logical frames consumed since the game went live; incremented once per
+    /// [`Game::tick`] while the game is live (never while frozen).
+    ticks: u64,
+    /// Terminal reason once the game froze via goal/clock; block-out sets it
+    /// to `TopOut` alongside `game_over`. Kept out of `GameSnapshot` (wire
+    /// stability); read through [`Game::finished_reason`].
+    finished: Option<FinishReason>,
 }
 
 impl Game {
-    /// Fresh game from `seed`: the first bag piece is already spawned.
+    /// Fresh Marathon game from `seed`: the first bag piece is already
+    /// spawned. Identical to `with_config(seed, &ModeConfig::default())`.
     pub fn new(seed: u64) -> Self {
+        Self::with_config(seed, &ModeConfig::default())
+    }
+
+    /// Fresh game from `seed` under `config`: the start board (if any) is
+    /// installed, `level` starts at `start_level` (gravity applies from
+    /// tick 0) and goal/clock/level-curve rules follow the config. The first
+    /// piece is already spawned, exactly like [`Game::new`].
+    pub fn with_config(seed: u64, config: &ModeConfig) -> Self {
+        let board = match config.start_board {
+            Some(start) => start.build(seed),
+            None => Board::new(),
+        };
         let mut g = Self {
-            board: Board::new(),
+            board,
             bag: Bag::new(seed),
             active: None,
             hold: HoldSlot::new(),
             lock_timer: LockTimer::new(),
             score: ScoreState::new(),
             lines: 0,
-            level: 1,
+            level: config.start_level.max(1),
             gravity_elapsed: 0,
             pending_drop: 0,
             last_action_was_rotation: false,
             last_kick_index: 0,
             game_over: false,
+            config: config.clone(),
+            ticks: 0,
+            finished: None,
         };
         let first = g.bag.next();
         g.spawn(first, &mut Vec::new());
@@ -105,12 +132,15 @@ impl Game {
     }
 
     /// Advance one logical frame (60 Hz): gravity, then lock-delay bookkeeping.
-    /// Emits at most one lock (+ its events) per frame.
+    /// Emits at most one lock (+ its events) per frame. Once the game is
+    /// frozen (top-out, goal or clock) every call is a no-op returning no
+    /// events, and the tick clock stops.
     pub fn tick(&mut self) -> Vec<GameEvent> {
         let mut ev = Vec::new();
-        if self.game_over {
+        if self.finished.is_some() {
             return ev;
         }
+        self.ticks += 1;
         self.gravity_elapsed += 1;
         if self.gravity_elapsed >= gravity::interval_for(self.level) {
             self.gravity_elapsed = 0;
@@ -131,6 +161,16 @@ impl Game {
         if self.lock_timer.tick() {
             self.lock_and_spawn(&mut ev);
         }
+        // Clock expiry wins only if this same frame did not already finish
+        // the game (top-out or goal take precedence).
+        if self.finished.is_none() {
+            if let Some(limit) = self.config.clock_ticks {
+                if self.ticks >= limit {
+                    self.finished = Some(FinishReason::TimeUp);
+                    ev.push(GameEvent::TimeUp { tick: self.ticks });
+                }
+            }
+        }
         ev
     }
 
@@ -139,7 +179,7 @@ impl Game {
     /// call, as does the lock-delay force-lock after 15 resets (T6).
     pub fn apply(&mut self, action: Action) -> Vec<GameEvent> {
         let mut ev = Vec::new();
-        if self.game_over {
+        if self.finished.is_some() {
             return ev;
         }
         let Some(active) = self.active else {
@@ -245,6 +285,29 @@ impl Game {
         self.bag.peek(n.min(6))
     }
 
+    /// Logical frames consumed while the game was live — one per effective
+    /// [`Game::tick`] call (T2). Stays constant once the game is frozen.
+    pub fn tick_count(&self) -> u64 {
+        self.ticks
+    }
+
+    /// `Some` once the game is frozen, naming *why* (T2). `TopOut` always
+    /// coincides with the snapshot's `game_over` flag; `GoalReached` and
+    /// `TimeUp` freeze the game with `game_over == false` (wire stability:
+    /// this getter, not the snapshot, carries the terminal reason).
+    pub fn finished_reason(&self) -> Option<FinishReason> {
+        self.finished
+    }
+
+    /// Rows of the settled stack that still contain at least one
+    /// [`Piece::Garbage`] cell (T2; Dig metric, used by `Goal::GarbageCleared`
+    /// and the T13 HUD).
+    pub fn garbage_rows_left(&self) -> usize {
+        (0..board::ROWS)
+            .filter(|&r| (0..board::COLS).any(|c| self.board.get(r, c) == Some(Piece::Garbage)))
+            .count()
+    }
+
     /// T24 versus contract exception (crate-internal only; not part of the
     /// frozen public `Game` API): replace the settled stack with `board`
     /// after [`crate::versus`] has pushed garbage rows underneath it.
@@ -259,6 +322,7 @@ impl Game {
         if top_out || overlap {
             self.active = None;
             self.game_over = true;
+            self.finished = Some(FinishReason::TopOut);
             return false;
         }
         true
@@ -274,6 +338,9 @@ impl Game {
     /// Re-arms lock timer, gravity counter and T-spin history. The hold flag
     /// is *not* cleared here: a hold-swap keeps it armed for the swapped-in
     /// piece; only the lock path ([`Game::lock_and_spawn`]) re-arms it.
+    ///
+    /// `BlockOutBehavior::WipeAndContinue` is plumbed through `config` but
+    /// behaves like `End` until T14 wires the Zen wipe here.
     fn spawn(&mut self, piece: Piece, ev: &mut Vec<GameEvent>) {
         self.lock_timer = LockTimer::new();
         self.gravity_elapsed = 0;
@@ -283,6 +350,7 @@ impl Game {
         if self.board.collides(&st) {
             self.active = None;
             self.game_over = true;
+            self.finished = Some(FinishReason::TopOut);
             ev.push(GameEvent::GameOver);
         } else {
             self.active = Some(st);
@@ -332,10 +400,25 @@ impl Game {
             ev.push(GameEvent::PerfectClear);
         }
         self.lines += lines as u32;
-        let level = gravity::level_for(self.lines);
-        if level > self.level {
-            self.level = level;
-            ev.push(GameEvent::LevelUp { level });
+        if self.config.levels_advance {
+            let level = gravity::level_for(self.lines);
+            if level > self.level {
+                self.level = level;
+                ev.push(GameEvent::LevelUp { level });
+            }
+        }
+        // Terminal goal: evaluated after this lock's line clear (T2/T3).
+        // Freezes like game-over — no next piece spawns.
+        if let Some(goal) = self.config.goal {
+            let met = match goal {
+                Goal::Lines(n) => self.lines >= n,
+                Goal::GarbageCleared => self.garbage_rows_left() == 0,
+            };
+            if met {
+                self.finished = Some(FinishReason::GoalReached);
+                ev.push(GameEvent::GoalReached { tick: self.ticks });
+                return;
+            }
         }
         let next = self.bag.next();
         self.hold.end_piece();
@@ -347,6 +430,7 @@ impl Game {
 mod tests {
     use super::*;
     use crate::board::{COLS, ROWS};
+    use crate::mode::BlockOutBehavior;
     use crate::piece::Rotation;
 
     fn state(piece: Piece, rot: Rotation, row: i32, col: i32) -> PieceState {
@@ -637,5 +721,344 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e, GameEvent::PieceLocked { .. })));
+    }
+
+    // ------------------------------------------------------------------
+    // T2: mode config, tick clock, terminal semantics
+    // ------------------------------------------------------------------
+
+    /// Scripted play log used by the config-comparison tests: exercises
+    /// every action variant plus gravity ticks for many pieces.
+    fn scripted_log(
+        g: &mut Game,
+        out_events: &mut Vec<GameEvent>,
+        out_snaps: &mut Vec<GameSnapshot>,
+    ) {
+        for piece_idx in 0..12u64 {
+            if piece_idx % 4 == 0 {
+                out_events.extend(g.apply(Action::Hold));
+            }
+            out_events.extend(g.apply(Action::RotateCw));
+            for _ in 0..(piece_idx % 5) {
+                out_events.extend(g.apply(Action::MoveLeft));
+            }
+            out_events.extend(g.apply(Action::SoftDrop));
+            out_events.extend(g.apply(Action::HardDrop));
+            for _ in 0..7 {
+                out_events.extend(g.tick());
+            }
+            out_snaps.push(g.snapshot());
+        }
+    }
+
+    #[test]
+    fn default_config_is_bit_identical_to_new() {
+        for seed in [1u64, 31337, 20261001] {
+            let mut a = Game::new(seed);
+            let mut b = Game::with_config(seed, &ModeConfig::default());
+            let (mut ea, mut eb) = (Vec::new(), Vec::new());
+            let (mut sa, mut sb) = (Vec::new(), Vec::new());
+            scripted_log(&mut a, &mut ea, &mut sa);
+            scripted_log(&mut b, &mut eb, &mut sb);
+            assert_eq!(ea, eb, "seed {seed}: default config event stream diverged");
+            assert_eq!(sa, sb, "seed {seed}: default config snapshots diverged");
+            // Same-seed default games serialize byte-identically.
+            for (x, y) in sa.iter().zip(sb.iter()) {
+                assert_eq!(
+                    bincode::serialize(x).unwrap(),
+                    bincode::serialize(y).unwrap()
+                );
+            }
+            assert_eq!(a.tick_count(), b.tick_count());
+            assert_eq!(a.finished_reason(), b.finished_reason());
+        }
+    }
+
+    #[test]
+    fn tick_count_counts_ticks() {
+        let mut g = Game::new(1);
+        assert_eq!(g.tick_count(), 0);
+        for i in 1..=50 {
+            g.tick();
+            assert_eq!(g.tick_count(), i);
+        }
+    }
+
+    #[test]
+    fn fixed_level_config_never_emits_levelup() {
+        let config = ModeConfig {
+            levels_advance: false,
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(31337, &config);
+        let mut events = Vec::new();
+        // Three forced tetrises = 12 lines; Marathon would be at level 2+.
+        for _ in 0..3 {
+            g.board = Board::new();
+            for r in 18..=21 {
+                for c in 0..COLS - 1 {
+                    g.board.set(r, c, Some(Piece::Z));
+                }
+            }
+            g.active = Some(state(Piece::I, Rotation::Cw, 0, 7));
+            events.extend(g.apply(Action::HardDrop));
+        }
+        assert_eq!(g.snapshot().lines, 12);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::LevelUp { .. })),
+            "levels_advance=false must never emit LevelUp"
+        );
+        assert_eq!(g.snapshot().level, 1);
+    }
+
+    #[test]
+    fn fixed_start_level_pins_gravity() {
+        // levels_advance=false at level 5: gravity must be interval_for(5)
+        // = 12 ticks per row, from the very first tick, and never change
+        // even as lines clear.
+        let config = ModeConfig {
+            start_level: 5,
+            levels_advance: false,
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(42, &config);
+        assert_eq!(g.snapshot().level, 5);
+        let interval = gravity::interval_for(5);
+        let start_row = g.snapshot().active.unwrap().row;
+        for _ in 0..interval - 1 {
+            g.tick();
+            assert_eq!(g.snapshot().active.unwrap().row, start_row);
+        }
+        g.tick();
+        assert_eq!(g.snapshot().active.unwrap().row, start_row + 1);
+        assert_eq!(g.snapshot().level, 5);
+    }
+
+    #[test]
+    fn lines_goal_emits_goal_reached_once_and_freezes() {
+        let config = ModeConfig {
+            goal: Some(Goal::Lines(4)),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(7, &config);
+        // Build a 9-wide, 4-tall stack with the I-piece well open.
+        for r in 18..=21 {
+            for c in 0..COLS - 1 {
+                g.board.set(r, c, Some(Piece::Z));
+            }
+        }
+        g.active = Some(state(Piece::I, Rotation::Cw, 0, 7));
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev.contains(&GameEvent::LineCleared { lines: 4 }));
+        assert!(
+            ev.contains(&GameEvent::GoalReached {
+                tick: g.tick_count()
+            }),
+            "expected GoalReached in {ev:?}"
+        );
+        // Frozen: like game-over, every later call is a no-op.
+        assert_eq!(g.finished_reason(), Some(FinishReason::GoalReached));
+        let s = g.snapshot();
+        assert!(!s.game_over, "goal finish is not a top-out");
+        assert!(s.active.is_none());
+        for _ in 0..50 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+        }
+        // Exactly once, even across the freeze.
+        let mut count = 0;
+        let mut h = Game::with_config(7, &config);
+        for r in 18..=21 {
+            for c in 0..COLS - 1 {
+                h.board.set(r, c, Some(Piece::Z));
+            }
+        }
+        h.active = Some(state(Piece::I, Rotation::Cw, 0, 7));
+        count += h
+            .apply(Action::HardDrop)
+            .iter()
+            .filter(|e| matches!(e, GameEvent::GoalReached { .. }))
+            .count();
+        for _ in 0..200 {
+            count += h
+                .tick()
+                .iter()
+                .filter(|e| matches!(e, GameEvent::GoalReached { .. }))
+                .count();
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn clock_timeup_fires_at_exact_tick_without_pieces() {
+        let config = ModeConfig {
+            clock_ticks: Some(100),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(99, &config);
+        let mut events = Vec::new();
+        for _ in 0..99 {
+            events.extend(g.tick());
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, GameEvent::TimeUp { .. })),
+            "TimeUp fired before tick 100"
+        );
+        assert_eq!(g.finished_reason(), None);
+        events.extend(g.tick());
+        assert!(
+            events.contains(&GameEvent::TimeUp { tick: 100 }),
+            "expected TimeUp at tick 100, got tail {events:?}"
+        );
+        assert_eq!(g.tick_count(), 100);
+        assert_eq!(g.finished_reason(), Some(FinishReason::TimeUp));
+        // Zero pieces played: nothing was ever locked or cleared.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::PieceLocked { .. })),
+            "clock test must not lock pieces"
+        );
+        // Frozen after TimeUp.
+        assert!(!g.snapshot().game_over);
+        for _ in 0..300 {
+            assert!(g.tick().is_empty());
+        }
+        assert_eq!(g.tick_count(), 100);
+    }
+
+    #[test]
+    fn topout_records_topout_finish_reason() {
+        let mut g = Game::new(3);
+        assert_eq!(g.finished_reason(), None);
+        for r in 3..ROWS {
+            g.board.set(r, 4, Some(Piece::S));
+            g.board.set(r, 5, Some(Piece::S));
+        }
+        g.active = Some(spawn_state(Piece::O));
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev.contains(&GameEvent::GameOver));
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+    }
+
+    #[test]
+    fn wipe_and_continue_plumbs_as_end_for_now() {
+        // T14 wires the actual wipe; until then the variant behaves like
+        // End so the plumbing is exercised here.
+        let config = ModeConfig {
+            on_block_out: BlockOutBehavior::WipeAndContinue,
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(3, &config);
+        for r in 3..ROWS {
+            g.board.set(r, 4, Some(Piece::S));
+            g.board.set(r, 5, Some(Piece::S));
+        }
+        g.active = Some(spawn_state(Piece::O));
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev.contains(&GameEvent::GameOver));
+        assert!(g.snapshot().game_over);
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+    }
+
+    #[test]
+    fn garbage_rows_left_counts_garbage_rows() {
+        let mut g = Game::new(5);
+        assert_eq!(g.garbage_rows_left(), 0);
+        g.board.set(21, 0, Some(Piece::Garbage));
+        g.board.set(21, 1, Some(Piece::Garbage));
+        g.board.set(20, 4, Some(Piece::Garbage));
+        g.board.set(19, 9, Some(Piece::Z)); // real piece, must not count
+        assert_eq!(g.garbage_rows_left(), 2);
+        g.board.set(20, 4, None);
+        assert_eq!(g.garbage_rows_left(), 1);
+    }
+
+    #[test]
+    fn garbage_cleared_goal_fires_when_last_garbage_row_goes() {
+        let config = ModeConfig {
+            goal: Some(Goal::GarbageCleared),
+            ..ModeConfig::default()
+        };
+        // Not final: one garbage row survives the lock -> no goal yet.
+        let mut g = Game::with_config(8, &config);
+        g.board = Board::new();
+        g.board.set(15, 3, Some(Piece::Garbage));
+        g.board.set(21, 5, Some(Piece::Garbage));
+        for c in [0usize, 1, 2, 3, 4, 6, 7, 8, 9] {
+            g.board.set(21, c, Some(Piece::Z));
+        }
+        assert_eq!(g.garbage_rows_left(), 2);
+        g.active = Some(state(Piece::I, Rotation::Cw, 0, 3)); // cells in col 5
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev.contains(&GameEvent::LineCleared { lines: 1 }), "{ev:?}");
+        assert_eq!(g.garbage_rows_left(), 1);
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, GameEvent::GoalReached { .. })),
+            "goal must not fire while garbage remains: {ev:?}"
+        );
+        assert_eq!(g.finished_reason(), None);
+        assert!(g.snapshot().active.is_some(), "game still playable");
+
+        // Final: the last garbage row goes at this lock -> GoalReached.
+        let mut h = Game::with_config(8, &config);
+        h.board = Board::new();
+        h.board.set(21, 5, Some(Piece::Garbage));
+        for c in [0usize, 1, 2, 3, 4, 6, 7, 8, 9] {
+            h.board.set(21, c, Some(Piece::Z));
+        }
+        h.active = Some(state(Piece::I, Rotation::Cw, 0, 3));
+        let ev = h.apply(Action::HardDrop);
+        assert!(
+            ev.contains(&GameEvent::GoalReached {
+                tick: h.tick_count()
+            }),
+            "expected GoalReached, got {ev:?}"
+        );
+        assert_eq!(h.garbage_rows_left(), 0);
+        assert_eq!(h.finished_reason(), Some(FinishReason::GoalReached));
+        assert!(!h.snapshot().game_over);
+        for _ in 0..50 {
+            assert!(h.tick().is_empty());
+        }
+    }
+
+    #[test]
+    fn buried_start_board_plus_garbage_goal_wires_dig_shape() {
+        // Config-only smoke test of the Dig shape T3/T4 build on: a buried
+        // board starts live with the goal armed and no early terminal state.
+        let config = ModeConfig {
+            start_level: 1,
+            levels_advance: false,
+            goal: Some(Goal::GarbageCleared),
+            start_board: Some(crate::mode::StartBoard::BuriedGarbage { rows: 10 }),
+            ..ModeConfig::default()
+        };
+        let g = Game::with_config(3, &config);
+        assert_eq!(g.garbage_rows_left(), 10);
+        assert!(g.snapshot().active.is_some());
+        assert_eq!(g.finished_reason(), None);
+    }
+
+    #[test]
+    fn snapshot_bytes_identical_for_same_seed_default_games() {
+        let run = |seed: u64| {
+            let mut g = Game::new(seed);
+            let mut bytes = Vec::new();
+            for _ in 0..60 {
+                g.apply(Action::MoveLeft);
+                g.apply(Action::RotateCw);
+                g.apply(Action::HardDrop);
+                for _ in 0..10 {
+                    g.tick();
+                }
+                bytes.extend(bincode::serialize(&g.snapshot()).unwrap());
+            }
+            bytes
+        };
+        assert_eq!(run(12345), run(12345));
     }
 }
