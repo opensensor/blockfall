@@ -94,6 +94,7 @@ pub fn mode_config(id: ModeId) -> ModeConfig {
             clock_ticks: None,
             start_board: None,
             on_block_out: BlockOutBehavior::End,
+            ..ModeConfig::default()
         },
         ModeId::Ultra => ModeConfig {
             clock_ticks: Some(ULTRA_CLOCK_TICKS),
@@ -108,6 +109,7 @@ pub fn mode_config(id: ModeId) -> ModeConfig {
                 rows: DIG_GARBAGE_ROWS,
             }),
             on_block_out: BlockOutBehavior::End,
+            ..ModeConfig::default()
         },
         // Placeholder until T12 adds the `GarbageFeed` field: plays as plain
         // marathon progression. T13 refines it to feed + no goal + marathon
@@ -122,6 +124,7 @@ pub fn mode_config(id: ModeId) -> ModeConfig {
             clock_ticks: None,
             start_board: None,
             on_block_out: BlockOutBehavior::WipeAndContinue,
+            ..ModeConfig::default()
         },
         // Versus campaign: runs through `start_versus` (T16), never the solo
         // bridge; the config is unused.

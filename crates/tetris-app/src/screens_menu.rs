@@ -2999,6 +2999,7 @@ mod tests {
             clock_ticks: None,
             start_board: None,
             on_block_out: BlockOutBehavior::End,
+            ..ModeConfig::default()
         }
     }
 
