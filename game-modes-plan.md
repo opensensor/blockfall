@@ -513,9 +513,52 @@ T1 ──► T2 ──┬──────────────────�
   exists): label text formats ticks correctly (e.g. 9 835 → `2:43.91`;
   10 235 → `2:50.58` — 60 Hz truncation);
   marathon run shows no clock; ultra warning fired-once behavior.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `725b5b8` (`core_bridge/mod.rs`, `hud.rs`,
+  `audio.rs`). `ModeHudInfo` resource (the task's **single** new resource,
+  `init_resource` in `CoreBridgePlugin`): `{ mode_id, clock_ticks,
+  clock_limit, countdown, lines_left, garbage_left, pieces_placed, show_hud,
+  feed_pending, feed_next_row_in, swap_in }` — last three reserved `None`
+  (T13 feed / T21 swap); `show_hud = goal.is_some() || clock.is_some()` so
+  Marathon renders neither row. `mode_hud_refresh_system` (FixedUpdate,
+  **after** `core_bridge_system`) refreshes from `tick_count()`/
+  `garbage_rows_left()`/`Countdown` every step; `pieces_placed` counts
+  `PieceLocked` from `MessageReader<CoreEvent>`, reset by watching
+  `GameCore::steps == 0` (both start paths zero steps before the first step
+  and the system runs post-step, so the first playable frame reports 1 —
+  documented inline). HUD: three new `HudTextSlot`s (`Clock` = `TIME\nm:ss.hh`
+  via `modes::format_time_ticks`, count-down when `clock_limit` present;
+  `Goal` = `Lines left: N`+`Pieces: P` (Sprint) / `Garbage: N` (Dig) / absent
+  (Ultra); `Countdown` = big centered `ceil(n/60)`, clock/goal hidden while
+  pre-roll runs). Layout: landscape = right panel below the next queue
+  (below even a 6-slot queue, above window bottom); portrait = deck row outer
+  margins; 3-2-1 centered over the field in both — never overlapping.
+  Fixture pattern extended: tests write `ModeHudInfo` directly + run `Update`
+  only (bridge refresh lives in `FixedUpdate`, so fixtures are never
+  clobbered; `HudFixture` snapshot usage unchanged/back-compat). **Ultra
+  audio decision**: discovered shipped cues are all generated placeholder
+  blips (`assets/generate.py`); none reads as a warning and `GameOver`'s
+  440→110 Hz sweep would falsely signal run-end at T-10s → edge-detected
+  system on `ModeHudInfo` (remaining ≤ 600 crossing, Local-tracked, re-arms
+  on restart) fires `info!("ULTRA warning…")` + `SfxDirector::
+  note_edge_cue("ultra-warning")` counter; **manual_check**: swap in a real
+  warning WAV (`pending_sfx.push_back(…)`) when one ships. Gotchas: (1)
+  PROVEN at `c3e42ff` — adding ANY single resource entity (even a dummy, at
+  any init position, even lazily on first Update — all 10 positions probed)
+  flips the two `screens_menu` submenu-click canaries via `button_rects`/
+  `rect_of` first-match-by-iteration-order luck; fix lives in T7's
+  deterministic-helper commit (sorted `button_rects`, root-scoped
+  `rect_of_under` — verified green WITH my resource when combined in the
+  shared tree; my commit alone on `c3e42ff` leaves those two red until T7
+  lands — integration ordering, not T8 code). (2) Lazy first-Update resource
+  insertion additionally breaks net `esc_on_listening_clears_the_upnp_state`
+  — keep build-time `init_resource`. (3) 1 pre-roll tick (180) → display 3,
+  but post-pre-roll first playable frame renders `0:00.01` (tick 1), not
+  `0:00.00`. Verified: app 404/404 + workspace green with T7 tree helpers
+  (worktree-pinned evidence in T8 session report); clippy `-D warnings` +
+  fmt `--check` clean.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/mod.rs`,
+  `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/audio.rs`
 
 ### T9: Mode-aware result (game-over) screen
 - **depends_on**: [T5, T6, T8]
