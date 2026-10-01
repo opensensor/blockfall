@@ -1404,6 +1404,113 @@ mod tests {
         );
     }
 
+    /// T21: the local bridge swaps both sides' full states at the exact
+    /// match-clock boundary — `BoardSwapped` lands on step 60 with
+    /// `match_ticks == steps`, never earlier, and the warning precedes it
+    /// by `warning_ticks`. Boards, per-game scores and pending all travel
+    /// with the swap (compared via quantities stable across the boundary
+    /// frame's own tick).
+    #[test]
+    fn switch_match_swaps_both_sides_at_the_bridge_boundary() {
+        let mut app = test_app(0x5EED);
+        let rule = AttackRule::Switch {
+            swap_interval_ticks: 60,
+            warning_ticks: 12,
+        };
+        start_in_app(&mut app, rule, Controller::Human, Controller::Human);
+        // Pin the match seed (wall-clock start, same pattern as T15/T20).
+        app.world_mut().non_send_mut::<VersusMatch>().match_ = Match::new(0x5EED_0021, rule);
+
+        // Left scores one early lock to differentiate the two snapshots.
+        // Neither side locks again — the fresh pieces hover on gravity
+        // alone — so boards and scores stay stable until the swap.
+        push_side(&mut app, Side::Left, &[Action::HardDrop]);
+
+        let mut saw_warning = false;
+        for step in 0..59u64 {
+            fixed_step(&mut app);
+            for e in drained_versus(&mut app) {
+                if matches!(e.0, MatchEvent::SwapWarning { at_tick: 60 }) {
+                    saw_warning = true;
+                    assert_eq!(
+                        step, 47,
+                        "warning must arrive exactly warning_ticks before the boundary"
+                    );
+                }
+                assert!(
+                    !matches!(e.0, MatchEvent::BoardSwapped { .. }),
+                    "no swap before the boundary (step {step})"
+                );
+            }
+        }
+        assert!(saw_warning, "SwapWarning must reach the VersusEvent stream");
+
+        let before = versus(&app);
+        assert_eq!(before.match_ticks, 59);
+        assert!(before.left.score > 0 && before.right.score == 0);
+        fixed_step(&mut app);
+        let events = drained_versus(&mut app);
+        assert!(
+            events.contains(&VersusEvent(MatchEvent::BoardSwapped { tick: 60 })),
+            "the swap fires exactly on the boundary: {events:?}"
+        );
+        let after = versus(&app);
+        assert_eq!(after.swaps_done, 1);
+        assert_eq!(after.match_ticks, 60);
+        assert_eq!(after.right.board, before.left.board);
+        assert_eq!(after.left.board, before.right.board);
+        assert_eq!(after.right.score, before.left.score);
+        assert_eq!(after.left.score, before.right.score);
+        assert_eq!(after.pending, (before.pending.1, before.pending.0));
+    }
+
+    /// T21: a Switch bot-vs-bot match plays through (at least one swap
+    /// before the crown), every executed swap surfaces as a `VersusEvent`,
+    /// and the crowned loser is the *identity* whose slot topped out.
+    #[test]
+    fn switch_bot_vs_bot_match_swaps_and_crowns_a_winner() {
+        let mut app = test_app(42);
+        let rule = AttackRule::Switch {
+            swap_interval_ticks: 300,
+            warning_ticks: 60,
+        };
+        start_in_app(&mut app, rule, Controller::Bot, Controller::Bot);
+        app.world_mut().non_send_mut::<VersusMatch>().match_ = Match::new(0x5EED_0022, rule);
+
+        let mut swaps = 0u32;
+        let mut crowned = None;
+        for _ in 0..30_000 {
+            fixed_step(&mut app);
+            for e in drained_versus(&mut app) {
+                if matches!(e.0, MatchEvent::BoardSwapped { .. }) {
+                    swaps += 1;
+                }
+                if let MatchEvent::WinnerCrowned { side } = e.0 {
+                    crowned = Some(side);
+                }
+            }
+            if crowned.is_some() {
+                break;
+            }
+        }
+        let winner = crowned.expect("Switch bot-vs-bot must crown a winner in 30k steps");
+        assert_eq!(
+            *app.world().resource::<VersusWinner>(),
+            VersusWinner(Some(winner))
+        );
+        let snap = versus(&app);
+        assert!(swaps >= 1, "300-tick interval ⇒ at least one swap happened");
+        assert_eq!(
+            swaps, snap.swaps_done,
+            "every executed swap reaches the VersusEvent stream"
+        );
+        let dead = match winner {
+            Side::Left => snap.right.game_over,
+            Side::Right => snap.left.game_over,
+        };
+        assert!(dead, "the loser's slot topped out (identity rule)");
+    }
+
     #[test]
     fn harness_restarts_after_a_match_and_exits_after_two() {
         // Drive the harness logic directly (no env var): first crowned match

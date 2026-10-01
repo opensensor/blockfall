@@ -55,7 +55,8 @@
 //! ## 1 v 1 (T26)
 //!
 //! Title grows a "1 v 1" entry leading through a two-step submenu flow
-//! (rule: Garbage / Race / Dig, then opponent: Human / Bot) that launches a
+//! (rule: Garbage / Race / Dig / Switch, then opponent: Human / Bot) that
+//! launches a
 //! match
 //! via [`start_versus`]; the flow lives in the [`VersusFlow`] resource
 //! ([`VersusStage`]) with Back buttons *and* Escape walking it back. While
@@ -304,6 +305,13 @@ impl Default for TerminalResult {
     }
 }
 
+/// Default Switch-rule swap cadence (T21): every 30 s of match clock at
+/// the fixed 60 Hz step.
+pub const SWITCH_SWAP_INTERVAL_TICKS: u32 = 1_800;
+
+/// Default Switch-rule warning lead (T21): 3 s before every swap.
+pub const SWITCH_WARNING_TICKS: u32 = 180;
+
 /// Which step of the Title → 1v1 submenu flow is showing (T26). Versus has
 /// no [`AppState`] variant (it plays inside `Playing`), so the flow state is
 /// owned here.
@@ -312,7 +320,7 @@ pub enum VersusStage {
     /// Plain title menu.
     #[default]
     Title,
-    /// Pick the attack rule (Garbage / Race / Dig).
+    /// Pick the attack rule (Garbage / Race / Dig / Switch).
     Rules,
     /// Pick the P2 opponent (Human / Bot); launches on choice.
     Opponent,
@@ -529,7 +537,7 @@ pub struct QuitRequested(pub bool);
 #[derive(Component)]
 pub struct OneVOneButton;
 
-/// Root of the 1v1 rule submenu (Garbage / Race / Dig); visible in
+/// Root of the 1v1 rule submenu (Garbage / Race / Dig / Switch); visible in
 /// [`AppState::Title`] while [`VersusStage::Rules`] is active.
 #[derive(Component)]
 pub struct VersusRulesRoot;
@@ -550,6 +558,10 @@ pub struct RuleRaceButton;
 /// "Dig" (Dig Duel, T20) rule button in the rules submenu.
 #[derive(Component)]
 pub struct RuleDigButton;
+
+/// "Switch" (T21) rule button in the rules submenu.
+#[derive(Component)]
+pub struct RuleSwitchButton;
 
 /// "Human" opponent button: launches a local-human vs local-human match.
 #[derive(Component)]
@@ -896,6 +908,7 @@ type VersusClickQuery<'w, 's> = Query<
         Has<RuleGarbageButton>,
         Has<RuleRaceButton>,
         Has<RuleDigButton>,
+        Has<RuleSwitchButton>,
         Has<OpponentHumanButton>,
         Has<OpponentBotButton>,
         Has<VersusBackButton>,
@@ -933,8 +946,20 @@ fn versus_button_clicks(mut params: VersusClickParams) {
         .net
         .is_some_and(|net| net.status == NetStatus::InMatch);
 
-    for (_entity, interaction, one_v_one, garbage, race, dig, human, bot, back, rematch, menu) in
-        params.buttons.iter()
+    for (
+        _entity,
+        interaction,
+        one_v_one,
+        garbage,
+        race,
+        dig,
+        switch,
+        human,
+        bot,
+        back,
+        rematch,
+        menu,
+    ) in params.buttons.iter()
     {
         if *interaction != Interaction::Pressed {
             continue;
@@ -957,6 +982,12 @@ fn versus_button_clicks(mut params: VersusClickParams) {
                         params.flow.stage = VersusStage::Opponent;
                     } else if dig {
                         params.flow.rule = AttackRule::Dig;
+                        params.flow.stage = VersusStage::Opponent;
+                    } else if switch {
+                        params.flow.rule = AttackRule::Switch {
+                            swap_interval_ticks: SWITCH_SWAP_INTERVAL_TICKS,
+                            warning_ticks: SWITCH_WARNING_TICKS,
+                        };
                         params.flow.stage = VersusStage::Opponent;
                     } else if back {
                         versus_flow_back(&mut params.flow);
@@ -1484,6 +1515,7 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
             menu_button(root, "Garbage", RuleGarbageButton);
             menu_button(root, "Race", RuleRaceButton);
             menu_button(root, "Dig", RuleDigButton);
+            menu_button(root, "Switch", RuleSwitchButton);
             menu_button(root, "Back", VersusBackButton);
         },
     );
@@ -2359,6 +2391,10 @@ mod tests {
             click_button_under(app, rules_root, |world, e| {
                 world.get::<RuleRaceButton>(e).is_some()
             });
+        } else if rule == "switch" {
+            click_button_under(app, rules_root, |world, e| {
+                world.get::<RuleSwitchButton>(e).is_some()
+            });
         } else {
             click_button_under(app, rules_root, |world, e| {
                 world.get::<RuleDigButton>(e).is_some()
@@ -2442,6 +2478,34 @@ mod tests {
             versus.match_.left.snapshot().board,
             versus.match_.right.snapshot().board,
             "same hole columns on both boards"
+        );
+    }
+
+    /// T21: the rules step grows a fourth button; picking Switch launches
+    /// the local match on the default 30 s cadence (both seats supported).
+    #[test]
+    fn one_v_one_switch_flow_starts_a_switch_match() {
+        let mut app = menu_test_app();
+        click_1v1_path(&mut app, "switch", "human");
+        let (active, rule, p1, p2) = versus_state(&app);
+        assert!(active, "Switch flow starts a local versus match");
+        assert_eq!(
+            rule,
+            AttackRule::Switch {
+                swap_interval_ticks: SWITCH_SWAP_INTERVAL_TICKS,
+                warning_ticks: SWITCH_WARNING_TICKS,
+            },
+            "the picker uses the named 30 s / 3 s defaults"
+        );
+        assert_eq!(SWITCH_SWAP_INTERVAL_TICKS, 1_800, "30 s at 60 Hz");
+        assert_eq!(SWITCH_WARNING_TICKS, 180, "3 s lead");
+        assert_eq!(p1, Controller::Human, "P1 stays the local human");
+        assert_eq!(p2, Controller::Human);
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            flow(&app).stage,
+            VersusStage::Title,
+            "flow closed on launch"
         );
     }
 
@@ -2935,8 +2999,19 @@ mod tests {
         let one = rect_of_under(&mut app, "title", "1v1");
         // Title "Settings" y-range sits under the rules panel but inside no
         // submenu button — the pre-fix build opened Settings through the
-        // (invisible-under-title) submenu here.
+        // (invisible-under-title) submenu here. T21's fourth rule button
+        // pushed the rules panel down so its Back overlaps the upper half
+        // of the title Settings rect; probe the strip *below* Back (menu
+        // buttons are 36 px tall) — still the hidden title button, inside
+        // no visible submenu button.
         let title_settings = rect_of_under(&mut app, "title", "settings");
+        let rules_back = rect_of_under(&mut app, "rules", "back");
+        let click_through_probe = title_settings + Vec2::Y * 11.0;
+        assert!(
+            click_through_probe.y - rules_back.y > 18.0
+                && click_through_probe.y - title_settings.y < 18.0,
+            "T21 layout shifted: probe must clear the rules Back button"
+        );
         let garbage = rect_of_under(&mut app, "rules", "garbage");
         let bot = rect_of_under(&mut app, "opponent", "bot");
 
@@ -2953,7 +3028,7 @@ mod tests {
         // click at its center must be inert (this used to open Settings
         // through the panel, stranding the player with no way to configure
         // the match).
-        tap(&mut app, title_settings);
+        tap(&mut app, click_through_probe);
         assert_eq!(app_state(&app), AppState::Title, "no click-through");
         assert_eq!(flow(&app).stage, VersusStage::Rules);
         assert_eq!(app.world().non_send::<GameCore>().steps, 0);
@@ -2991,13 +3066,22 @@ mod tests {
         app.update();
 
         let one = rect_of_under(&mut app, "title", "1v1");
+        // Same T21 probe adjustment as the click-through regression test
+        // above: title Settings below the rules panel's Back button.
         let title_settings = rect_of_under(&mut app, "title", "settings");
+        let rules_back = rect_of_under(&mut app, "rules", "back");
+        let click_through_probe = title_settings + Vec2::Y * 11.0;
+        assert!(
+            click_through_probe.y - rules_back.y > 18.0
+                && click_through_probe.y - title_settings.y < 18.0,
+            "T21 layout shifted: probe must clear the rules Back button"
+        );
         let garbage = rect_of_under(&mut app, "rules", "garbage");
         let bot = rect_of_under(&mut app, "opponent", "bot");
 
         tap_fast(&mut app, one);
         assert_eq!(flow(&app).stage, VersusStage::Rules, "1v1 opens rules");
-        tap(&mut app, title_settings);
+        tap(&mut app, click_through_probe);
         assert_eq!(app_state(&app), AppState::Title, "no click-through");
         assert_eq!(flow(&app).stage, VersusStage::Rules);
         tap_fast(&mut app, garbage);

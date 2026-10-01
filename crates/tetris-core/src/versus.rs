@@ -43,6 +43,18 @@
 //!   top-out loses on the spot (opponent crowned). If both sides would zero
 //!   on the same bridge frame, the first-settled side wins (fixed
 //!   Left-then-Right settle order ⇒ symmetric on both peers).
+//! - [`AttackRule::Switch { .. }`] (T21): garbage attacks exactly like
+//!   [`AttackRule::Garbage`] (same send table and land path), plus every
+//!   `swap_interval_ticks` of the match clock the two sides' **entire game
+//!   states swap** — board, bag, hold, active piece and per-game counters —
+//!   together with their pending garbage (owner decision: queued batches
+//!   follow **the board** they were aimed at, not the side that queued
+//!   them). Sides stay *identities*: the player of a slot keeps playing it,
+//!   only the state travels, so a side that tops out on the board it just
+//!   inherited loses (opponent crowned, exactly as Garbage).
+//!   [`MatchEvent::SwapWarning`] fires `warning_ticks` before each swap;
+//!   both swap events come from [`Match::advance_match_clock`] — see there
+//!   for the exact ordering contract against lock settles.
 //! - Any top-out (block-out in normal play, or garbage overflow) hands the
 //!   win to the opponent, even if that opponent already finished. Once a
 //!   winner is set, [`Match::apply`] is a no-op returning an empty batch,
@@ -124,17 +136,30 @@ pub enum AttackRule {
     /// the outcome is fully deterministic; see
     /// `Match::new` and [`Match::settle`].
     Dig,
-    /// Switch scaffold (rule behavior lands in T21): garbage attacks plus
-    /// full board swaps every `swap_interval_ticks` of the match clock, with
-    /// [`MatchEvent::SwapWarning`] `warning_ticks` before each swap. Until
-    /// T21 implements it, this behaves like no-op/no-attack (see
-    /// [`Match::settle`]).
+    /// Switch (T21): garbage attacks exactly like [`AttackRule::Garbage`]
+    /// (shared send/land path), and every `swap_interval_ticks` of the match
+    /// clock the two sides' **entire game states swap** — board, bag, hold,
+    /// active piece, per-game counters — together with their pending
+    /// garbage, which follows **the board** it was aimed at (owner
+    /// decision). Sides stay identities: a slot that tops out loses even
+    /// while holding the opponent's old stack. [`MatchEvent::SwapWarning`]
+    /// precedes each [`MatchEvent::BoardSwapped`] by `warning_ticks`; the
+    /// swap executes inside [`Match::advance_match_clock`] (both sides
+    /// already ticked, next-frame inputs not yet applied).
     Switch {
         /// Match ticks between board swaps (T21; default 1 800).
         swap_interval_ticks: u32,
         /// Match ticks of warning ahead of a swap (T21; default 180).
         warning_ticks: u32,
     },
+}
+
+impl AttackRule {
+    /// Whether line clears queue garbage on the opponent under this rule
+    /// (the [`AttackRule::Garbage`] send table, reused by Switch).
+    fn garbage_attacks(&self) -> bool {
+        matches!(self, AttackRule::Garbage | AttackRule::Switch { .. })
+    }
 }
 
 impl Default for AttackRule {
@@ -214,14 +239,16 @@ pub enum MatchEvent {
         /// Winning side.
         side: Side,
     },
-    /// A Switch board swap is scheduled at match tick `at_tick` (T21
-    /// scaffold: emitted `warning_ticks` before [`MatchEvent::BoardSwapped`]).
+    /// A Switch board swap is scheduled at match tick `at_tick` (emitted by
+    /// [`Match::advance_match_clock`] exactly `warning_ticks` before
+    /// [`MatchEvent::BoardSwapped`]; Switch rule only).
     SwapWarning {
         /// Match tick at which the swap will happen.
         at_tick: u64,
     },
-    /// The two sides' entire game states swapped at match tick `tick`
-    /// (T21 scaffold; Switch rule only).
+    /// The two sides' entire game states swapped at match tick `tick`,
+    /// pending garbage included (T21; Switch rule only — see
+    /// [`AttackRule::Switch`] and [`Match::advance_match_clock`]).
     BoardSwapped {
         /// Match tick the swap executed on.
         tick: u64,
@@ -249,8 +276,8 @@ pub struct MatchSnapshot {
     /// [`Match::advance_match_clock`] (the Switch rule's swap schedule is
     /// expressed against this clock).
     pub match_ticks: u64,
-    /// Number of Switch board swaps already executed (T21 swap bookkeeping;
-    /// always 0 until T21 implements the Switch rule).
+    /// Number of Switch board swaps already executed (T21 swap
+    /// bookkeeping; 0 for every other rule).
     pub swaps_done: u32,
 }
 
@@ -272,8 +299,8 @@ pub struct Match {
     /// exclusively by [`Match::advance_match_clock`] (see there for the
     /// exact stepping contract both peers must follow).
     match_ticks: u64,
-    /// Number of Switch board swaps executed so far (T21 scaffold; stays 0
-    /// until T21 implements the swap logic).
+    /// Number of Switch board swaps executed so far (T21; 0 for every
+    /// other rule).
     swaps_done: u32,
     rng: Rng,
 }
@@ -345,18 +372,69 @@ impl Match {
     /// call-sequence logic: both peers run identical bridge code and step
     /// the mirror in lockstep, so `match_ticks` is the same value on both
     /// ends at every observable point and every Swap schedule derived from
-    /// it is deterministic. Returns match-level events emitted on this tick
-    /// boundary (always empty until T21 emits `SwapWarning`/`BoardSwapped`).
-    /// Like the rest of `Match`, a crowned match is frozen: after a winner
-    /// the clock stops advancing (both peers crown on the identical lockstep
-    /// step, so the gate is symmetric and the frozen match snapshot stays
-    /// byte-stable).
+    /// it is deterministic. Like the rest of `Match`, a crowned match is
+    /// frozen: after a winner the clock stops advancing (both peers crown
+    /// on the identical lockstep step, so the gate is symmetric and the
+    /// frozen match snapshot stays byte-stable) — and a frozen match can
+    /// therefore never reach or cross a swap boundary.
+    ///
+    /// Switch schedule (T21), evaluated against the post-increment tick `t`
+    /// (boundaries are `swap_interval_ticks, 2·swap_interval_ticks, …`; the
+    /// degenerate `swap_interval_ticks == 0` config stays inert):
+    /// - [`MatchEvent::SwapWarning { at_tick: boundary }`] at
+    ///   `boundary - warning_ticks` — i.e. exactly when `t + warning_ticks`
+    ///   hits the next boundary. A warning landing at tick 0 is never
+    ///   emitted (a warning of at least the whole interval simply first
+    ///   appears at the tick-`interval` boundary, riding that swap).
+    /// - The swap itself at `t == boundary`, **after** this frame's lock
+    ///   settles: the bridge applies actions and ticks both sides before
+    ///   calling this, so every garbage send/pending delivery of the
+    ///   boundary frame is already booked when `std::mem::swap` exchanges
+    ///   the two [`Game`]s (board, bag, hold, active piece, per-game
+    ///   counters — everything; the sides run identical marathon-default
+    ///   configs by construction, `Match::new` being the only `Game`
+    ///   factory) together with `pending`, so a queued batch keeps landing
+    ///   on **the board** it was aimed at after the swap, whichever slot
+    ///   that board ends up in. Next-frame inputs apply to the swapped
+    ///   states. `swaps_done` counts executed swaps; `Race`'s `finished`
+    ///   flags never move under Switch (no side ever finishes).
     pub fn advance_match_clock(&mut self) -> Vec<MatchEvent> {
         if self.winner.is_some() {
             return Vec::new();
         }
         self.match_ticks += 1;
-        Vec::new()
+        let AttackRule::Switch {
+            swap_interval_ticks,
+            warning_ticks,
+        } = self.rule
+        else {
+            return Vec::new();
+        };
+        if swap_interval_ticks == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let interval = swap_interval_ticks as u64;
+        let boundary = (self.swaps_done as u64 + 1) * interval;
+        // The warning for boundary `B = k · interval` is due at tick
+        // `B - warning_ticks` whenever that is at least 1; evaluating it as
+        // `t + warning_ticks = B` keeps that guard free and never warns
+        // twice per boundary. A long warning (≥ one interval) can ride an
+        // earlier swap tick — then `SwapWarning` (of the *next* boundary)
+        // and `BoardSwapped` (of this one) share one call.
+        let lead = self.match_ticks + warning_ticks as u64;
+        if lead >= interval && lead.is_multiple_of(interval) {
+            out.push(MatchEvent::SwapWarning { at_tick: lead });
+        }
+        if self.match_ticks == boundary {
+            std::mem::swap(&mut self.left, &mut self.right);
+            self.pending.swap(0, 1);
+            self.swaps_done += 1;
+            out.push(MatchEvent::BoardSwapped {
+                tick: self.match_ticks,
+            });
+        }
+        out
     }
 
     /// Apply one action for `side` to its game and run the versus rules:
@@ -421,7 +499,7 @@ impl Match {
         // the receiver's next locks instead of burying them instantly, so
         // even a huge burst stays playable.
         let i = side.index();
-        if self.rule == AttackRule::Garbage && locked && !top_out && self.pending[i] > 0 {
+        if self.rule.garbage_attacks() && locked && !top_out && self.pending[i] > 0 {
             let rows = self.pending[i].min(MAX_GARBAGE_PER_LAND);
             self.pending[i] -= rows;
             out.push(MatchEvent::GarbageReceived { side, lines: rows });
@@ -442,7 +520,9 @@ impl Match {
         }
 
         match self.rule {
-            AttackRule::Garbage => {
+            // Garbage and Switch share this send path verbatim (T21 reuses
+            // it, it is not a copy).
+            AttackRule::Garbage | AttackRule::Switch { .. } => {
                 if locked && cleared > 0 {
                     // Attack table: N lines (1..=4) send N; every clear
                     // beyond the first in the chain adds +1 (the snapshot
@@ -491,10 +571,6 @@ impl Match {
                     out.push(MatchEvent::WinnerCrowned { side });
                 }
             }
-            // Switch: rule behavior lands in T21. Until then a documented
-            // no-attack placeholder: locks clear and top out normally
-            // (handled above), but no swap bookkeeping happens here.
-            AttackRule::Switch { .. } => {}
         }
         out
     }
@@ -825,33 +901,416 @@ mod tests {
         assert_eq!(snap.swaps_done, 0, "no swap logic before T21");
     }
 
-    /// T19 scaffolding (Switch half): Switch is still a documented
-    /// no-attack placeholder — locks clear normally, but nothing queues,
-    /// swaps or crowns beyond the standard top-out path. (The Dig half
-    /// became the real Dig Duel rule in T20; see the dig tests below.)
+    // ----------------------------------------------------------------
+    // T21: Switch rule
+    // ----------------------------------------------------------------
+
+    /// The Switch rule under test with short interval/warning values so the
+    /// boundary arithmetic is cheap to drive.
+    fn switch(interval: u32, warning: u32) -> AttackRule {
+        AttackRule::Switch {
+            swap_interval_ticks: interval,
+            warning_ticks: warning,
+        }
+    }
+
+    /// One bridge-shaped frame: tick both sides, then the single
+    /// match-clock advance where the swap boundary lives.
+    fn frame(m: &mut Match, log: &mut Vec<MatchEvent>) {
+        log.extend(m.tick(Side::Left));
+        log.extend(m.tick(Side::Right));
+        log.extend(m.advance_match_clock());
+    }
+
     #[test]
-    fn switch_rule_is_a_no_attack_placeholder() {
+    fn switch_sends_and_lands_garbage_on_the_garbage_table() {
         let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::I]));
-        let rule = AttackRule::Switch {
-            swap_interval_ticks: 1_800,
-            warning_ticks: 180,
-        };
-        let mut m = Match::new(seed, rule);
-        setup_flat_gap(&mut m, Side::Left);
-        let ev = m.apply(Side::Left, Action::HardDrop);
+        let mut m = Match::new(seed, switch(1_000, 180));
+        setup_vertical_gap(&mut m, Side::Left, 2, 5);
+        let ev = drop_vertical_i(&mut m, Side::Left, 5);
         assert_eq!(
             ev,
-            vec![MatchEvent::PieceLocked {
-                side: Side::Left,
-                lines: 1
-            }],
-            "{rule:?} must neither attack nor swap before T21"
+            vec![
+                MatchEvent::PieceLocked {
+                    side: Side::Left,
+                    lines: 2
+                },
+                MatchEvent::GarbageSent {
+                    side: Side::Left,
+                    lines: 2
+                },
+            ],
+            "Switch attacks with the Garbage table"
         );
+        assert_eq!(m.pending_attack(Side::Right), 2);
+        let ev = m.apply(Side::Right, Action::HardDrop);
+        assert!(
+            ev.contains(&MatchEvent::GarbageReceived {
+                side: Side::Right,
+                lines: 2
+            }),
+            "pending garbage lands on the receiver's next lock: {ev:?}"
+        );
+        hole_in_row(&m.right.snapshot().board, ROWS - 1);
+    }
+
+    /// The send path is *reused*, not re-implemented: with a swap boundary
+    /// that never falls inside the scripted window, Switch emits exactly the
+    /// Garbage rule's event stream for the same seed and inputs.
+    #[test]
+    fn switch_attack_stream_is_identical_to_the_garbage_rule() {
+        fn stream(rule: AttackRule) -> Vec<MatchEvent> {
+            let seed = find_match_seed(Some(&[Piece::I, Piece::O]), Some(&[Piece::I]));
+            let mut m = Match::new(seed, rule);
+            let mut log = Vec::new();
+            setup_vertical_gap(&mut m, Side::Left, 4, 5);
+            log.extend(drop_vertical_i(&mut m, Side::Left, 5));
+            log.extend(m.apply(Side::Right, Action::HardDrop));
+            setup_o_double(&mut m, Side::Left);
+            log.extend(m.apply(Side::Left, Action::HardDrop));
+            log.extend(m.apply(Side::Right, Action::HardDrop));
+            log
+        }
+        let garbage = stream(AttackRule::Garbage);
+        let swapped = stream(switch(100_000, 180));
+        assert!(!garbage.is_empty());
+        assert_eq!(
+            garbage, swapped,
+            "Switch must reuse the Garbage attack path verbatim"
+        );
+    }
+
+    #[test]
+    fn switch_swaps_full_state_at_exact_boundary() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, switch(4, 2));
+        // Differentiate the sides: Left scores a lock, Right spends its hold.
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, MatchEvent::PieceLocked { .. })));
+        assert!(m.apply(Side::Right, Action::Hold).is_empty());
+        assert!(m.right.snapshot().hold.is_some());
+
+        let mut log = Vec::new();
+        for _ in 0..3 {
+            frame(&mut m, &mut log);
+        }
+        assert_eq!(
+            log.iter()
+                .filter(|e| matches!(e, MatchEvent::BoardSwapped { .. }))
+                .count(),
+            0,
+            "no swap before the boundary: {log:?}"
+        );
+        let before = m.snapshot();
+        assert!(before.left.score > 0 && before.right.hold.is_some());
+
+        frame(&mut m, &mut log); // match_ticks hits 4 == the boundary
+        assert!(
+            log.contains(&MatchEvent::BoardSwapped { tick: 4 }),
+            "{log:?}"
+        );
+        let after = m.snapshot();
+        assert_eq!(after.match_ticks, 4);
+        assert_eq!(after.swaps_done, 1);
+        // The *entire* per-side states traveled, counters included:
+        // board, active piece, hold, next queue, score/lines/level.
+        assert_eq!(after.left, before.right);
+        assert_eq!(after.right, before.left);
+        assert!(after.left.hold.is_some() && after.right.hold.is_none());
+        assert!(after.right.score > 0 && after.left.score == 0);
+    }
+
+    /// Bag identity travels with the state: after the swap the slot plays
+    /// the *other* side's piece sequence from that point on.
+    #[test]
+    fn switch_swap_carries_the_piece_sequence() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, switch(2, 1));
+        let left_seq = (m.left.snapshot().active, m.left.peek_next(6));
+        let right_seq = (m.right.snapshot().active, m.right.peek_next(6));
+        assert_ne!(left_seq.0.map(|p| p.piece), right_seq.0.map(|p| p.piece));
+
+        let mut log = Vec::new();
+        frame(&mut m, &mut log);
+        frame(&mut m, &mut log); // boundary at tick 2
+        assert!(log.contains(&MatchEvent::BoardSwapped { tick: 2 }));
+
+        // Both slots must now deal the opponent's original sequence.
+        assert_eq!(m.left.snapshot().active, right_seq.0);
+        assert_eq!(m.left.peek_next(6), right_seq.1);
+        assert_eq!(m.right.snapshot().active, left_seq.0);
+        assert_eq!(m.right.peek_next(6), left_seq.1);
+    }
+
+    /// Owner decision: pending garbage follows **the board**, not the side
+    /// that queued it — a batch aimed at a board keeps landing on that board
+    /// after the swap, even though a different identity now plays it. The
+    /// delivery is settled *before* the boundary (locks land during the
+    /// frame's settles), and a send created on the boundary frame itself
+    /// (before `advance_match_clock`) travels with the board too.
+    #[test]
+    fn switch_pending_garbage_travels_with_the_board() {
+        let seed = find_match_seed(Some(&[Piece::I, Piece::O]), Some(&[Piece::I]));
+        let mut m = Match::new(seed, switch(6, 2));
+        setup_flat_gap(&mut m, Side::Left);
+
+        // Queue a batch on Right at t = 0.
+        m.apply(Side::Left, Action::HardDrop);
+        assert_eq!(m.pending_attack(Side::Right), 1);
+
+        // Idle frames up to the boundary, then a fresh send on the boundary
+        // frame itself *before* the clock advance (bridge order: settles,
+        // then clock). The second consecutive clear chains (+1) ⇒ 2 more.
+        for _ in 0..5 {
+            let mut log = Vec::new();
+            frame(&mut m, &mut log);
+        }
+        assert_eq!(m.pending_attack(Side::Right), 1);
+        setup_o_single(&mut m, Side::Left);
+        m.apply(Side::Left, Action::HardDrop);
+        assert_eq!(m.pending_attack(Side::Right), 3);
+
+        let mut log = Vec::new();
+        log.extend(m.tick(Side::Left));
+        log.extend(m.tick(Side::Right));
+        log.extend(m.advance_match_clock()); // t == 6 ⇒ swap
+        assert!(
+            log.contains(&MatchEvent::BoardSwapped { tick: 6 }),
+            "{log:?}"
+        );
+        assert_eq!(m.pending_attack(Side::Left), 3);
         assert_eq!(m.pending_attack(Side::Right), 0);
+
+        // Left (now holding Right's old board) locks: all three queued rows
+        // land on that board — the same garbage the Right slot was facing.
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert!(
+            ev.contains(&MatchEvent::GarbageReceived {
+                side: Side::Left,
+                lines: 3
+            }),
+            "{ev:?}"
+        );
+        let hole = hole_in_row(&m.left.snapshot().board, ROWS - 1);
+        assert_eq!(hole_in_row(&m.left.snapshot().board, ROWS - 2), hole);
+        assert_eq!(hole_in_row(&m.left.snapshot().board, ROWS - 3), hole);
+    }
+
+    #[test]
+    fn switch_warning_fires_once_per_boundary_at_the_exact_lead() {
+        let mut m = Match::new(11, switch(10, 3));
+        let mut log = Vec::new();
+        for _ in 0..25 {
+            frame(&mut m, &mut log);
+        }
+        let clock: Vec<_> = log
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    MatchEvent::SwapWarning { .. } | MatchEvent::BoardSwapped { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            clock,
+            vec![
+                MatchEvent::SwapWarning { at_tick: 10 },
+                MatchEvent::BoardSwapped { tick: 10 },
+                MatchEvent::SwapWarning { at_tick: 20 },
+                MatchEvent::BoardSwapped { tick: 20 },
+            ],
+            "one warning exactly warning_ticks before each boundary, one swap each"
+        );
+        assert_eq!(m.snapshot().swaps_done, 2);
+    }
+
+    /// `warning_ticks >= swap_interval_ticks` would put the first boundary's
+    /// warning at match tick 0 (never observable); the warning for boundary
+    /// `k+1` then co-fires with boundary `k` at its swap tick.
+    #[test]
+    fn switch_warning_never_fires_at_tick_zero() {
+        let mut m = Match::new(11, switch(10, 10));
+        let mut log = Vec::new();
+        for _ in 0..12 {
+            frame(&mut m, &mut log);
+        }
+        let clock: Vec<_> = log
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    MatchEvent::SwapWarning { .. } | MatchEvent::BoardSwapped { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            clock,
+            vec![
+                MatchEvent::SwapWarning { at_tick: 20 },
+                MatchEvent::BoardSwapped { tick: 10 },
+            ],
+            "no warning at tick 0; the next one rides the swap tick"
+        );
+    }
+
+    #[test]
+    fn switch_zero_interval_never_swaps_or_warns() {
+        let mut m = Match::new(5, switch(0, 0));
+        let mut log = Vec::new();
+        for _ in 0..10 {
+            frame(&mut m, &mut log);
+        }
+        assert!(m.match_ticks() == 10);
+        assert_eq!(m.snapshot().swaps_done, 0);
+        assert!(
+            !log.iter().any(|e| matches!(
+                e,
+                MatchEvent::SwapWarning { .. } | MatchEvent::BoardSwapped { .. }
+            )),
+            "the degenerate 0-interval config is inert: {log:?}"
+        );
+    }
+
+    /// Swaps are pure match-clock logic: fully asymmetric per-side input
+    /// schedules (only one side acts on most frames, neither ever locks)
+    /// must not add, drop or shift a single swap.
+    #[test]
+    fn switch_has_no_double_swap_with_asymmetric_input_timing() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, switch(5, 2));
+        setup_vertical_gap(&mut m, Side::Left, 4, 5);
+        setup_vertical_gap(&mut m, Side::Right, 3, 4);
+
+        let mut log = Vec::new();
+        for i in 0..23u32 {
+            // Never a HardDrop: both sides stay alive on gravity alone, so
+            // the only match-clock influence is the frame count itself.
+            if i % 2 == 0 {
+                m.apply(Side::Left, Action::RotateCw);
+            }
+            if i % 3 == 0 {
+                m.apply(Side::Left, Action::MoveLeft);
+            }
+            if i % 5 == 0 {
+                m.apply(Side::Right, Action::RotateCcw);
+            }
+            if i % 7 != 0 {
+                m.apply(Side::Right, Action::MoveRight);
+            }
+            frame(&mut m, &mut log);
+        }
+        let swaps: Vec<u64> = log
+            .iter()
+            .filter_map(|e| match e {
+                MatchEvent::BoardSwapped { tick } => Some(*tick),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            swaps,
+            vec![5, 10, 15, 20],
+            "exactly one swap per match-clock boundary"
+        );
+        assert_eq!(m.snapshot().swaps_done, 4);
+        assert_eq!(m.match_ticks(), 23);
+    }
+
+    #[test]
+    fn switch_replay_is_deterministic() {
+        fn replay() -> (Vec<MatchEvent>, MatchSnapshot) {
+            let seed = find_match_seed(Some(&[Piece::I, Piece::O]), Some(&[Piece::I]));
+            let mut m = Match::new(seed, switch(7, 3));
+            let mut log = Vec::new();
+            for i in 0..20u32 {
+                if i % 2 == 0 {
+                    log.extend(m.apply(Side::Left, Action::HardDrop));
+                }
+                if i % 3 == 0 {
+                    log.extend(m.apply(Side::Right, Action::HardDrop));
+                }
+                if i % 5 == 0 {
+                    log.extend(m.apply(Side::Right, Action::MoveLeft));
+                }
+                frame(&mut m, &mut log);
+            }
+            (log, m.snapshot())
+        }
+        let (log_a, snap_a) = replay();
+        let (log_b, snap_b) = replay();
+        assert!(log_a
+            .iter()
+            .any(|e| matches!(e, MatchEvent::BoardSwapped { .. })));
+        assert!(log_a
+            .iter()
+            .any(|e| matches!(e, MatchEvent::SwapWarning { .. })));
+        assert_eq!(
+            log_a, log_b,
+            "identical seed+inputs ⇒ identical event stream"
+        );
+        assert_eq!(snap_a, snap_b);
+    }
+
+    /// Sides are **identities**; boards travel. A side that tops out while
+    /// holding the opponent's old stack still loses (opponent crowned).
+    #[test]
+    fn switch_top_out_after_a_swap_loses_by_identity() {
+        let seed = find_match_seed(Some(&[Piece::O]), Some(&[Piece::O]));
+        let mut m = Match::new(seed, switch(6, 2));
+        // A row-0 cell on **Left's** board makes any garbage push into it
+        // overflow-fatal; the queued batch aims at that board (pending
+        // follows it across the swap into the Right slot).
+        let mut board = m.left.snapshot().board;
+        board.set(0, 0, Some(Piece::J));
+        assert!(m.game_mut(Side::Left).install_board(board, false));
+        m.pending[Side::Left.index()] = 1;
+
+        let mut log = Vec::new();
+        for _ in 0..6 {
+            frame(&mut m, &mut log);
+        }
+        assert!(
+            log.contains(&MatchEvent::BoardSwapped { tick: 6 }),
+            "{log:?}"
+        );
         assert_eq!(m.winner(), None);
-        let mut ev = m.advance_match_clock();
-        ev.extend(m.advance_match_clock());
-        assert!(ev.is_empty(), "{rule:?} emits no clock events yet");
+        assert_eq!(m.pending_attack(Side::Right), 1);
+        assert_eq!(m.pending_attack(Side::Left), 0);
+
+        // Right locks: the overflow-fatal push lands on the board it now
+        // holds — a board Left built. Right tops out, Left is crowned.
+        let ev = m.apply(Side::Right, Action::HardDrop);
+        assert!(
+            ev.contains(&MatchEvent::PlayerTopOut { side: Side::Right }),
+            "the side holding the fatal board tops out: {ev:?}"
+        );
+        assert!(ev.contains(&MatchEvent::WinnerCrowned { side: Side::Left }));
+        assert_eq!(m.winner(), Some(Side::Left));
+    }
+
+    /// Post-crown the match clock is frozen (T19): a crowned Switch match
+    /// can never reach — or cross — a swap boundary.
+    #[test]
+    fn switch_crowned_match_never_swaps() {
+        let seed = find_match_seed(Some(&[Piece::I]), None);
+        let mut m = Match::new(seed, switch(2, 1));
+        // Left dies on its own queued garbage before the first boundary.
+        m.pending[Side::Left.index()] = 1;
+        let mut board = Board::new();
+        board.set(0, 0, Some(Piece::J));
+        assert!(m.game_mut(Side::Left).install_board(board, false));
+        let ev = m.apply(Side::Left, Action::HardDrop);
+        assert!(ev.contains(&MatchEvent::WinnerCrowned { side: Side::Right }));
+
+        let mut log = Vec::new();
+        for _ in 0..10 {
+            log.extend(m.advance_match_clock());
+        }
+        assert!(log.is_empty(), "frozen clock emits nothing: {log:?}");
+        assert_eq!(m.match_ticks(), 0);
+        assert_eq!(m.snapshot().swaps_done, 0);
     }
 
     #[test]

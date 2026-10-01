@@ -1015,7 +1015,11 @@ pub enum VersusHudSlot {
     /// progress counter instead.
     Pending,
     /// `FINISHED` badge for a side that completed a Race target (empty
-    /// text while it still races or tops out).
+    /// text while it still races or tops out). Under the Switch rule (T21)
+    /// it doubles as the match-wide `SWAP n` countdown — under Switch no
+    /// side ever finishes a Race, so the badge is structurally dead there.
+    /// Inside the swap warning window (`warning_ticks` before a boundary)
+    /// the text turns to the garbage-orange warning color.
     Status,
 }
 
@@ -1102,6 +1106,29 @@ fn versus_status_text(finished: bool) -> String {
     } else {
         String::new()
     }
+}
+
+/// Switch-rule swap countdown (T21), derived purely from the snapshot
+/// (fixture-driven like the rest of the versus HUD): whole seconds until
+/// the next swap (rounded up) and whether the match is already inside the
+/// `warning_ticks` window before that boundary. `None` for every other
+/// rule (and for the degenerate zero-interval config the core keeps inert).
+fn versus_swap_info(snapshot: &tetris_core::versus::MatchSnapshot) -> Option<(u32, bool)> {
+    let AttackRule::Switch {
+        swap_interval_ticks,
+        warning_ticks,
+    } = snapshot.rule
+    else {
+        return None;
+    };
+    if swap_interval_ticks == 0 {
+        return None;
+    }
+    let interval = swap_interval_ticks as u64;
+    let boundary = (snapshot.swaps_done as u64 + 1) * interval;
+    let remaining = boundary.saturating_sub(snapshot.match_ticks);
+    let warning = snapshot.match_ticks.saturating_add(warning_ticks as u64) >= boundary;
+    Some((remaining.div_ceil(60) as u32, warning))
 }
 
 /// World-space center of a versus stat text.
@@ -1208,6 +1235,7 @@ type VersusTextQuery<'w, 's> = Query<
         &'static mut Text2d,
         &'static mut TextFont,
         &'static mut Transform,
+        &'static mut TextColor,
     ),
     (
         With<VersusHudText>,
@@ -1276,8 +1304,11 @@ fn sync_versus_hud(
         LadderOrigin::Match { rung } => Some(rung),
         _ => None,
     });
+    // Switch swap countdown (T21): match-wide, shown identically on both
+    // side panels; the ladder badge (Garbage-only flows) outranks it.
+    let swap = versus_swap_info(&snapshot);
 
-    for (meta, mut text, mut font, mut transform) in texts.iter_mut() {
+    for (meta, mut text, mut font, mut transform, mut color) in texts.iter_mut() {
         let anchor = if meta.side == Side::Left { left } else { right };
         let game = if meta.side == Side::Left {
             &snapshot.left
@@ -1307,10 +1338,28 @@ fn sync_versus_hud(
                 AttackRule::Dig => versus_dug_text(buried_rows_left(game)),
                 _ => versus_pending_text(pending),
             },
-            VersusHudSlot::Status => match ladder_rung {
-                Some(rung) => ladder_badge_text(rung),
-                None => versus_status_text(finished),
-            },
+            VersusHudSlot::Status => {
+                // Badge precedence: ladder rung > Switch swap countdown >
+                // race `FINISHED`. The color follows (garbage-orange inside
+                // the swap warning window, white during the plain countdown,
+                // the gold badge color otherwise — restored every frame so
+                // a fixture-driven rule switch can never leave a stale
+                // warning color behind).
+                let (content, wanted) = match ladder_rung {
+                    Some(rung) => (ladder_badge_text(rung), FINISHED_COLOR),
+                    None => match swap {
+                        Some((secs, warning)) => (
+                            format!("SWAP {secs}"),
+                            if warning { GARBAGE_COLOR } else { Color::WHITE },
+                        ),
+                        None => (versus_status_text(finished), FINISHED_COLOR),
+                    },
+                };
+                if color.0 != wanted {
+                    color.0 = wanted;
+                }
+                content
+            }
         };
         if text.0 != content {
             text.0 = content;
@@ -2158,6 +2207,110 @@ mod tests {
             versus_text_of(&mut app, Side::Right, VersusHudSlot::Status),
             ""
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T21: Switch swap countdown (fixture-driven like the T8/T13 meters)
+    // ------------------------------------------------------------------
+
+    fn versus_color_of(app: &mut App, side: Side, slot: VersusHudSlot) -> Color {
+        let mut query = app.world_mut().query::<(&VersusHudText, &TextColor)>();
+        query
+            .iter(app.world())
+            .find(|(meta, _)| meta.side == side && meta.slot == slot)
+            .map(|(_, color)| color.0)
+            .expect("versus stat text exists")
+    }
+
+    fn switch_fixture(app: &mut App, match_ticks: u64, swaps_done: u32) {
+        let rule = AttackRule::Switch {
+            swap_interval_ticks: 1_800,
+            warning_ticks: 180,
+        };
+        let mut snapshot = Match::new(0xBEEF, rule).snapshot();
+        snapshot.match_ticks = match_ticks;
+        snapshot.swaps_done = swaps_done;
+        app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot);
+        let _ = app.world_mut().try_run_schedule(Update);
+    }
+
+    /// The Status slot counts the next swap down in whole seconds (rounded
+    /// up) on both panels, turns garbage-orange inside the 3 s warning
+    /// window, and re-arms after a swap — all from the snapshot alone.
+    #[test]
+    fn versus_hud_swaps_status_to_swap_countdown_under_switch() {
+        let mut app = versus_hud_app(7);
+        for (ticks, expected, warning) in [
+            (0u64, "SWAP 30", false),
+            (900, "SWAP 15", false),
+            // 1 619 ticks in: 181 ticks left (rounds up to 4 s), one tick
+            // outside the 180-tick warning window.
+            (1_619, "SWAP 4", false),
+            // 1 620: exactly warning_ticks before the boundary ⇒ warning.
+            (1_620, "SWAP 3", true),
+            // One tick before the swap the countdown reads 1 s, warning.
+            (1_799, "SWAP 1", true),
+            // After the swap (swaps_done advanced) it re-arms at 30.
+            (1_800, "SWAP 30", false),
+        ] {
+            switch_fixture(&mut app, ticks, if ticks >= 1_800 { 1 } else { 0 });
+            for side in [Side::Left, Side::Right] {
+                assert_eq!(
+                    versus_text_of(&mut app, side, VersusHudSlot::Status),
+                    expected,
+                    "match_ticks {ticks}"
+                );
+                assert_eq!(
+                    versus_color_of(&mut app, side, VersusHudSlot::Status),
+                    if warning { GARBAGE_COLOR } else { Color::WHITE },
+                    "warning state at match_ticks {ticks}"
+                );
+            }
+        }
+    }
+
+    /// Other rules keep the plain Status slot (empty under Garbage/Dig,
+    /// gold-badge colored), and the color from a previous Switch fixture is
+    /// never left behind on a rule switch.
+    #[test]
+    fn versus_hud_swap_countdown_is_hidden_for_other_rules() {
+        let mut app = versus_hud_app(8);
+        switch_fixture(&mut app, 1_700, 0);
+        assert_eq!(
+            versus_text_of(&mut app, Side::Left, VersusHudSlot::Status),
+            "SWAP 2"
+        );
+        for rule in [
+            AttackRule::Garbage,
+            AttackRule::Race { target_lines: 40 },
+            AttackRule::Dig,
+            AttackRule::Switch {
+                swap_interval_ticks: 0,
+                warning_ticks: 0,
+            },
+        ] {
+            let snapshot = fixture_match(rule);
+            app.world_mut().resource_mut::<VersusHudFixture>().0 = Some(snapshot);
+            let _ = app.world_mut().try_run_schedule(Update);
+            for side in [Side::Left, Side::Right] {
+                assert_eq!(
+                    versus_text_of(&mut app, side, VersusHudSlot::Status),
+                    "",
+                    "{:?} rule must show no swap countdown",
+                    app.world()
+                        .resource::<VersusHudFixture>()
+                        .0
+                        .as_ref()
+                        .unwrap()
+                        .rule
+                );
+                assert_eq!(
+                    versus_color_of(&mut app, side, VersusHudSlot::Status),
+                    FINISHED_COLOR,
+                    "status color restored"
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------------
