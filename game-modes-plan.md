@@ -784,9 +784,74 @@ T1 ──► T2 ──┬──────────────────�
   300; interval decays 15 per 1800 ticks down to the 60 floor; cap-4 trickle;
   overflow tops out; same-seed replay determinism; marathon regression (T1)
   untouched.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `4f910b6` (only `mode.rs` + `game.rs`).
+  `mode.rs`: `GarbageFeed { interval_ticks, decay_ticks, decay_by,
+  floor_ticks }` (serde, `Default` == consts `FEED_INTERVAL_TICKS=300 /
+  FEED_DECAY_TICKS=1800 / FEED_DECAY_BY=15 / FEED_FLOOR_TICKS=60`) +
+  `pub interval_at(t) -> u64` = `max(floor, interval - decay_by * (t /
+  decay_ticks))` (checked_div ⇒ `decay_ticks: 0` disables decay; floor above
+  start wins; saturating). `ModeConfig.garbage_feed: Option<GarbageFeed>`
+  (Default None ⇒ every pre-T12 config bit-identical). `game.rs`:
+  `FeedState { rules, next_queue_tick, pending, hole_rng }` (None without
+  feed). **Queue schedule**: in `tick()` right after the tick increment,
+  `ticks >= next_queue_tick` ⇒ `pending += 1` and
+  `next_queue_tick = ticks + interval_at(ticks)` — the wait is committed at
+  each queue event from the interval in force *there*, so decay applies once
+  per fully-elapsed 1800-tick window (window 0's 300 divides 1800 ⇒ first
+  post-decay row exactly at tick 1800, then 285 spacing; floor 60 from
+  window 16). Queue events depend only on game ticks, never locks; a frozen
+  game never queues (tick gating) and the countdown freezes in place.
+  **Landing point (documented, versus parity)**: inside `lock_and_spawn`,
+  after this lock's merge+clear+scoring/level bookkeeping, **before** the
+  goal check and **before** the next spawn (versus lands after the whole
+  Game call incl. spawn and tops out on active-overlap; landing pre-spawn
+  is the equivalent outcome here — a stack buried into the spawn area ends
+  via `spawn`'s own block-out, single `GameOver`); at most
+  `versus::MAX_GARBAGE_PER_LAND` (4) rows per lock via
+  `versus::push_garbage_rows`, surplus trickles; exactly one hole column
+  per *landing* batch (constant within batch, versus-style) from an
+  independent splitmix64 `Rng::new(seed ^ FEED_HOLE_SALT)`
+  (`0x51F0_7D3A_9C6B_4E21` — different from `BURIED_GARBAGE_SALT` and the
+  bag stream; `peek_next` pinned unchanged). **Top-out**: push overflow ⇒
+  install pushed board, clear active, `game_over = true`,
+  `finished = Some(TopOut)`, emit `GameOver` once and return before the
+  goal check/spawn — top-out wins over a same-lock `Goal::Lines` (tested:
+  exactly one GameOver, no GoalReached); clock already loses to locks by T2
+  ordering. **No new GameEvent variants, no GameSnapshot fields** (T1
+  golden green). Getters: `pending_garbage() -> u32` (queued-not-landed;
+  0 without feed), `ticks_to_next_row() -> Option<u64>` (None without feed;
+  ticks until the NEXT QUEUE event — pending rows don't affect it; freezes
+  while the game does). RED captured (E0422/E0425/E0433 `GarbageFeed`,
+  E0560 `garbage_feed`, 27×E0599 getters) → GREEN: tetris-core 171 lib +
+  6 invariant + 3 marathon golden + 5 headless pass (9 new game.rs tests:
+  queue-at-300/land-on-lock with `pending_garbage()` visibility, decay
+  sequence pinned to tick 40k incl. per-window recurrence + 60-floor run,
+  cap-4 trickle 6⇒4+2 with per-batch single hole, overflow top-out frozen,
+  landing-topout-beats-goal same lock, same-seed replay of events +
+  snapshots + getter traces, bag-peek untouched under feed, default ==
+  `Game::new` incl. getters); 4 new mode.rs tests (defaults, interval_at
+  windows/floor, degenerate configs). Workspace green (app 420), clippy
+  `--workspace --all-targets -D warnings` + `fmt --all --check` clean.
+  **UNSTAGED working-tree fixups (T2 precedent, whoever lands the next
+  app-crate commit must stage them)**: `crates/tetris-app/src/modes.rs`
+  + `crates/tetris-app/src/screens_menu.rs` — three exhaustive
+  `ModeConfig { … }` literals (Sprint/Dig/Zen + test helper
+  `goal_on_first_lock`) gained `..ModeConfig::default()`; behavior-neutral
+  (`garbage_feed: None`), required because a new struct field breaks
+  exhaustive literals; T13 (which edits `modes.rs` anyway) should keep them.
+  Gotchas: (a) hole stream derives from the **game** seed — the T13 app
+  config only needs `garbage_feed: Some(GarbageFeed::default())`; (b) rows
+  queue mid-air and are *only* observable via `pending_garbage` until a
+  lock — the app HUD reads both fields (T8's reserved
+  `ModeHudInfo.feed_pending`/`feed_next_row_in`); (c) decay windows count
+  from game tick 0 — with T5's 0-tick Survival pre-roll that is feed time
+  (no pre-roll is planned; if one is ever added, feed would need a base
+  offset).
+- **files edited/created**: `crates/tetris-core/src/mode.rs`,
+  `crates/tetris-core/src/game.rs` (+ unstaged: `..default()` compile
+  fixups in `crates/tetris-app/src/modes.rs` and
+  `crates/tetris-app/src/screens_menu.rs`, see log)
 
 ### T13: Survival app wiring + HUD
 - **depends_on**: [T12, T8]
