@@ -1023,9 +1023,46 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Headless test: bot at 10-tick cooldown beats a 120-tick
   ladder seat (win path unlocks), winner resource drives unlock + record;
   rung persistence round-trip under `TETRIS_CONFIG_DIR`.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Complete
+- **log**: `b760f52`. Ladder screen (new `screens_ladder.rs`, mounted as
+  `BotLadderPlugin`) rides inside `AppState::ModeSelect` (no new `AppState`
+  variant): the BotLadder mode-select row routes to `open_ladder` instead of
+  `start_mode_run`, and the list hides while the ladder shows. **Zero new
+  Bevy resources**: the campaign state is `LadderOrigin{Closed,Screen,
+  Match{rung}}` added as a field on the existing `VersusFlow` resource
+  (additive; `VersusStage` untouched). Rung press =
+  `start_versus_with_cooldown(Garbage, Human, Bot, [0, RUNG_COOLDOWNS[r]])`
+  — tuning lives ONLY in `pub const RUNG_COOLDOWNS: [u32; 8] =
+  [120, 104, 82, 60, 44, 30, 19, 10]` (rung 4 == the 60 default, pinned by
+  test). Left (human) crown on a `Match`-origin flow folds
+  `HighestRung{rung}` via a new `records::highest_beaten_rung` helper +
+  forced save; bot crown records nothing (retry). Flow isolation: only
+  `LadderOrigin::Match` arms the record fold and the HUD badge, so plain
+  1v1/netplay crowns never touch `bot_ladder` records (test-pinned); the
+  overlay Menu on a ladder crown walks back to the ladder screen (pause
+  quit likewise), Rematch re-arms the rung's own cooldown (the R key in
+  versus.rs still restarts at the 60 default — core_bridge off-limits,
+  accepted). Versus HUD badge: `RUNG n/8` re-targets the pooled Status slot
+  while ladder-origin (Garbage rule can never show the slot's `FINISHED`
+  anyway) — no new entities. `is_shipped(BotLadder)` flipped, description
+  now "Beat eight bots of rising speed.". RED (E0583 ladder module missing)
+  → GREEN: 14 new ladder tests (entry, cooldown `[0,120]` on rung 1,
+  locked-rung inertness, win-unlock + Menu→ladder, bot-win retry, rematch
+  cooldown, isolation, persistence round-trip under `TETRIS_CONFIG_DIR`
+  proving rung 3 recorded ⇒ rung 4 playable after reload, fast-bot-beats-
+  slow-bot `[120,10]` bot-vs-bot ⇒ Right wins, T15 rate-test style with
+  pinned match RNG) + 2 HUD + 1 records helper test. Validation at this
+  commit: app lib 448 + 7 integration green, `cargo test --workspace` all
+  15 suites green (pre-existing canaries incl. the resource-churn submenu
+  tests green unmodified — resource count unchanged), clippy
+  `--workspace --all-targets -- -D warnings` exit 0, `cargo fmt --all
+  --check` clean.
+- **files edited/created**: `crates/tetris-app/src/screens_ladder.rs` (new),
+  `modes.rs`, `records.rs`, `hud.rs`, `lib.rs`, `screens_menu.rs` (flow
+  field + overlay/pause ladder branches), `screens_modes.rs` (row routing,
+  list-hide gate, Escape walk-back, defensive `VersusFlow` init, and the
+  `rows_are_data_driven` hypothetical swapped BotLadder→Daily — T16 shipped
+  so T17 must swap it to another unshipped mode, comment pinned in the test)
 
 ### T17: Daily Challenge
 - **depends_on**: [T6, T7]
