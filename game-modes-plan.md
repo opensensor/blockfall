@@ -835,9 +835,32 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: `cargo test --workspace` green with defaults; a unit test
   starts a bot-vs-bot match at 10-tick cooldown and asserts a materially
   higher lock rate than the 60-tick default.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `fbf0232`. Pure plumbing in `versus.rs` (single file; `net/harness.rs`
+  inspected — its `SoakPlayer` is test-local pacing, never constructs
+  `VersusMatch` cooldown state, untouched; `mod.rs` re-exports via `pub use
+  versus::*` so no export churn). `VersusMatch::bot_cooldown_ticks: [u32; 2]`
+  (pub) replaces the constant read in `versus_bot_system`
+  (`bot_cooldown[index] = bot_cooldown_ticks[index]` on drop; countdown field
+  unchanged); `VersusMatch::new` defaults it to `[BOT_LOCK_COOLDOWN_STEPS; 2]`;
+  `setup_net_mirror` resets it to the default alongside `bot_cooldown = [0; 2]`
+  (covers `start_net_match` and the guest `pending_start` rebuild);
+  `start_versus` keeps its signature and delegates with the default;
+  `start_versus_with_cooldown(..., cooldowns: [u32; 2])` is the real body.
+  TDD: RED = E0425 `start_versus_with_cooldown` + E0609 `bot_cooldown_ticks` →
+  GREEN. Tests: `start_versus_sets_default_and_param_cooldown_ticks` and
+  `per_match_cooldown_scales_the_bot_lock_rate` (bot-vs-bot, fixed 300
+  `Match::tick` window, RNG pinned after the entry point for reproducibility;
+  [10, 10] locks 42 vs [60, 60] locks 10 — 4.2× ≥ the ≥3× bar; Race with an
+  unreachable target keeps the pace measurement free of garbage truncation).
+  Default-identity: every existing call path (menu, R-restart, `TETRIS_1V1`
+  harness, net mirror) flows the constant default; all pre-existing
+  versus/harness/soak tests pass unmodified. Validation on HEAD-pinned
+  worktree (c91cb74 + this file only — shared tree was red from T12's
+  in-flight core WIP at validation time): app 420+7 green, `cargo test
+  --workspace` all suites green, `cargo clippy --workspace --all-targets --
+  -D warnings` exit 0, `cargo fmt --all --check` clean.
+- **files edited/created**: `crates/tetris-app/src/core_bridge/versus.rs`
 
 ### T16: Bot Ladder campaign
 - **depends_on**: [T15, T6, T7]
