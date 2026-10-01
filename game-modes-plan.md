@@ -1079,9 +1079,57 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Unit tests: date→seed stable and distinct across dates;
   rotation mapping; first-run-wins recording (second run ignored); share
   line format.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Complete
+- **log**: `d494f33`. `daily.rs` (new) is the single source: chrono-free
+  `CivilDate` (Hinnant `civil_from_days`/`days_from_civil`, epoch-day
+  arithmetic), `utc_today` (the only `SystemTime` touch — core stays
+  date-free), `daily_seed` = splitmix64 over the packed date,
+  `DAILY_ROTATION = [Sprint, Ultra, Dig]` indexed by `weekday(Mon=0) % 3`
+  (Mon Sprint / Tue Ultra / Wed Dig / Thu Sprint / Fri Ultra / Sat Dig /
+  Sun rolls back onto the head), `share_line` (exact `YYYY-MM-DD` + U+00B7
+  separators), and a thread-local `set_today_override` test seam
+  (`render::set_portrait_override` precedent — App::update runs systems on
+  the calling thread). Date injection: pure fns take `CivilDate` params;
+  flow paths read `today()` (override-aware). **Start with seed**:
+  `start_mode_run_with_seed(id, ..., seed_override: Option<u64>)` added to
+  core_bridge with `start_mode_run` delegating `None` — bookkeeping (forced
+  seed wins over `TETRIS_SEED`, pre-roll re-arm, play bump) stays in ONE
+  place; `daily::start_daily` wraps it and returns `(date, mode, seed)`.
+  **Daily attempt state**: `DailyAttempt{Idle, Active{date}}` as a
+  `VersusFlow` field (T16 `LadderOrigin` precedent — zero new Bevy
+  resources; resource-churn submenu canaries green unmodified). **Recording
+  gate lives in `daily::finish_daily_attempt`** (T6's `record_run` replaces
+  Daily content unconditionally): stored date == attempt date ⇒ ignore
+  (share line quotes the stored first result), new date replaces; Sprint/
+  Dig daily top-out earns nothing, Ultra top-out records the standing score.
+  `terminal_record_system` consumes the marker at Game Over (later retry =
+  plain run; pause→Restart also clears it); the normal per-mode matrix is
+  NOT suppressed for daily runs. **UI**: mode-select gains a `DailyRowButton`
+  banner (`Daily · Dig — Not yet` / `— 1:42.35`, synced from `Records` +
+  state) — NOT a catalogue `ModeRowButton`; `is_shipped(Daily)` stays false
+  and the three modes stay normal on their rows (the banner press is what
+  arms the marker); result screen headline becomes the share line via
+  `TerminalResult.daily_share` (display-only label). RED (E0583 daily
+  module missing) → GREEN: 20 new tests (civil-date round trips incl.
+  epoch/leap, weekday pins, seed stable + 10-date distinct, 7-weekday
+  rotation cycle, share line exact incl. zero-padded `1:42.35` = 6 141
+  ticks, first-run-wins gate + new-day replace, mode-rule result strings,
+  banner render/status, banner press starts today's mode with today's seed +
+  pre-roll, normal rows never carry/keep the marker, daily Sprint goal
+  records + second run no-op, Ultra daily top-out records score, Sprint
+  daily top-out records nothing, plain Marathon never touches DAILY).
+  Validation at commit: app lib 467 + 7 integration green, `cargo test
+  --workspace` all 15 suites green (T1 golden canary holds), clippy
+  `--workspace --all-targets -- -D warnings` exit 0, `cargo fmt --all
+  --check` clean.
+- **files edited/created**: `crates/tetris-app/src/daily.rs` (new),
+  `crates/tetris-app/src/core_bridge/mod.rs` (seed-override param
+  `start_mode_run_with_seed`; `start_mode_run` delegates),
+  `crates/tetris-app/src/screens_menu.rs` (`VersusFlow.daily` marker,
+  terminal consume + daily fold, `TerminalResult.daily_share` headline,
+  pause-Restart clear), `crates/tetris-app/src/screens_modes.rs` (Daily
+  banner row + press routing + sync, hypothetical swapped Daily→DigDuel),
+  `crates/tetris-app/src/lib.rs` (`mod daily;`)
 
 ### T18: RELEASE 2 GATE
 - **depends_on**: [T13, T14, T16, T17]
