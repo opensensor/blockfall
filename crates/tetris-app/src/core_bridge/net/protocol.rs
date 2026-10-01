@@ -21,8 +21,12 @@ use tetris_core::versus::{AttackRule, MatchSnapshot, Side};
 pub const PROTOCOL_ID: u64 = 0x424C4B46_5F317631;
 
 /// Application-level protocol version carried in [`NetMsg::Hello`]; peers
-/// must agree exactly or the handshake kicks the guest.
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+/// must agree exactly or the handshake kicks the guest. 0.2.0 (T19):
+/// `AttackRule` gained the `Dig`/`Switch` variants and `MatchSnapshot`
+/// gained the match-clock/swap fields — old and new builds are wire-
+/// incompatible and refuse each other at the handshake. Ship desktop +
+/// Android together (PRD).
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// One wire message. Field-level semantics live in netplay-plan.md §"Wire
 /// protocol"; the `side`/`left`/`right` payload split of
@@ -148,6 +152,19 @@ mod tests {
                 rule: AttackRule::Race { target_lines: 40 },
                 match_delay: 30,
             },
+            NetMsg::MatchStart {
+                seed: 7,
+                rule: AttackRule::Dig,
+                match_delay: 0,
+            },
+            NetMsg::MatchStart {
+                seed: u64::MAX,
+                rule: AttackRule::Switch {
+                    swap_interval_ticks: 1_800,
+                    warning_ticks: 180,
+                },
+                match_delay: 8,
+            },
             NetMsg::TickInput {
                 tick: u64::MAX,
                 actions: vec![Action::MoveLeft, Action::HardDrop, Action::RotateCw],
@@ -267,8 +284,127 @@ mod tests {
         for _ in 0..ticks {
             m.tick(Side::Left);
             m.tick(Side::Right);
+            m.advance_match_clock();
         }
         m.snapshot()
+    }
+
+    #[test]
+    fn protocol_version_is_bumped_for_t19() {
+        // T19 wire break: new AttackRule variants + new MatchSnapshot fields.
+        assert_eq!(PROTOCOL_VERSION, "0.2.0");
+    }
+
+    /// Append-order canary: bincode writes the enum variant index as the
+    /// leading fixint u32 — Garbage/Race must stay pinned at 0/1 forever
+    /// (append-only rule), Dig/Switch take the new slots 2/3.
+    #[test]
+    fn attack_rule_variant_indices_are_append_only() {
+        let index = |rule: &AttackRule| -> u32 {
+            let bytes = codec().serialize(rule).expect("rule encodes");
+            assert!(bytes.len() >= 4);
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        };
+        assert_eq!(index(&AttackRule::Garbage), 0);
+        assert_eq!(index(&AttackRule::Race { target_lines: 40 }), 1);
+        assert_eq!(index(&AttackRule::Dig), 2);
+        assert_eq!(
+            index(&AttackRule::Switch {
+                swap_interval_ticks: 1_800,
+                warning_ticks: 180,
+            }),
+            3
+        );
+    }
+
+    /// An old peer (rule indices 0/1 only) rejects anything beyond index 1:
+    /// patch the rule index inside a `MatchStart` (after the 4-byte `NetMsg`
+    /// variant tag + 8-byte seed) to a bogus value and expect rejection.
+    #[test]
+    fn matchstart_rejects_rule_index_beyond_appended_set() {
+        let mut bytes = encode(&NetMsg::MatchStart {
+            seed: 1,
+            rule: AttackRule::Garbage,
+            match_delay: 2,
+        });
+        for bogus in [4u32, 99, u32::MAX] {
+            let mut mangled = bytes.clone();
+            mangled[12..16].copy_from_slice(&bogus.to_le_bytes());
+            assert!(decode(&mangled).is_err(), "rule index {bogus} accepted");
+        }
+        // Index 2 is exactly the appended `Dig` variant: with no payload of
+        // its own the patched buffer is the canonical `Dig` encoding and a
+        // new build decodes it.
+        bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            decode(&bytes).unwrap(),
+            NetMsg::MatchStart {
+                seed: 1,
+                rule: AttackRule::Dig,
+                match_delay: 2,
+            }
+        );
+    }
+
+    /// `snapshot_hash` coverage: snapshots differing **only** in the T19
+    /// fields (`match_ticks` / `swaps_done`) must hash differently — a
+    /// stale peer silently dropping them could never ride along unnoticed.
+    #[test]
+    fn snapshot_hash_covers_match_clock_fields() {
+        let base = match_at(42, AttackRule::Garbage, 25);
+        let mut tick_shifted = base.clone();
+        tick_shifted.match_ticks = base.match_ticks + 1;
+        let mut swaps_shifted = base.clone();
+        swaps_shifted.swaps_done = base.swaps_done + 1;
+
+        assert_ne!(base, tick_shifted);
+        assert_ne!(base, swaps_shifted);
+        assert_ne!(snapshot_hash(&base), snapshot_hash(&tick_shifted));
+        assert_ne!(snapshot_hash(&base), snapshot_hash(&swaps_shifted));
+        // identical states still agree bit-for-bit
+        assert_eq!(snapshot_hash(&base), snapshot_hash(&base.clone()));
+    }
+
+    /// The bridge-level contract the match clock relies on: stepping like
+    /// `versus_bridge_system`/`lockstep::apply_batch` (tick L, tick R,
+    /// advance once) is a pure function of the call sequence — identical
+    /// sequences yield identical snapshots incl. `match_ticks`, so both
+    /// peers of a netplay mirror stay on one clock.
+    #[test]
+    fn match_clock_is_deterministic_across_identical_step_sequences() {
+        use tetris_core::versus::Match;
+        let run = |seed: u64, rule: AttackRule| -> MatchSnapshot {
+            let mut m = Match::new(seed, rule);
+            for i in 0..40 {
+                if i % 7 == 0 {
+                    m.apply(Side::Left, Action::HardDrop);
+                }
+                if i % 11 == 0 {
+                    m.apply(Side::Right, Action::HardDrop);
+                }
+                m.tick(Side::Left);
+                m.tick(Side::Right);
+                assert!(
+                    m.advance_match_clock().is_empty(),
+                    "no match-clock events before T21"
+                );
+            }
+            m.snapshot()
+        };
+        let garbage = run(99, AttackRule::Garbage);
+        assert_eq!(garbage, run(99, AttackRule::Garbage));
+        assert_eq!(garbage.match_ticks, 40);
+        assert_eq!(garbage.swaps_done, 0, "no swap logic before T21");
+        let dig = run(99, AttackRule::Dig);
+        assert_eq!(dig.match_ticks, 40);
+        let switch = run(
+            99,
+            AttackRule::Switch {
+                swap_interval_ticks: 1_800,
+                warning_ticks: 180,
+            },
+        );
+        assert_eq!(switch.match_ticks, 40);
     }
 
     #[test]
@@ -368,20 +504,26 @@ mod tests {
         let sides = select(vec![Side::Left, Side::Right]);
         prop_oneof![
             (version, any::<u8>()).prop_map(|(version, delay)| NetMsg::Hello { version, delay }),
-            (any::<u64>(), any::<u8>(), 0u32..2).prop_map(|(seed, match_delay, rule_idx)| {
-                let rule = if rule_idx == 0 {
-                    AttackRule::Garbage
-                } else {
-                    AttackRule::Race {
-                        target_lines: u32::MAX >> (rule_idx * 4),
+            (any::<u64>(), any::<u8>(), any::<u32>(), 0u32..4).prop_map(
+                |(seed, match_delay, payload, rule_idx)| {
+                    let rule = match rule_idx {
+                        0 => AttackRule::Garbage,
+                        1 => AttackRule::Race {
+                            target_lines: u32::MAX >> (payload % 32),
+                        },
+                        2 => AttackRule::Dig,
+                        _ => AttackRule::Switch {
+                            swap_interval_ticks: payload,
+                            warning_ticks: payload.rotate_left(16),
+                        },
+                    };
+                    NetMsg::MatchStart {
+                        seed,
+                        rule,
+                        match_delay,
                     }
-                };
-                NetMsg::MatchStart {
-                    seed,
-                    rule,
-                    match_delay,
-                }
-            }),
+                },
+            ),
             (any::<u64>(), actions.clone())
                 .prop_map(|(tick, actions)| NetMsg::TickInput { tick, actions }),
             (any::<u64>(), actions.clone(), actions.clone())

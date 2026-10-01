@@ -100,6 +100,21 @@ pub enum AttackRule {
         /// Cumulative cleared lines that win the match.
         target_lines: u32,
     },
+    /// Dig Duel scaffold (rule behavior lands in T20): identical buried
+    /// garbage on both boards, no attacks. Until T20 implements it, this
+    /// behaves like no-op/no-attack (see [`Match::settle`]).
+    Dig,
+    /// Switch scaffold (rule behavior lands in T21): garbage attacks plus
+    /// full board swaps every `swap_interval_ticks` of the match clock, with
+    /// [`MatchEvent::SwapWarning`] `warning_ticks` before each swap. Until
+    /// T21 implements it, this behaves like no-op/no-attack (see
+    /// [`Match::settle`]).
+    Switch {
+        /// Match ticks between board swaps (T21; default 1 800).
+        swap_interval_ticks: u32,
+        /// Match ticks of warning ahead of a swap (T21; default 180).
+        warning_ticks: u32,
+    },
 }
 
 impl Default for AttackRule {
@@ -152,6 +167,18 @@ pub enum MatchEvent {
         /// Winning side.
         side: Side,
     },
+    /// A Switch board swap is scheduled at match tick `at_tick` (T21
+    /// scaffold: emitted `warning_ticks` before [`MatchEvent::BoardSwapped`]).
+    SwapWarning {
+        /// Match tick at which the swap will happen.
+        at_tick: u64,
+    },
+    /// The two sides' entire game states swapped at match tick `tick`
+    /// (T21 scaffold; Switch rule only).
+    BoardSwapped {
+        /// Match tick the swap executed on.
+        tick: u64,
+    },
 }
 
 /// Comparable, serializable match state (mirrors [`Game::snapshot`]).
@@ -170,6 +197,14 @@ pub struct MatchSnapshot {
     pub finished: (bool, bool),
     /// Active attack rule.
     pub rule: AttackRule,
+    /// Match-level tick counter, mirrored from [`Match::match_ticks`]: one
+    /// increment per fully-observed frame, advanced through
+    /// [`Match::advance_match_clock`] (the Switch rule's swap schedule is
+    /// expressed against this clock).
+    pub match_ticks: u64,
+    /// Number of Switch board swaps already executed (T21 swap bookkeeping;
+    /// always 0 until T21 implements the Switch rule).
+    pub swaps_done: u32,
 }
 
 /// Deterministic 1v1 match composing two independent [`Game`] instances.
@@ -186,6 +221,13 @@ pub struct Match {
     finished: [Option<u32>; 2],
     /// Number of sides that have finished the Race target.
     finish_clock: u32,
+    /// Match-level clock: one increment per fully-observed frame, driven
+    /// exclusively by [`Match::advance_match_clock`] (see there for the
+    /// exact stepping contract both peers must follow).
+    match_ticks: u64,
+    /// Number of Switch board swaps executed so far (T21 scaffold; stays 0
+    /// until T21 implements the swap logic).
+    swaps_done: u32,
     rng: Rng,
 }
 
@@ -205,6 +247,8 @@ impl Match {
             pending: [0, 0],
             finished: [None, None],
             finish_clock: 0,
+            match_ticks: 0,
+            swaps_done: 0,
             rng,
         }
     }
@@ -223,6 +267,33 @@ impl Match {
     /// under the Race rule).
     pub fn pending_attack(&self, side: Side) -> u32 {
         self.pending[side.index()]
+    }
+
+    /// Match-level clock: number of fully-observed frames advanced through
+    /// [`Match::advance_match_clock`] since the match was created.
+    pub fn match_ticks(&self) -> u64 {
+        self.match_ticks
+    }
+
+    /// Advance the match clock by one frame. The bridge calls this **exactly
+    /// once per fixed step, after both sides have ticked** (local path:
+    /// `versus_bridge_system`; netplay path: `lockstep::apply_batch` — both
+    /// on both peers), never from anywhere else. The rule is pure
+    /// call-sequence logic: both peers run identical bridge code and step
+    /// the mirror in lockstep, so `match_ticks` is the same value on both
+    /// ends at every observable point and every Swap schedule derived from
+    /// it is deterministic. Returns match-level events emitted on this tick
+    /// boundary (always empty until T21 emits `SwapWarning`/`BoardSwapped`).
+    /// Like the rest of `Match`, a crowned match is frozen: after a winner
+    /// the clock stops advancing (both peers crown on the identical lockstep
+    /// step, so the gate is symmetric and the frozen match snapshot stays
+    /// byte-stable).
+    pub fn advance_match_clock(&mut self) -> Vec<MatchEvent> {
+        if self.winner.is_some() {
+            return Vec::new();
+        }
+        self.match_ticks += 1;
+        Vec::new()
     }
 
     /// Apply one action for `side` to its game and run the versus rules:
@@ -340,6 +411,11 @@ impl Match {
                     }
                 }
             }
+            // Dig Duel / Switch: rule behavior lands in T20/T21. Until then
+            // both are documented no-attack placeholders: locks clear and
+            // top out normally (handled above), but no attack or swap
+            // bookkeeping happens here.
+            AttackRule::Dig | AttackRule::Switch { .. } => {}
         }
         out
     }
@@ -354,6 +430,8 @@ impl Match {
             winner: self.winner,
             finished: (self.finished[0].is_some(), self.finished[1].is_some()),
             rule: self.rule,
+            match_ticks: self.match_ticks,
+            swaps_done: self.swaps_done,
         }
     }
 
@@ -602,6 +680,102 @@ mod tests {
     fn default_rule_is_race_at_forty() {
         assert_eq!(AttackRule::default(), AttackRule::Race { target_lines: 40 });
         assert_eq!(DEFAULT_RACE_LINES, 40);
+    }
+
+    /// T19 append-order canary: bincode pins the variant index in the
+    /// leading fixint u32 — Garbage/Race stay at 0/1 forever, the appended
+    /// variants occupy exactly 2/3.
+    #[test]
+    fn attack_rule_variant_indices_are_append_only() {
+        let index = |rule: &AttackRule| -> u32 {
+            let bytes = bincode::serialize(rule).expect("rule encodes");
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        };
+        assert_eq!(index(&AttackRule::Garbage), 0);
+        assert_eq!(index(&AttackRule::Race { target_lines: 40 }), 1);
+        assert_eq!(index(&AttackRule::Dig), 2);
+        assert_eq!(
+            index(&AttackRule::Switch {
+                swap_interval_ticks: 1_800,
+                warning_ticks: 180,
+            }),
+            3
+        );
+    }
+
+    #[test]
+    fn new_variants_round_trip() {
+        let cases: Vec<(AttackRule, MatchEvent)> = vec![
+            (AttackRule::Dig, MatchEvent::SwapWarning { at_tick: 1_620 }),
+            (
+                AttackRule::Switch {
+                    swap_interval_ticks: 1_800,
+                    warning_ticks: 180,
+                },
+                MatchEvent::BoardSwapped { tick: 1_800 },
+            ),
+        ];
+        for (rule, event) in cases {
+            let rule_back: AttackRule = bincode::deserialize(&bincode::serialize(&rule).unwrap())
+                .expect("rule round-trips");
+            assert_eq!(rule_back, rule);
+            let event_back: MatchEvent = bincode::deserialize(&bincode::serialize(&event).unwrap())
+                .expect("event round-trips");
+            assert_eq!(event_back, event);
+        }
+    }
+
+    /// The match clock moves *only* through `advance_match_clock` — per-side
+    /// `tick` calls alone never touch it — and the snapshot mirrors it.
+    #[test]
+    fn match_clock_advances_only_via_advance_match_clock() {
+        let mut m = Match::new(1, AttackRule::Garbage);
+        assert_eq!(m.match_ticks(), 0);
+        assert_eq!(m.snapshot().match_ticks, 0);
+        assert_eq!(m.snapshot().swaps_done, 0);
+        for _ in 0..5 {
+            m.tick(Side::Left);
+            m.tick(Side::Right);
+        }
+        assert_eq!(m.match_ticks(), 0, "tick() must not move the clock");
+        m.advance_match_clock();
+        m.advance_match_clock();
+        assert_eq!(m.match_ticks(), 2);
+        let snap = m.snapshot();
+        assert_eq!(snap.match_ticks, 2);
+        assert_eq!(snap.swaps_done, 0, "no swap logic before T21");
+    }
+
+    /// T20/T21 scaffolding only: the new rules are documented no-attack
+    /// placeholders — locks clear normally, but nothing queues, swaps or
+    /// crowns beyond the standard top-out path.
+    #[test]
+    fn new_rules_are_no_attack_placeholders() {
+        let seed = find_match_seed(Some(&[Piece::I]), Some(&[Piece::I]));
+        for rule in [
+            AttackRule::Dig,
+            AttackRule::Switch {
+                swap_interval_ticks: 1_800,
+                warning_ticks: 180,
+            },
+        ] {
+            let mut m = Match::new(seed, rule);
+            setup_flat_gap(&mut m, Side::Left);
+            let ev = m.apply(Side::Left, Action::HardDrop);
+            assert_eq!(
+                ev,
+                vec![MatchEvent::PieceLocked {
+                    side: Side::Left,
+                    lines: 1
+                }],
+                "{rule:?} must neither attack nor swap before T20/T21"
+            );
+            assert_eq!(m.pending_attack(Side::Right), 0);
+            assert_eq!(m.winner(), None);
+            let mut ev = m.advance_match_clock();
+            ev.extend(m.advance_match_clock());
+            assert!(ev.is_empty(), "{rule:?} emits no clock events yet");
+        }
     }
 
     #[test]

@@ -1796,6 +1796,20 @@ mod tests {
                     snapshot.finished
                 );
             }
+            // T19 placeholder: Dig/Switch have no win condition yet
+            // (behavior lands in T20/T21), so under the no-attack scaffold
+            // the only path to a crown is a top-out — the loser is dead.
+            // The soak itself only cycles Garbage/Race (see `soak_rule`).
+            AttackRule::Dig | AttackRule::Switch { .. } => {
+                let dead = match winner {
+                    Some(Side::Left) => snapshot.right.game_over,
+                    _ => snapshot.left.game_over,
+                };
+                assert!(
+                    dead,
+                    "soak match {index}: {rule:?} placeholder crowned without a topped-out loser"
+                );
+            }
         }
         // The scripted players actually played (event pipeline sanity).
         assert!(

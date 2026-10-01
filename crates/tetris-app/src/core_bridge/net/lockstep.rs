@@ -643,6 +643,10 @@ fn apply_batch(m: &mut Match, left: &[Action], right: &[Action]) -> Vec<MatchEve
         }
         events.extend(m.tick(side));
     }
+    // Match-clock frame after both sides ticked — the exact mirror of
+    // `versus_bridge_system` (T19), so host and guest keep identical
+    // `match_ticks` (the Switch swap schedule derives from it).
+    events.extend(m.advance_match_clock());
     events
 }
 
@@ -1996,8 +2000,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
 
-        let host_snap = snapshot(&host);
-        let guest_snap = snapshot(&guest);
+        let mut host_snap = snapshot(&host);
+        let mut guest_snap = snapshot(&guest);
+        // T19: the guest mirror lags the host by the input-delay pipeline,
+        // so the two snapshots can be taken a lockstep tick apart (`>=`
+        // wait, not an aligned capture). Pin the T19 clock contract first —
+        // `match_ticks` is 1:1 with executed lockstep steps on each peer —
+        // then normalize it for the state-equality hash. Per-tick-aligned
+        // hash equality is what the production `SnapshotHash` exchange
+        // checks every 60 ticks (this run reaching here without a `Desync`
+        // proves it). Tick progress stays pinned by the wait above and the
+        // `dropped_late_inputs` / `stall_steps` asserts below.
+        for (name, app, snap) in [
+            ("host", &host, &mut host_snap),
+            ("guest", &guest, &mut guest_snap),
+        ] {
+            assert_eq!(
+                snap.match_ticks,
+                app.world().resource::<NetLockstep>().tick,
+                "{name}: match clock must be 1:1 with executed lockstep steps"
+            );
+        }
+        guest_snap.match_ticks = host_snap.match_ticks;
         assert_eq!(
             protocol::snapshot_hash(&host_snap),
             protocol::snapshot_hash(&guest_snap),

@@ -525,6 +525,10 @@ fn versus_bridge_system(
         }
         events.extend(versus.match_.tick(side));
     }
+    // One match-clock frame per fully-observed step, after both sides
+    // ticked — mirrored exactly by `lockstep::apply_batch` so netplay
+    // mirrors keep the same `match_ticks` on both peers (T19).
+    events.extend(versus.match_.advance_match_clock());
     versus.steps += 1;
     for event in events {
         messages.write(VersusEvent(event));
@@ -929,6 +933,26 @@ mod tests {
             "no CoreEvent during versus"
         );
         assert_eq!(versus_steps(&app), 3, "versus stepped instead");
+    }
+
+    #[test]
+    fn match_clock_tracks_bridge_steps_one_frame_per_step() {
+        // T19: the bridge advances the match clock exactly once per fixed
+        // step after both sides ticked — `match_ticks == steps` is the
+        // symmetry contract the netplay mirrors rely on.
+        let mut app = test_app(11);
+        activate(&mut app, Controller::Human, Controller::Human);
+        assert_eq!(
+            app.world().non_send::<VersusMatch>().match_.match_ticks(),
+            0
+        );
+        for _ in 0..5 {
+            fixed_step(&mut app);
+        }
+        let versus = app.world().non_send::<VersusMatch>();
+        assert_eq!(versus.steps, 5);
+        assert_eq!(versus.match_.match_ticks(), 5);
+        assert_eq!(versus.match_.snapshot().match_ticks, 5);
     }
 
     #[test]
@@ -1417,6 +1441,9 @@ mod tests {
         reference.tick(Side::Left);
         reference.apply(Side::Right, Action::HardDrop);
         reference.tick(Side::Right);
+        // T19: the bridge advances the match clock once per step after both
+        // sides ticked — the direct reference path mirrors that contract.
+        reference.advance_match_clock();
         assert_eq!(snap, reference.snapshot(), "Idle bridge == direct path");
     }
 
@@ -1566,9 +1593,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(guest.world().non_send::<VersusMatch>().seed, seed);
+        // T19: with the input-delay pipeline the guest legitimately trails
+        // the host by a lockstep tick at capture time. Pin the 1:1 clock
+        // contract per peer (match clock == executed lockstep steps), then
+        // normalize the clock for the state-equality hash — the production
+        // `SnapshotHash` exchange (no `Desync` here) keeps tick-aligned
+        // hash equality; the 20-match soak and relay tests cover it.
+        let mut host_snap = host.world().non_send::<VersusMatch>().match_.snapshot();
+        let mut guest_snap = guest.world().non_send::<VersusMatch>().match_.snapshot();
+        for (name, app, snap) in [
+            ("host", &host, &mut host_snap),
+            ("guest", &guest, &mut guest_snap),
+        ] {
+            assert_eq!(
+                snap.match_ticks,
+                app.world().resource::<NetLockstep>().tick,
+                "{name}: match clock must be 1:1 with executed lockstep steps"
+            );
+        }
+        guest_snap.match_ticks = host_snap.match_ticks;
         assert_eq!(
-            protocol::snapshot_hash(&host.world().non_send::<VersusMatch>().match_.snapshot()),
-            protocol::snapshot_hash(&guest.world().non_send::<VersusMatch>().match_.snapshot()),
+            protocol::snapshot_hash(&host_snap),
+            protocol::snapshot_hash(&guest_snap),
             "mirrors still agree after {target} lockstep ticks"
         );
 
