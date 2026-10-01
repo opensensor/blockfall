@@ -1,9 +1,10 @@
-//! Settings / best-score JSON persistence (T15).
+//! Settings JSON persistence (T15) + the [`PersistedBestScore`] display view
+//! over the Marathon record (T6).
 //!
 //! Storage layout — `<config_dir>/settings.json` + `<config_dir>/best.json`,
 //! where the config dir is `dirs::config_dir()/tetris` (e.g.
 //! `~/.config/tetris/`) unless the `TETRIS_CONFIG_DIR` environment variable
-//! overrides it (tests and packaging). Both files are written atomically
+//! overrides it (tests and packaging). Files are written atomically
 //! (tmp file + rename) and a missing or corrupt file falls back to defaults
 //! with a `warn!` — the loader never panics.
 //!
@@ -16,14 +17,18 @@
 //!   `{"Key":"KeyA"}` (Bevy `KeyCode` variant name via its serde impl,
 //!   enabled through the `bevy/serialize` feature) and plain `"WheelUp"` /
 //!   `"WheelDown"`. Round-trip tested for every PRD §9 default binding.
-//! - `best.json` — `{ "score": u64, "level": u32, "lines": u32 }`, the best
-//!   finished run (highest score, [`record_final_run`] keeps the max).
+//! - `best.json` — per-mode records file owned **exclusively** by
+//!   [`crate::records`] (T6 single-writer fix); the legacy
+//!   `{ "score": u64, "level": u32, "lines": u32 }` shape is a migration
+//!   input there. This module only *reads* it (via `records::load_from`) to
+//!   refresh [`PersistedBestScore`]; [`save_to`]/[`save_once`] no longer
+//!   write it.
 //!
 //! Public API for T16 (settings screen) and T17 (game-over screen):
-//! [`SettingsPersistPlugin`], [`PersistedBestScore`] (read-only display
-//! resource; saves happen automatically on change, on `CoreEvent(GameOver)`
-//! and on app exit), plus the explicit [`load`]/[`save_once`] helpers and
-//! their path-injectable [`load_from`]/[`save_to`] twins.
+//! [`SettingsPersistPlugin`] (mounts [`crate::records::RecordsPlugin`]),
+//! [`PersistedBestScore`] (display-only view of the Marathon `BestScore`),
+//! plus the explicit [`load`]/[`save_once`] helpers and their path-injectable
+//! [`load_from`]/[`save_to`] twins (settings/bindings only).
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
@@ -56,8 +61,9 @@ pub const NET_PROFILE_FILE: &str = "net_profile.json";
 /// Environment variable that overrides the config dir (used by tests).
 pub const CONFIG_DIR_ENV: &str = "TETRIS_CONFIG_DIR";
 
-/// Seconds a settings/bindings change waits before hitting disk.
-const SAVE_DEBOUNCE_SECS: f32 = 0.4;
+/// Seconds a settings/bindings change waits before hitting disk. Also used
+/// by [`crate::records`] for its own debounced `best.json` writer.
+pub(crate) const SAVE_DEBOUNCE_SECS: f32 = 0.4;
 
 /// Platform config directory for persisted files, honoring
 /// [`CONFIG_DIR_ENV`]. Never fails; degrades to `./tetris`.
@@ -82,8 +88,12 @@ pub fn config_dir() -> PathBuf {
     base.join(APP_DIR_NAME)
 }
 
-/// Best finished run, keyed on final score (PRD §7.4 "best").
-/// T17 renders `score`/`level`/`lines` from this resource.
+/// Best finished Marathon run (PRD §7.4 "best"), displayed by the title and
+/// game-over screens.
+///
+/// T6: this is a **view** over the Marathon [`crate::records::Record::BestScore`]
+/// entry, refreshed every frame from [`crate::records`] — it is never a
+/// recorder and never writes disk itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Resource)]
 pub struct PersistedBestScore {
     /// Final score of the best run.
@@ -237,35 +247,12 @@ struct SettingsFile {
     bindings: BindingsFile,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct BestFile {
-    score: u64,
-    level: u32,
-    lines: u32,
-}
-
-impl From<PersistedBestScore> for BestFile {
-    fn from(best: PersistedBestScore) -> Self {
-        Self {
-            score: best.score,
-            level: best.level,
-            lines: best.lines,
-        }
-    }
-}
-
-impl From<BestFile> for PersistedBestScore {
-    fn from(file: BestFile) -> Self {
-        Self {
-            score: file.score,
-            level: file.level,
-            lines: file.lines,
-        }
-    }
-}
-
 /// Keep only the best run (highest final score) in `best`. Returns `true`
 /// when the record was replaced.
+///
+/// T6 note: recording now lives in [`crate::records::Records::record_run`];
+/// this helper stays API-compatible as a pure max-score fold for the
+/// [`PersistedBestScore`] view and its callers.
 pub fn record_final_run(best: &mut PersistedBestScore, score: u64, level: u32, lines: u32) -> bool {
     if score <= best.score {
         return false;
@@ -300,14 +287,35 @@ fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Option<T> {
 
 /// Path-injectable loader: `(Settings, KeyBindings, best)` from `dir`,
 /// falling back to defaults file-by-file on missing/corrupt input.
+///
+/// T6: the returned [`PersistedBestScore`] is the display **view** of the
+/// Marathon [`crate::records::Record::BestScore`] entry read through
+/// [`crate::records::load_from`] (which transparently migrates the legacy
+/// file). Nothing here writes `best.json` — that is [`crate::records`]' job.
 pub fn load_from(dir: &Path) -> (Settings, KeyBindings, PersistedBestScore) {
     let (settings, bindings) = match read_json_opt::<SettingsFile>(&dir.join(SETTINGS_FILE)) {
         Some(file) => (file.settings, file.bindings.into()),
         None => (Settings::default(), KeyBindings::default()),
     };
-    let best = read_json_opt::<BestFile>(&dir.join(BEST_FILE))
-        .map_or(PersistedBestScore::default(), PersistedBestScore::from);
+    let best = marathon_view(&crate::records::load_from(dir));
     (settings, bindings, best)
+}
+
+/// [`PersistedBestScore`] display view of the Marathon `BestScore` entry
+/// (defaults when absent or a non-score variant is stored).
+fn marathon_view(records: &crate::records::Records) -> PersistedBestScore {
+    match records.record_for(crate::records::MARATHON) {
+        Some(crate::records::Record::BestScore {
+            score,
+            level,
+            lines,
+        }) => PersistedBestScore {
+            score: *score,
+            level: *level,
+            lines: *lines,
+        },
+        _ => PersistedBestScore::default(),
+    }
 }
 
 /// Load from the platform [`config_dir`].
@@ -316,7 +324,8 @@ pub fn load() -> (Settings, KeyBindings, PersistedBestScore) {
 }
 
 /// Write `bytes` to `path` atomically: sibling tmp file, fsync, rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Also used by [`crate::records`] for `best.json` (T6 single-writer).
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let result = (|| -> io::Result<()> {
         let mut file = File::create(&tmp)?;
@@ -335,26 +344,29 @@ fn to_bytes<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec_pretty(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-/// Write both files under `dir` (created if absent). One atomic swap per
-/// file; a failed run leaves the previous files untouched.
+/// Write `settings.json` under `dir` (created if absent); one atomic swap, a
+/// failed run leaves the previous file untouched.
+///
+/// T6 single-writer fix: `best.json` is **no longer written here** — it is
+/// owned by [`crate::records`] (only `records::save_to`/`records::save`
+/// touch it now). `_best` remains in the signature for caller compatibility
+/// and is ignored.
 pub fn save_to(
     dir: &Path,
     settings: &Settings,
     bindings: &KeyBindings,
-    best: PersistedBestScore,
+    _best: PersistedBestScore,
 ) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let settings_bytes = to_bytes(&SettingsFile {
         settings: settings.clone(),
         bindings: BindingsFile::from(bindings),
     })?;
-    write_atomic(&dir.join(SETTINGS_FILE), &settings_bytes)?;
-    let best_bytes = to_bytes(&BestFile::from(best))?;
-    write_atomic(&dir.join(BEST_FILE), &best_bytes)?;
-    Ok(())
+    write_atomic(&dir.join(SETTINGS_FILE), &settings_bytes)
 }
 
-/// Save immediately to the platform [`config_dir`].
+/// Save settings immediately to the platform [`config_dir`] (see
+/// [`save_to`]: `best.json` is not touched).
 pub fn save_once(
     settings: &Settings,
     bindings: &KeyBindings,
@@ -504,10 +516,14 @@ fn change_detection_system(
     queue.timer.reset();
 }
 
-/// On `CoreEvent(GameEvent::GameOver)` fold the finished run's final
-/// score/level/lines (read from `GameCore`) into the best record and force
-/// an immediate flush. Exclusive (direct `&mut World`) because `GameCore`
-/// is a non-send resource; no-ops in apps without the core bridge.
+/// Interim Marathon recorder (T6, until T9 makes the game-over screen the
+/// caller of [`crate::records::Records::record_run`]): on
+/// `CoreEvent(GameEvent::GameOver)` fold the finished run's snapshot into the
+/// Marathon [`crate::records::Record::BestScore`] and force a records flush
+/// **only when the record improved**. Exclusive (direct `&mut World`) because
+/// `GameCore` is a non-send resource; no-ops in apps without the core bridge.
+/// Writes through [`crate::records`] — the sole `best.json` writer; never
+/// touches [`PersistedBestScore`] or the settings [`SaveQueue`].
 fn best_score_system(world: &mut World) {
     let game_over = world
         .get_resource::<Messages<CoreEvent>>()
@@ -524,22 +540,46 @@ fn best_score_system(world: &mut World) {
         return;
     };
     let snapshot = core.game.snapshot();
-    let mut best = world.resource_mut::<PersistedBestScore>();
-    if record_final_run(&mut best, snapshot.score, snapshot.level, snapshot.lines) {
-        let mut queue = world.resource_mut::<SaveQueue>();
-        queue.pending = true;
-        queue.force = true;
+    let improved = match world.get_resource_mut::<crate::records::Records>() {
+        Some(mut records) => records.record_run(
+            crate::records::MARATHON,
+            crate::records::Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            },
+        ),
+        None => return,
+    };
+    if improved {
+        if let Some(mut queue) = world.get_resource_mut::<crate::records::RecordsSaveQueue>() {
+            queue.pending = true;
+            queue.force = true;
+        }
     }
 }
 
-/// Perform the pending save once the debounce window has elapsed (or was
-/// forced by a game-over record).
+/// Refresh the [`PersistedBestScore`] display view from the Marathon entry
+/// (T6): a pure view, no disk access, and only assigned on difference so the
+/// resource never self-dirties every frame.
+fn best_score_view_system(
+    records: Res<crate::records::Records>,
+    mut best: ResMut<PersistedBestScore>,
+) {
+    let view = marathon_view(&records);
+    if *best != view {
+        *best = view;
+    }
+}
+
+/// Perform the pending settings save once the debounce window has elapsed.
+/// T6: best score no longer flows through this path (see
+/// [`crate::records::records_flush_system`]).
 fn flush_system(
     time: Res<Time>,
     mut queue: ResMut<SaveQueue>,
     settings: Res<Settings>,
     bindings: Res<KeyBindings>,
-    best: Res<PersistedBestScore>,
 ) {
     if !queue.pending {
         return;
@@ -550,39 +590,54 @@ fn flush_system(
     }
     queue.pending = false;
     queue.force = false;
-    if let Err(err) = save_to(&config_dir(), &settings, &bindings, *best) {
-        warn!("could not persist settings/best score: {err}");
+    if let Err(err) = save_to(
+        &config_dir(),
+        &settings,
+        &bindings,
+        PersistedBestScore::default(),
+    ) {
+        warn!("could not persist settings: {err}");
     }
 }
 
-/// Last-chance flush: a still-pending change is written when the app exits.
+/// Last-chance flush: a still-pending settings change is written when the app
+/// exits (best score is flushed by [`crate::records::records_exit_flush_system`]).
 fn exit_flush_system(
     mut exits: MessageReader<AppExit>,
     queue: Res<SaveQueue>,
     settings: Res<Settings>,
     bindings: Res<KeyBindings>,
-    best: Res<PersistedBestScore>,
 ) {
     if exits.read().next().is_none() || !queue.pending {
         return;
     }
-    if let Err(err) = save_to(&config_dir(), &settings, &bindings, *best) {
-        warn!("could not persist settings/best score on exit: {err}");
+    if let Err(err) = save_to(
+        &config_dir(),
+        &settings,
+        &bindings,
+        PersistedBestScore::default(),
+    ) {
+        warn!("could not persist settings on exit: {err}");
     }
 }
 
-/// Loads `Settings` + best score at startup and saves them atomically.
+/// Loads `Settings` at startup and saves them atomically, and mounts
+/// [`crate::records::RecordsPlugin`] — the sole `best.json` owner (T6).
 ///
-/// Registers [`PersistedBestScore`] for T17 and auto-persists: debounced on
-/// any [`Settings`]/[`KeyBindings`] change (T16 edits need no extra call),
-/// immediately on `CoreEvent(GameEvent::GameOver)`, and once more on
-/// [`AppExit`] if a debounced save is still in flight. N5 adds the separate
-/// [`NetProfile`] resource on top: loaded at `Startup`, rewritten (atomic,
-/// same discipline) one frame after a change and once more on [`AppExit`].
+/// Registers [`PersistedBestScore`] (display view of the Marathon record)
+/// for the title/game-over screens: saves happen automatically on
+/// [`Settings`]/[`KeyBindings`] change (debounced, T16 edits need no extra
+/// call) and once more on [`AppExit`] if a debounced save is still in
+/// flight. N5 adds the separate [`NetProfile`] resource on top: loaded at
+/// `Startup`, rewritten (atomic, same discipline) one frame after a change
+/// and once more on [`AppExit`].
 pub struct SettingsPersistPlugin;
 
 impl Plugin for SettingsPersistPlugin {
     fn build(&self, app: &mut App) {
+        // T6: per-mode records live in their own plugin — resources, startup
+        // load, debounced/forced flushes and the AppExit safety net.
+        app.add_plugins(crate::records::RecordsPlugin);
         // Defensive inits: the plugin is self-sufficient even when added
         // before `main.rs`/`InputPlugin` inserted these resources.
         app.init_resource::<Settings>()
@@ -597,6 +652,7 @@ impl Plugin for SettingsPersistPlugin {
                 Update,
                 (
                     best_score_system,
+                    best_score_view_system,
                     change_detection_system,
                     flush_system,
                     net_profile_flush_system,
@@ -692,11 +748,9 @@ mod tests {
         );
         bindings.set_slot(BindSlot::Rotate180, vec![Bind::WheelDown]);
         bindings.set_slot(BindSlot::Pause, Vec::new());
-        let best = PersistedBestScore {
-            score: 123_456,
-            level: 9,
-            lines: 140,
-        };
+        // T6: `save_to` no longer persists best scores (records module owns
+        // best.json), so the round-trip uses the default view value.
+        let best = PersistedBestScore::default();
 
         save_to(dir.path(), &settings, &bindings, best).expect("save edited");
         assert_eq!(load_from(dir.path()), (settings, bindings, best));
@@ -793,11 +847,15 @@ mod tests {
         let (settings, bindings, best) = default_trio();
         save_to(dir.path(), &settings, &bindings, best).unwrap();
 
-        for name in [SETTINGS_FILE, BEST_FILE] {
-            let raw = fs::read_to_string(dir.path().join(name)).unwrap();
-            serde_json::from_str::<serde_json::Value>(&raw)
-                .unwrap_or_else(|err| panic!("{name} is not valid JSON: {err}"));
-        }
+        // T6: settings persistence touches settings.json only; best.json is
+        // owned by the records module.
+        let raw = fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|err| panic!("{SETTINGS_FILE} is not valid JSON: {err}"));
+        assert!(
+            !dir.path().join(BEST_FILE).exists(),
+            "settings save must not write best.json"
+        );
         let leftovers: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -805,14 +863,11 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "tmp file left behind: {leftovers:?}");
 
-        // A second save atomically replaces both files and stays readable.
-        let better = PersistedBestScore {
-            score: 7,
-            level: 1,
-            lines: 2,
-        };
-        save_to(dir.path(), &settings, &bindings, better).unwrap();
-        assert_eq!(load_from(dir.path()).2, better);
+        // A second save atomically replaces the settings file and stays readable.
+        let mut edited = settings.clone();
+        edited.das_ms = 99;
+        save_to(dir.path(), &edited, &bindings, best).unwrap();
+        assert_eq!(load_from(dir.path()).0.das_ms, 99);
     }
 
     #[test]
@@ -857,9 +912,11 @@ mod tests {
         std::env::remove_var(CONFIG_DIR_ENV);
     }
 
-    /// Full integration path: boot the persistence plugin (plus the real
-    /// core bridge) against a temp dir, play to game over through the fixed
-    /// schedule and assert the best score reached disk.
+    /// Full integration path (T6): boot the persistence + records plugins
+    /// (plus the real core bridge) against a temp dir, play to game over
+    /// through the fixed schedule and assert the Marathon record — not a raw
+    /// best — reaches disk via the sole writer, and the title-screen view
+    /// refreshes from it.
     #[test]
     fn app_boots_and_game_over_persists_best_score() {
         let _env = ENV_LOCK.lock().unwrap();
@@ -880,6 +937,7 @@ mod tests {
             PersistedBestScore::default()
         );
         assert!(!dir.path().join(SETTINGS_FILE).exists());
+        assert!(!dir.path().join(BEST_FILE).exists());
 
         // Pile pieces up until the core declares game over.
         for _ in 0..1000 {
@@ -896,23 +954,106 @@ mod tests {
         let expected = app.world().non_send::<GameCore>().game.snapshot();
         assert!(expected.score > 0, "precondition: the run scored");
 
-        // Two Update frames: capture the GameOver event, then flush it.
+        // Several Update frames: record + refresh the view, then flush.
+        for _ in 0..3 {
+            app.update();
+        }
+
+        // The Marathon record is the sole thing written to best.json (new shape).
+        let marathon = crate::records::load_from(dir.path());
+        assert_eq!(
+            marathon.record_for(crate::records::MARATHON),
+            Some(&crate::records::Record::BestScore {
+                score: expected.score,
+                level: expected.level,
+                lines: expected.lines,
+            })
+        );
+        // ... and the title-screen view (via `load_from` too) reflects it.
+        let (settings, bindings, best_view) = load_from(dir.path());
+        assert_eq!(best_view.score, expected.score);
+        assert_eq!(
+            app.world().resource::<PersistedBestScore>().score,
+            expected.score
+        );
+        // Game over no longer forces a settings write: settings.json absent.
+        assert!(!dir.path().join(SETTINGS_FILE).exists());
+        assert_eq!(settings, Settings::default());
+        assert_eq!(bindings, KeyBindings::default());
+
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    /// The [`PersistedBestScore`] view tracks the Marathon record: it follows
+    /// a better score and does NOT regress on a worse one.
+    #[test]
+    fn best_score_view_tracks_marathon_record() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new("viewsync");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = minimal_persist_app(&dir);
+        app.update();
+
+        let better = crate::records::Record::BestScore {
+            score: 1000,
+            level: 5,
+            lines: 40,
+        };
+        assert!(app
+            .world_mut()
+            .resource_mut::<crate::records::Records>()
+            .record_run(crate::records::MARATHON, better.clone()));
         app.update();
         assert_eq!(
             *app.world().resource::<PersistedBestScore>(),
             PersistedBestScore {
-                score: expected.score,
-                level: expected.level,
-                lines: expected.lines,
+                score: 1000,
+                level: 5,
+                lines: 40
             }
         );
-        let (_, _, best) = load_from(dir.path());
-        assert_eq!(best.score, expected.score);
-        // The forced save rewrites settings.json too — still valid defaults.
-        let (settings, bindings, _) = load_from(dir.path());
-        assert_eq!(settings, Settings::default());
-        assert_eq!(bindings, KeyBindings::default());
 
+        let improved = app
+            .world_mut()
+            .resource_mut::<crate::records::Records>()
+            .record_run(
+                crate::records::MARATHON,
+                crate::records::Record::BestScore {
+                    score: 999,
+                    level: 9,
+                    lines: 99,
+                },
+            );
+        assert!(!improved, "worse run must not replace the record");
+        app.update();
+        assert_eq!(
+            *app.world().resource::<PersistedBestScore>(),
+            PersistedBestScore {
+                score: 1000,
+                level: 5,
+                lines: 40
+            },
+            "view must not regress"
+        );
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    #[test]
+    fn settings_exit_flush_never_touches_best_json() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new("singlewriter");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = minimal_persist_app(&dir);
+        app.update();
+        app.world_mut().resource_mut::<Settings>().das_ms = 133;
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        // Settings flushed on exit, best.json never written by settings paths.
+        assert!(dir.path().join(SETTINGS_FILE).exists());
+        assert!(
+            !dir.path().join(BEST_FILE).exists(),
+            "only the records module may create best.json"
+        );
         std::env::remove_var(CONFIG_DIR_ENV);
     }
 
