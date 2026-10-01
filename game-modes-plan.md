@@ -1,0 +1,643 @@
+# Plan: Blockfall Game Modes (PRD: game-modes-PRD.md)
+
+**Generated**: 2026-10-01
+
+## Overview
+
+Add nine game modes, two versus rules and mutators to Blockfall over three
+gated releases, per `game-modes-PRD.md`. The keystone is R1 (mode config +
+tick clock + per-mode records), which every later mode reuses as data. The
+core stays deterministic; times are ticks; the frozen
+`Game`/`GameEvent`/`Action` contract reopens exactly once (T2) and
+`GameSnapshot`/`MatchSnapshot` wire shapes stay byte-stable until the R3
+protocol bump.
+
+**Owner decisions locked in (2026-10-01):**
+- Plan covers all three releases, with hard release gates between them.
+- Sprint and Dig gravity: **fixed at level 1** (`levels_advance = false`).
+- Mutator runs: **no record** (mode play counters still increment).
+- Switch: queued garbage **follows the board** (swap exchanges board, hold,
+  next queue and pending garbage).
+- Race rule: **unchanged** (no same-pieces retrofit).
+
+**Assumptions for the remaining PRD open questions** (flip before their task
+runs if the owner decides otherwise):
+- Daily Challenge: first completed run of the day is recorded; share line is
+  **display-only text** on the result screen (Bevy 0.19 has no clipboard).
+- Zen top-out: **wipes the whole stack**.
+- `game-modes-PRD.md` check-in beside `PRD.md` (+ §14 item 3 close +
+  CHANGELOG): done as the final docs task (T25), pending the owner checkbox.
+
+## Prerequisites
+
+- Rust toolchain per `rust-toolchain.toml` (clippy + rustfmt included).
+- Validation loop: `cargo test --workspace`, `cargo clippy --workspace -- -D
+  warnings`, `cargo fmt --all --check`.
+- Headless drivers already present: `TETRIS_BOT=1`, `TETRIS_1V1=garbage|race`,
+  `TETRIS_NET=host:<port>|join:<addr>`, `TETRIS_SEED`, `TETRIS_CONFIG_DIR`,
+  nightly `#[ignore]`d soaks (`cargo test --workspace -- --ignored`).
+- No new dependencies. No accounts, servers, or >2-player matches (PRD
+  non-goals).
+
+## Key architectural constraints (carry through every task)
+
+1. **Wire stability in R1/R2**: do NOT add/reorder fields in `GameSnapshot`,
+   `MatchSnapshot`, or `AttackRule` (all bincode-encoded for
+   `snapshot_hash`/`MatchStart`). New `GameEvent` variants are safe (events
+   never cross the wire) but must be **appended** at the end of the enum.
+   The R6 protocol bump happens only in T19.
+2. `Game::new(seed)` keeps its exact current behavior; mode behavior arrives
+   via `Game::with_config(seed, &ModeConfig)` whose default config reproduces
+   Marathon bit-for-bit (gated by the golden test T1).
+3. The core never reads a clock or date; the Daily seed is derived in the app.
+4. Countdowns (Sprint/Dig 3 s, Ultra warning, Switch swap warning) are tick
+   budgets, not wall time. Solo start countdowns gate stepping in the app
+   bridge so core tick 0 == first playable frame.
+5. `state.rs` T1 contract: only **additive** changes (new `AppState` variant);
+   fix non-exhaustive matches it creates.
+6. Every task ends with the repo green: tests + clippy `-D warnings` + fmt.
+
+## Dependency Graph
+
+```
+Release 1                          Release 2                  Release 3
+T1 ──► T2 ──┬──────────────────────────────────────┐
+            ├── T3 ── T4 ──┐                       │
+            │              ├── T10 ─┐              │
+            └── T5 ─┬── T8 ─┼───────┼─┐            │
+  T6 ───────────────┼───────┼─── T7 ─┼─ T9 ─ T11 ═ GATE ═╗
+                    │       │        │                  ║
+                    ╚═══════╧════════╧══╗               ║
+                                        ║               ║
+                              T12 ── T13║               ║
+                              T14 ══════╣               ║
+                              T15 ── T16║               ║
+                              T17 ══════╩═══ T18 ═ GATE ═╗
+                                                         ║
+                                   T19 ── T20 ── T21 ─┐  ║
+                                   T23 ── T24         ├─ T22
+                                                      │     ║
+                                   T25 ═ FINAL GATE ◄═╧═════╝
+```
+
+## Tasks
+
+### T1: Marathon golden regression test
+- **depends_on**: []
+- **location**: `crates/tetris-core/tests/marathon_regression.rs` (new)
+- **description**: Pin today's behavior before any core change: for 3 fixed
+  seeds, run scripted action logs (moves, rotations, drops, holds, ticks to
+  top-out), assert exact final `GameSnapshot` field values AND the exact
+  bincode byte length + hash of the snapshot (wire-shape canary). This test
+  is the R1 release gate's "Marathon unchanged" criterion.
+- **validation**: `cargo test -p tetris-core marathon` passes on current code;
+  stays green through T2–T11.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T2: Core mode config, tick clock, goal/time-up events
+- **depends_on**: [T1]
+- **location**: `crates/tetris-core/src/mode.rs` (new), `crates/tetris-core/src/game.rs`, `crates/tetris-core/src/event.rs`, `crates/tetris-core/src/lib.rs`
+- **description**: The one deliberate reopening of the frozen contract.
+  `mode.rs`: `ModeConfig { start_level: u32, levels_advance: bool, goal:
+  Option<Goal>, clock_ticks: Option<u64>, start_board: Option<StartBoard>,
+  on_block_out: BlockOutBehavior }` with `Default` == today's Marathon
+  (level 1, advancing, no goal/clock, empty board, end on block-out);
+  `Goal::Lines(u32) | Goal::GarbageCleared`; `StartBoard::BuriedGarbage {
+  rows: usize }` (one hole per row, no two adjacent rows share a hole column,
+  holes drawn from a splitmix64 stream derived from the seed);
+  `BlockOutBehavior::End | WipeAndContinue` (behavior wired in T14, plumbed
+  here). `Game::with_config(seed, &ModeConfig)`; `Game::new` delegates with
+  the default config. Game internals: `ticks: u64` incremented in `tick()`,
+  public `tick_count()`; `levels_advance=false` pins gravity to
+  `interval_for(start_level)` and suppresses `LevelUp`; fixed `start_level`
+  seeds `gravity::interval_for` without touching `gravity.rs` semantics.
+  Terminal handling: reaching goal or clock expiry freezes the game (all
+  further `tick`/`apply` are no-ops, like game-over) and emits `GameEvent::
+  GoalReached { tick }` / `GameEvent::TimeUp { tick }` — new variants
+  **appended** to the enum (T1 wire-canary must stay green: `GameSnapshot`
+  gets NO fields; terminal state is exposed via a `Game::finished_reason()
+  -> Option<FinishReason>` getter, not the snapshot). `garbage_rows_left()`
+  getter counts rows containing ≥1 `Piece::Garbage` cell.
+- **validation**: Unit tests in `mode.rs`/`game.rs`: default config ==
+  `Game::new` (snapshot equality over scripted play); fixed-level config
+  never emits `LevelUp`; `Goal::Lines(40)` emits `GoalReached` exactly once
+  and freezes; `clock_ticks: 100` emits `TimeUp` at tick 100 even with no
+  pieces placed; buried-garbage start board satisfies the no-adjacent-hole
+  invariant over 100 seeds. T1 golden test still passes.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T3: Core Dig mechanics
+- **depends_on**: [T2]
+- **location**: `crates/tetris-core/src/mode.rs`, `crates/tetris-core/src/game.rs` (+ tests)
+- **description**: Make `Goal::GarbageCleared` fire when `garbage_rows_left()`
+  hits 0 (evaluate after `lock_and_spawn`'s line clear). Note garbage rows
+  shift down with the stack; the metric is rows containing `Piece::Garbage`,
+  so clearing any garbage cell in a row retires that row. Sprint config is
+  `Goal::Lines(40)`; confirm Sprint needs no further core work (config-only,
+  exercised in T4).
+- **validation**: Core unit test: seed a buried board, script clears to zero
+  garbage ⇒ `GoalReached { tick }`; top-out before that ⇒ `GameOver` only, no
+  goal. Same-seed replay equality test for a full Dig run.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T4: Sprint + Ultra config semantics, headless completion tests
+- **depends_on**: [T2, T3]
+- **location**: `crates/tetris-core/tests/modes_headless.rs` (new)
+- **description**: Pure-core proof (no Bevy) using the greedy solver pattern
+  from `core_bridge` reimplemented against `Game` directly, or a scripted
+  hard-drop driver: (a) Sprint config (40 lines, fixed level 1) completes with
+  `GoalReached`; (b) Dig config (10 buried rows, fixed level 1) completes
+  with `GoalReached`; (c) Ultra config (clock 7 200 ticks, marathon
+  progression) emits `TimeUp` at **exactly** tick 7 200 with a non-zero score
+  and score stands (no top-out needed); top-out before the clock also ends it
+  with score kept. These are the PRD's "Solo modes complete headlessly" CI
+  criterion; re-run in CI on every push (not `#[ignore]`d).
+- **validation**: `cargo test -p tetris-core modes_headless` green in CI.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T5: App solo bridge — mode-aware starts, countdown, terminal reasons
+- **depends_on**: [T2]
+- **location**: `crates/tetris-app/src/core_bridge/mod.rs`, `crates/tetris-app/src/modes.rs` (new)
+- **description**: `modes.rs`: `ModeId` enum (`Marathon, Sprint, Ultra, Dig`
+  now; later modes add their variant in their own task) with one catalogue
+  `fn mode_config(id) -> ModeConfig` + display name + one-line description,
+  so menus/records/catalogue share a single source. `GameCore` gains
+  `start_mode(seed, ModeConfig)` (keeping `restart_with` for Marathon and
+  honoring `TETRIS_SEED` like `restart_run`); `restart_on_r_system` retries
+  the current mode, not raw Marathon. A `Countdown` resource gates stepping
+  for modes with a pre-roll (Sprint/Dig: 180 ticks, HUD shows 3-2-1 via
+  `SimPaused`-style hold that still drains events); core tick 0 therefore
+  equals the first playable frame. On `GoalReached`/`TimeUp` events the
+  bridge flips `AppState::GameOver` (terminal reason exposed for T9 via
+  `Game::finished_reason()`). **Countdown vs pause**: the pre-roll is its own
+  `Countdown(u32)` resource consumed in `FixedUpdate` only while
+  `AppState::Playing` and `SimPaused(false)`; it does NOT reuse `SimPaused`
+  (a pause+resume via `resume_game` in `screens_menu.rs` must never cancel
+  the remaining 3-2-1). Actions arriving during the countdown keep being
+  held in `PendingActions` exactly like a freeze frame. Also **pre-declare
+  the full `ModeId` catalogue now** (all ten modes with configs, names,
+  descriptions) behind an `is_shipped(id) -> bool` list, so later mode tasks
+  add no catalogue rows — they only flip `is_shipped` — which keeps
+  `modes.rs` free of same-wave edit conflicts.
+- **validation**: Headless bridge tests (MinimalPlugins pattern already in the
+  file): starting Sprint runs the countdown before the first core tick; Ultra
+  `TimeUp` flips `AppState::GameOver`; Sprint top-out yields no goal event.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T6: Per-mode records file + best.json migration + play counts
+- **depends_on**: []
+- **location**: `crates/tetris-app/src/records.rs` (new), `crates/tetris-app/src/settings_persist.rs`, `crates/tetris-app/src/screens_menu.rs` (best label call sites)
+- **description**: Replace the single `best.json` shape with a per-mode
+  records file reusing this module's atomic-write/load discipline:
+  `Record { BestTime{ticks}, BestScore{score,level,lines}, LifetimeLines,
+  HighestRung, Daily{date,result} }` keyed by `ModeId` string; plus per-mode
+  play counters (PRD success metric). Migration: old `{score,level,lines}`
+  shape loads into the Marathon `BestScore` and is rewritten in the new
+  shape on first save (serde-tagged enum or versioned wrapper; corrupt file
+  still falls back to defaults like today). `PersistedBestScore` resource
+  stays (title screen reads it) but becomes a view over the Marathon entry.
+  **Single-writer fix (critical):** today
+  `settings_persist::best_score_system` force-records *every*
+  `GameEvent::GameOver` into `PersistedBestScore` — with modes live that
+  would record Sprint/Dig/Survival top-outs as Marathon bests (PRD: no
+  result) while Ultra's `TimeUp` records nothing. This task retires that
+  system as a writer: `Records` becomes the sole recorder, the legacy
+  `best_score_system` is reduced to refreshing the `PersistedBestScore` view
+  from the Marathon entry (no disk writes), and the game-over screen (T9) is
+  the only caller of `record_run`, gated by terminal reason × mode (Sprint/
+  Dig top-out → nothing; Ultra either ending → score; Survival GameOver →
+  time). API: `Records` resource, `record_for(mode)`, `record_run(mode,
+  outcome)` returning `bool` is_record, `bump_plays(mode)`.
+- **validation**: Round-trip tests under `TETRIS_CONFIG_DIR` (env-lock
+  pattern already in `settings_persist`): legacy file migrates to Marathon;
+  corrupt file ⇒ defaults; time/score/rung/daily record updates; play counters
+  increment. Existing `app_boots_and_game_over_persists_best_score` adapted.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T7: Mode select screen (portrait-first)
+- **depends_on**: [T5, T6]
+- **location**: `crates/tetris-app/src/screens_modes.rs` (new), `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/state.rs`, `crates/tetris-app/src/touch.rs`
+- **description**: Add `AppState::ModeSelect` (additive; fix exhaustive
+  matches). Title's "Start" now goes to a scrolling list: one row per solo
+  mode (Sprint/Ultra/Dig + Marathon), each showing name, one-line description
+  and its record from T6. Row press → `start_mode` via T5. Keep the existing
+  1 v 1 / Online / Settings / Quit buttons. Reuse the `menu_button` marker /
+  `Interaction` click pattern; must be touch-operable and readable in portrait
+  (scroll container; PRD risk "ten entries crowd the phone menu").
+- **validation**: Headless UI test: button click moves `AppState` to
+  `ModeSelect`, row click starts the right `ModeConfig`; manual portrait APK
+  check (start, scroll, select, back).
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T8: HUD clock and goal counter
+- **depends_on**: [T5]
+- **location**: `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/audio.rs`
+- **description**: Add a clock label and per-mode goal counter to the solo
+  HUD, shown only when the mode requests it (`ModeId` catalogue flag):
+  Sprint = count-up clock (mm:ss.hh from `Game::tick_count()`), lines left,
+  pieces placed (count `PieceLocked` events client-side); Ultra = count-down
+  from `clock_ticks` (score already shown); Dig = clock + garbage rows left
+  (`garbage_rows_left()`). Tick→time formatting helper lives in `modes.rs`.
+  **Data carrier**: `GameSnapshot` gains no fields (wire rule) and
+  `HudFixture` only injects snapshots — so the bridge writes a
+  `ModeHudInfo` resource (clock ticks, goal text inputs: lines-left /
+  garbage-left / pieces-placed, feed queue + next-row countdown for T13,
+  swap-timer field reserved for T21) every fixed step from the core getters;
+  HUD systems read `ModeHudInfo`, and extend `HudFixture` to also accept it.
+  Ultra: warning sound in the last 10 s (one shot at tick 6 600 via
+  comparison against `ModeHudInfo`, using existing `bevy_kira_audio`
+  WAV assets; if no fitting asset exists, reuse the most urgent existing cue).
+- **validation**: Headless HUD tests (fixture pattern `HudFixture` already
+  exists): label text formats ticks correctly (e.g. 10 235 → `2:43.91`);
+  marathon run shows no clock; ultra warning fired-once behavior.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T9: Mode-aware result (game-over) screen
+- **depends_on**: [T5, T6, T8]
+- **location**: `crates/tetris-app/src/screens_menu.rs` (game-over screen code)
+- **description**: The game-over screen renders per terminal reason and mode:
+  Sprint/Dig completed → final time (mm:ss.hh) + "New record"/best time;
+  Sprint/Dig top-out → explicitly *no result* shown; Ultra → score stands
+  either way + record line. Retry re-runs the same mode (seed fresh unless
+  `TETRIS_SEED`); "Menu" returns to `AppState::ModeSelect`. Uses
+  `Game::finished_reason()` + `Records::record_run` (records write only when
+  the PRD says a result exists: top-out in Sprint/Dig records nothing).
+- **validation**: Headless tests per terminal reason (drive core to each
+  outcome); record written/not-written assertions through `Records`.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T10: Release-1 CI completion gates
+- **depends_on**: [T3, T4, T5]
+- **location**: `crates/tetris-app/src/core_bridge/mod.rs` (bot mode + solver), `.github/` (if job list needs the new test names)
+- **description**: Two parts. (a) **Dig-aware solver**: the existing greedy
+  `bot_move` weights cover the stack and will bury Dig's holes rather than
+  dig them (it tops out well before clearing 10 garbage rows). Give the bot a
+  Dig-aware heuristic (e.g. weight the lowest reachable hole strongly when the
+  board contains `Piece::Garbage`, target the hole column) without changing
+  marathon behavior (marathon boards have no garbage ⇒ heuristic inactive).
+  (b) Extend `TETRIS_BOT=1` to run a named mode (`TETRIS_BOT=sprint|ultra|dig`,
+  plain `=1` stays marathon), logging `BOT mode_done mode=sprint
+  time_ticks=…` / `mode=ultra score=…` / `mode=dig time_ticks=…`, and —
+  crucially — `BOT mode_abort mode=… ticks=…` with nonzero-exit semantics on
+  top-out, so a silent early death fails the test instead of hanging the
+  budget. Ultra: top-out before tick 7 200 still yields `mode_done` (score
+  stands either way per PRD). Add one workspace-level hidden-window
+  integration test running Sprint and Dig to completion (PRD: "the bot
+  finishes Sprint and Dig"); Ultra's exact-tick end is already covered purely
+  in core by T4.
+- **validation**: `cargo test --workspace` green; `TETRIS_BOT=sprint cargo run`
+  (desktop) completes a Sprint run headless-ly and exits 0.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T11: RELEASE 1 GATE
+- **depends_on**: [T7, T8, T9, T10]
+- **location**: repo-wide
+- **description**: `cargo test --workspace` + `cargo clippy --workspace -- -D
+  warnings` + `cargo fmt --all --check` green (T1 golden proves Marathon
+  unchanged — PRD gate). Manual: Android APK portrait check — every R1 mode
+  started, played, left with touch only (PRD G5). Playtest Sprint/Ultra/Dig;
+  tune any "starting value" constants. Old `best.json` on a real profile
+  migrates and the title screen still shows the Marathon best.
+- **validation**: All of the above recorded in the plan log. No R2 task starts
+  before this is green.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T12: Core Survival garbage feed
+- **depends_on**: [T11]
+- **location**: `crates/tetris-core/src/mode.rs`, `crates/tetris-core/src/game.rs` (+ tests)
+- **description**: `GarbageFeed { interval_ticks: 300, decay_ticks: 1800,
+  decay_by: 15, floor_ticks: 60 }` (named constants, tunable) in
+  `ModeConfig`. Game-internal: feed timer queues 1 row per interval; the
+  whole pending batch (cap `versus::MAX_GARBAGE_PER_LAND` = 4, surplus
+  trickles like versus) lands on the player's next lock by reusing
+  `versus::push_garbage_rows` (already `pub(crate)`); hole column per batch
+  from an independent splitmix64 stream derived from the seed (never the bag
+  stream — bag draws must stay untouched). Overflow past the ceiling tops out
+  exactly like a block-out. Expose `pending_garbage()` and `ticks_to_next_row`
+  getters for the HUD.
+- **validation**: Unit tests: first row lands on the first lock after tick
+  300; interval decays 15 per 1800 ticks down to the 60 floor; cap-4 trickle;
+  overflow tops out; same-seed replay determinism; marathon regression (T1)
+  untouched.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T13: Survival app wiring + HUD
+- **depends_on**: [T12, T8]
+- **location**: `crates/tetris-app/src/modes.rs`, `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/screens_menu.rs`
+- **description**: Catalogue entry (config: feed + no goal + marathon
+  gravity). HUD: elapsed clock, the existing queued-garbage meter (reuse the
+  versus pending-garbage display, fed from `pending_garbage()`), and time
+  until the next row. Result on top-out = time survived, recorded as
+  `BestTime` under Survival.
+- **validation**: Headless test: bot survives ≥ 30 s of feed then eventually
+  tops out with a recorded time; HUD fixture shows queue count and
+  countdown-to-next-row strings.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T14: Zen mode (core wipe-on-block-out + app)
+- **depends_on**: [T11, T5]
+- **location**: `crates/tetris-core/src/game.rs` (`WipeAndContinue` branch in the spawn/block-out path), `crates/tetris-app/src/modes.rs`, `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/records.rs`
+- **description**: Implement `BlockOutBehavior::WipeAndContinue`: on spawn
+  collision, clear the board (whole stack — owner decision), re-spawn the
+  colliding piece at its spawn state, and emit `GameEvent::StackWiped` (new
+  variant, appended to the enum — wire-safe, events never cross the network).
+  No `GameOver` ever fires; score/lines keep accumulating. App: catalogue
+  entry (fixed level 1, no goal); HUD shows session lines + lifetime lines
+  (`Records::LifetimeLines` — incremented on every line clear event,
+  persisted via the debounced save path); exit via pause → menu.
+- **validation**: Core test: force a block-out with `WipeAndContinue`, assert
+  play continues, no `GameOver`, board empty, same-seed replay identical. App
+  test: lifetime lines persist across a simulated restart of the config dir.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T15: Bot speed as a per-match parameter
+- **depends_on**: [T11]
+- **location**: `crates/tetris-app/src/core_bridge/versus.rs`
+- **description**: Replace the `BOT_LOCK_COOLDOWN_STEPS` constant read inside
+  `versus_bot_system` with a per-side cooldown stored on `VersusMatch`
+  (`bot_cooldown_ticks: [u32; 2]`). **Non-breaking**: keep `start_versus`
+  signature and behavior exactly as today (fills the default constant) and
+  add `start_versus_with_cooldown(..., [u32; 2])` for the ladder (T16) — no
+  call-site churn in `screens_menu.rs`/`harness.rs`. Pure plumbing: default
+  behavior byte-identical (existing versus/harness/soak tests pass
+  unmodified).
+- **validation**: `cargo test --workspace` green with defaults; a unit test
+  starts a bot-vs-bot match at 10-tick cooldown and asserts a materially
+  higher lock rate than the 60-tick default.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T16: Bot Ladder campaign
+- **depends_on**: [T15, T6, T7]
+- **location**: `crates/tetris-app/src/screens_ladder.rs` (new), `crates/tetris-app/src/modes.rs`, `crates/tetris-app/src/records.rs`
+- **description**: Ladder flow screen entered from mode select: 8 rungs,   `start_versus_with_cooldown(Garbage, Human, Bot, [c; 2])` per rung with
+  cooldown constants
+  `[120, 104, 82, 60, 44, 30, 19, 10]` (named const array, rung 4 == today's
+  60; tuning lives here only). Win (via `VersusWinner`) unlocks the next rung;
+  loss retries. Persist `HighestRung` in `Records`; locked rungs disabled in
+  the list; versus HUD gains the rung number. Rematch/menu buttons reuse the
+  T26 versus overlay flow.
+- **validation**: Headless test: bot at 10-tick cooldown beats a 120-tick
+  ladder seat (win path unlocks), winner resource drives unlock + record;
+  rung persistence round-trip under `TETRIS_CONFIG_DIR`.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T17: Daily Challenge
+- **depends_on**: [T6, T7]
+- **location**: `crates/tetris-app/src/daily.rs` (new), `crates/tetris-app/src/modes.rs`, `crates/tetris-app/src/screens_menu.rs` (result line), `crates/tetris-app/src/records.rs`
+- **description**: App-side (core never sees a date): today's UTC date
+  (`SystemTime` → civil date helper) → seed via splitmix64; weekday maps the
+  day's mode among Sprint/Ultra/Dig by a named `const DAILY_ROTATION`
+  (weekday-index % 3). Mode-select row shows today's mode + "your result /
+  not yet". First **completed** run of the day records
+  `Daily { date, ticks-or-score }`; retries the same day update nothing
+  (first-counts, owner decision). Result screen shows the share line
+  `Blockfall Daily 2026-10-01 · Dig · 1:42.35` as display-only selectable
+  text (no clipboard in Bevy 0.19 — owner decision fallback).
+- **validation**: Unit tests: date→seed stable and distinct across dates;
+  rotation mapping; first-run-wins recording (second run ignored); share
+  line format.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T18: RELEASE 2 GATE
+- **depends_on**: [T13, T14, T16, T17]
+- **location**: repo-wide
+- **description**: Full validation suite green (wire canary T1 still holds —
+  R2 must not have touched snapshot serialization). Playtest Survival feed
+  constants and ladder rung curve (PRD risk: trim to fewer rungs if uneven).
+  Manual Android portrait check for Survival/Zen/Bot Ladder/Daily.
+- **validation**: All green + playtest notes in log. No R3 task starts before
+  this gate.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T19: Match-level tick clock + protocol bump + new AttackRule variants
+- **depends_on**: [T18]
+- **location**: `crates/tetris-core/src/versus.rs`, `crates/tetris-app/src/core_bridge/net/protocol.rs`, `crates/netplay-gateway` (only if it inspects `AttackRule`)
+- **description**: The only wire-breaking task. `AttackRule` gains `Dig` and
+  `Switch { swap_interval_ticks: u32, warning_ticks: u32 }` **appended**
+  (existing variant indices unchanged). `Match` gains a match-level `ticks`
+  counter + `MatchEvent::SwapWarning { at_tick }` /
+  `MatchEvent::BoardSwapped { tick }`, all serialized into
+  `MatchSnapshot` (new fields → new bytes — that's what the bump covers).
+  `PROTOCOL_VERSION` "0.1.0" → "0.2.0" (handshake then refuses mixed builds —
+  PRD says ship desktop + Android together, note in changelog). `snapshot_hash
+  = FNV-1a over bincode(MatchSnapshot)` automatically covers the new fields;
+  add a test asserting old-rule snapshots differ from new-struct snapshots so
+  a stale field can't ride silently.
+- **validation**: Protocol roundtrip tests for every new variant; version
+  handshake rejection test for old↔new; `snapshot_hash` coverage test;
+  gateway self-test still passes (`cargo run -p netplay-gateway --
+  --self-test`).
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T20: Dig Duel rule (core + local 1v1 first)
+- **depends_on**: [T19]
+- **location**: `crates/tetris-core/src/versus.rs`, `crates/tetris-app/src/core_bridge/versus.rs`, `crates/tetris-app/src/screens_menu.rs` (rule buttons), `crates/tetris-app/src/hud.rs`
+- **description**: Core: `AttackRule::Dig` — both sides start with the same
+  10 buried garbage rows (same hole columns on both boards, derived from the
+  match seed), same piece sequence (`Match` same-pieces option: both side
+  game seeds identical), no garbage ever sent. Win: first side whose
+  `garbage_rows_left()` hits 0; a top-out loses immediately (opponent wins).
+  App: new rule button under 1 v 1 (Garbage / Race / Dig) driving
+  `start_versus` locally first (no protocol exposure beyond T19's); versus
+  HUD gains garbage-rows-left per side.
+- **validation**: Core tests: identical boards+sequences from one seed;
+  first-to-clear crowns winner; top-out hands win over; replay determinism.
+  Local human-vs-bot Dig Duel plays through.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T21: Switch rule (core + local 1v1 first)
+- **depends_on**: [T19, T20]
+- **location**: `crates/tetris-core/src/versus.rs`, `crates/tetris-app/src/core_bridge/versus.rs`, `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/hud.rs`
+- **description**: Core: Garbage attacks as usual; every `swap_interval_ticks`
+  (default 1 800) the two sides' **entire game states swap** (board, bag
+  state, hold, active piece, per-game counters) together with their pending
+  garbage (decision: follows the board). Swap executes at the tick boundary
+  after both sides ticked, deterministically on both peers; `SwapWarning`
+  emitted `warning_ticks` (default 180 = 3 s) before. Winner = opponent of
+  the side that tops out (as Garbage). App: rule button + swap countdown in
+  the versus HUD.
+- **validation**: Core tests: swap happens at exactly the right tick; state
+  equivalence after swap (left-after == right-before); warning lead time;
+  pending garbage moves with the board; replay determinism; no double-swap on
+  asymmetric action timing.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T22: Online exposure + soak + relay e2e for Dig Duel and Switch
+- **depends_on**: [T20, T21]
+- **location**: `crates/tetris-app/src/core_bridge/net/{protocol.rs,session.rs,gateway.rs,online_ui.rs,harness.rs}`, `crates/netplay-gateway/tests/*`
+- **description**: Online UI: host picks the rule (Garbage/Race/Dig/Switch) —
+  it travels on `MatchStart` already; guest mirrors (unknown variants are gone
+  post-bump). Extend `soak_rule(i)` in `harness.rs` so the 20-match nightly
+  soak (`-- --ignored`) covers each new rule, and add Dig/Switch cases to the
+  relay loopback + NAT-punch e2e tests. Zero snapshot-hash mismatches is the
+  PRD gate. Switch risk: consider a brief input freeze on swap ticks —
+  playtest locally first, implement behind a named const if needed.
+- **validation**: `cargo test -p tetris-app -- --ignored` soak green for every
+  rule; relay e2e green; version-skew handshake test.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T23: Mutator framework + cheap mutators
+- **depends_on**: [T18, T7]
+- **location**: `crates/tetris-app/src/mutators.rs` (new), `crates/tetris-app/src/screens_modes.rs`, `crates/tetris-app/src/input.rs`, `crates/tetris-app/src/render.rs`, `crates/tetris-app/src/hud.rs`, `crates/tetris-app/src/records.rs`
+- **description**: `Mutators` resource selected on the mode-select screen per
+  run (toggles: Invisible, No Hold, No Ghost, One Preview, 20G). Wiring per
+  PRD R7: **No Ghost** = render skips ghost cells; **One Preview** = HUD next
+  queue forced to 1; **20G** = `ModeConfig.start_level = 20` (uses R1); **No
+  Hold** = filter `Action::Hold` in the bridge before `PendingActions`
+  reaches the core (core untouched); **Invisible** in T24. Mutated runs never
+  write best records (owner decision) but still bump mode play counters —
+  enforce centrally in `Records::record_run(mutated: bool)`.
+- **validation**: Headless tests per mutator: hold press is a silent no-op
+  with No Hold; `snapshot_with_next` untouched but HUD shows 1; ghost absent
+  in drawn cells (render test pattern `cells_of(app, CellKind::...)` exists);
+  20G config start level; record suppressed + play count incremented with any
+  mutator active.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T24: Invisible mutator (lock fade)
+- **depends_on**: [T23]
+- **location**: `crates/tetris-app/src/render.rs`
+- **description**: Render-only: locked cells fade out over/after 1 s
+  (60 fixed steps). Render layer tracks per-cell lock age: when the board
+  snapshot grows a cell between frames, stamp `spawn_frame`; fade alpha from
+  age. Sprite pool already in `render.rs` carries per-cell state. Must not
+  touch the core or snapshot; active piece and ghost unaffected.
+- **validation**: Render test: after a lock, the locked cells' sprite alpha
+  matches the fade curve at sampled ages; disabled mutator ⇒ today's exact
+  colors (regression test reuses `drawn()` helper).
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+### T25: RELEASE 3 GATE + docs
+- **depends_on**: [T22, T23, T24]
+- **location**: repo-wide; `PRD.md` §14 item 3; `CHANGELOG.md`; check-in of `game-modes-PRD.md`
+- **description**: Full validation incl. per-rule 20-match soaks and relay
+  e2e; clippy/fmt; Android APK portrait check for Dig Duel, Switch and
+  mutators (mode screens reachable with touch only; Switch swap warning
+  visible). Docs: bump `PROTOCOL_VERSION` note in README/CHANGELOG ("desktop
+  and Android must update together"), add `game-modes-PRD.md` beside
+  `PRD.md` and close §14 item 3 (**pending the owner checkbox**), update the
+  README modes table.
+- **validation**: All green; changelog reviewed.
+- **status**: Not Completed
+- **log**:
+- **files edited/created**:
+
+## Parallel Execution Groups
+
+Shared-file hubs (`modes.rs` catalogue pre-declared in T5 minimizes this,
+`hud.rs`, `screens_menu.rs`, `records.rs`, `versus.rs` core+bridge): **at
+most one task per wave may edit a given file; the coordinator serializes
+colliding tasks** — parallelism is the default, same-file tasks queue.
+
+| Wave | Tasks | Can Start When |
+|------|-------|----------------|
+| 1 | T1 | Immediately |
+| 2 | T2, T6 | T1 done |
+| 3 | T3, T5 | T2 done |
+| 4 | T4, T7, T8 | T3+T2→T4; T5(+T6)→T7; T5→T8 |
+| 5 | T9, T10 | T5, T6, T8→T9; T3, T4, T5→T10 |
+| 6 | **T11 — R1 gate** | T7–T10 done |
+| 7 | T12, T15 | R1 gate passed (T14 waits: same core `game.rs` as T12) |
+| 8 | T13, T14, T17 | T12→T13; T11→T14; T6, T7→T17 |
+| 9 | T16 | T15 (and ladder UI files free) |
+| 10 | **T18 — R2 gate** | T13, T14, T16, T17 done |
+| 11 | T19 | R2 gate passed |
+| 12 | T20, T23 | T19→T20; T18→T23 (mutators touch `hud.rs` — serialize with T20's HUD edits) |
+| 13 | T21, T24 | T20→T21; T23→T24 |
+| 14 | T22 | T20, T21 done |
+| 15 | **T25 — R3 gate + docs** | T22, T24 done |
+
+## Testing Strategy
+
+- **Regression gate everywhere**: T1 golden snapshot + bincode-canary test
+  runs on every task; wire shape of `GameSnapshot`/`MatchSnapshot` may only
+  change in T19.
+- **Core**: unit tests per mode config in `mode.rs`/`game.rs`/`versus.rs`;
+  same-seed replay test per new behavior (event streams + snapshots equal);
+  `modes_headless.rs` bot-completion tests run on every CI push.
+- **App**: headless `MinimalPlugins`/hidden-window tests following the
+  existing patterns in `core_bridge/mod.rs`, `hud.rs` fixtures and
+  `render.rs` drawn-cell probes.
+- **Netplay**: protocol roundtrip + hostile-fuzz (existing proptest covers
+  new variants once added to the strategy), 20-match nightly soak
+  (`cargo test --workspace -- --ignored`) extended per rule, relay loopback +
+  NAT-punch e2e.
+- **Persistence**: every records test isolates `TETRIS_CONFIG_DIR` under the
+  existing `ENV_LOCK`; migration tested from a literal legacy `best.json`.
+- **Phone parity**: manual Android APK portrait check at each release gate
+  (start / play / leave each shipped mode with touch only).
+- **CI commands**: `cargo test --workspace`, `cargo clippy --workspace -- -D
+  warnings`, `cargo fmt --all --check`.
+
+## Risks & Mitigations
+
+- **Reopening the frozen core contract** → done once in T2, default config =
+  Marathon, hard-gated by T1 golden test at T11.
+- **Wire format break lands too early** → bincode byte-canary assertion in T1
+  fires in CI the moment anyone touches `GameSnapshot`/`MatchSnapshot` before
+  T19; protocol bump isolated to T19.
+- **Old/new builds can't interop post-R3** → version handshake (existing
+  mechanism) + changelog: ship desktop and Android together.
+- **Phone menu crowding** → scrolling list, one line per mode (T7); versus
+  rules stay under 1 v 1 / Online, not in the solo list.
+- **Ladder curve uneven** (greedy bot gets faster, not smarter) → speeds are
+  a single named const array in T16, tunable without touching logic; ship
+  fewer rungs if needed.
+- **Switch disorients under input delay** → 3 s warning mandatory; optional
+  swap-tick input freeze behind a const, decided after local playtest (T21)
+  before online soak (T22).
+- **Survival/Ultra/Switch timings are guesses** → all named constants,
+  playtest tuning at the release gates (T11/T18).
+- **`best.json` migration corrupts a real profile** → additive read of the
+  legacy shape before ever writing the new one; atomic writes already in
+  place; corruption falls back to defaults as today.
+- **Zen lifetime-lines persistence churn** → piggyback on the existing
+  debounced save, not per-line writes.
