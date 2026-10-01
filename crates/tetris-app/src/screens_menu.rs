@@ -78,6 +78,7 @@ use crate::core_bridge::{
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
+use crate::screens_modes::open_mode_select;
 use crate::settings_persist::PersistedBestScore;
 use crate::state::{AppState, CaptureOrder, RebindingCapture};
 
@@ -85,11 +86,11 @@ use crate::state::{AppState, CaptureOrder, RebindingCapture};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opaque backdrop for the title screen.
-const PANEL_BG: Color = Color::srgb(0.09, 0.09, 0.12);
+pub(crate) const PANEL_BG: Color = Color::srgb(0.09, 0.09, 0.12);
 /// Dimming backdrop for the pause / game-over overlays.
 const DIM_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.62);
-const BUTTON_BG: Color = Color::srgb(0.22, 0.22, 0.27);
-const RECORD_COLOR: Color = Color::srgb(1.0, 0.85, 0.3);
+pub(crate) const BUTTON_BG: Color = Color::srgb(0.22, 0.22, 0.27);
+pub(crate) const RECORD_COLOR: Color = Color::srgb(1.0, 0.85, 0.3);
 
 // ---------------------------------------------------------------------------
 // Pure handlers (drive the transitions; systems are thin glue)
@@ -156,7 +157,9 @@ pub fn toggle_pause(state: &mut AppState, sim: &mut SimPaused, freeze: &JuiceFre
 }
 
 /// Fresh run via the shared T14 restart path (honors `TETRIS_SEED`); used by
-/// Title → Start, Pause → Restart and Game Over → Play again.
+/// Pause → Restart and Game Over → Play again. Title → Start no longer runs
+/// through here — since T7 it opens [`AppState::ModeSelect`] and the picked
+/// mode starts via `start_mode_run` in [`crate::screens_modes`].
 pub fn start_new_run(
     core: &mut GameCore,
     state: &mut AppState,
@@ -303,7 +306,8 @@ pub struct PauseRoot;
 #[derive(Component)]
 pub struct GameOverRoot;
 
-/// Title "Start" button ([`start_new_run`]).
+/// Title "Start" button → [`AppState::ModeSelect`] (T7 — the mode list in
+/// [`crate::screens_modes`] decides what actually starts).
 #[derive(Component)]
 pub struct StartButton;
 
@@ -609,12 +613,7 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                     continue;
                 }
                 if start {
-                    start_new_run(
-                        params.core.as_mut(),
-                        &mut params.state,
-                        &mut params.sim,
-                        &params.freeze,
-                    );
+                    open_mode_select(&mut params.state, &mut params.sim, &params.freeze);
                 } else if settings {
                     open_settings(&mut params.state);
                 } else if quit {
@@ -925,7 +924,7 @@ fn startup_goto_title_system(mut state: ResMut<AppState>) {
 // Startup UI construction
 // ---------------------------------------------------------------------------
 
-fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor, Pickable) {
+pub(crate) fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor, Pickable) {
     (
         Text::new(text),
         TextFont::from_font_size(size),
@@ -990,7 +989,7 @@ fn sync_hidden_ui_unpickable(
     }
 }
 
-fn menu_button(parent: &mut ChildSpawnerCommands, text: &str, marker: impl Bundle) {
+pub(crate) fn menu_button(parent: &mut ChildSpawnerCommands, text: &str, marker: impl Bundle) {
     parent
         .spawn((
             Button,
@@ -1192,6 +1191,8 @@ mod tests {
 
     use crate::core_bridge::CoreBridgePlugin;
     use crate::input::InputPlugin;
+    use crate::modes::ModeId;
+    use crate::screens_modes::{ModeRowButton, ModeSelectPlugin, ModeSelectRoot};
     use crate::screens_settings::SettingsScreenPlugin;
     use bevy::app::App;
 
@@ -1313,6 +1314,9 @@ mod tests {
             crate::hud::HudPlugin,
             InputPlugin,
             MenuScreensPlugin,
+            // T7 production parity: the mode-select roots (extra resource +
+            // UI entities) must not perturb any menu behavior.
+            ModeSelectPlugin,
             SettingsScreenPlugin,
         ));
         app.update();
@@ -1457,6 +1461,8 @@ mod tests {
 
     #[test]
     fn start_button_launches_fresh_playing_run() {
+        // T7: Title "Start" opens the mode list; the picked row starts the
+        // fresh run (Sprint here, so the T5 pre-roll contract is covered too).
         let mut app = menu_test_app();
         startup_goto_title(app.world_mut().resource_mut::<AppState>().as_mut());
         app.update();
@@ -1468,8 +1474,27 @@ mod tests {
             |world, e| world.get::<TitleRoot>(e).is_some(),
             |world, e| world.get::<StartButton>(e).is_some(),
         );
+        assert_eq!(app_state(&app), AppState::ModeSelect);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<ModeRowButton>(e)
+                    .is_some_and(|row| row.id == ModeId::Sprint)
+            },
+        );
         assert_eq!(app_state(&app), AppState::Playing);
         assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            ModeId::Sprint
+        );
+        assert_eq!(
+            *app.world().resource::<crate::core_bridge::Countdown>(),
+            crate::core_bridge::Countdown(crate::modes::PRE_ROLL_TICKS),
+            "Sprint starts behind its pre-roll"
+        );
         assert_eq!(*app.world().resource::<SimPaused>(), SimPaused(false));
         let snapshot = app.world().non_send::<GameCore>().game.snapshot();
         assert!(snapshot.board.is_empty() && snapshot.score == 0);
@@ -1795,13 +1820,15 @@ mod tests {
             "HUD roots must release the title once the match ends"
         );
 
-        // The title menu must be selectable again.
+        // The title menu must be selectable again (T7: Start opens the
+        // mode list — the important assertion is that the click lands on a
+        // live title button at all, not on the dead versus HUD).
         click_button_under(
             &mut app,
             |world, e| world.get::<TitleRoot>(e).is_some(),
             |world, e| world.get::<StartButton>(e).is_some(),
         );
-        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(app_state(&app), AppState::ModeSelect);
         assert!(!app.world().non_send::<VersusMatch>().active);
     }
 
@@ -1944,15 +1971,27 @@ mod tests {
         assert_eq!(*app.world().resource::<VersusWinner>(), VersusWinner(None));
         assert_eq!(vis_of::<VersusOverRoot>(&mut app), Visibility::Hidden);
 
-        // Solo path intact: Title → Start launches a fresh solo run.
+        // Solo path intact: Title → Start opens the list, and a row press
+        // launches a fresh solo run (T7).
         click_button_under(
             &mut app,
             |world, e| world.get::<TitleRoot>(e).is_some(),
             |world, e| world.get::<StartButton>(e).is_some(),
         );
+        assert_eq!(app_state(&app), AppState::ModeSelect);
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<ModeRowButton>(e)
+                    .is_some_and(|row| row.id == ModeId::Marathon)
+            },
+        );
         assert_eq!(app_state(&app), AppState::Playing);
         let core = app.world().non_send::<GameCore>();
         assert_eq!(core.steps, 0);
+        assert_eq!(core.active_mode.id, ModeId::Marathon);
         let snapshot = core.game.snapshot();
         assert!(snapshot.board.is_empty() && snapshot.score == 0);
     }
@@ -2052,10 +2091,49 @@ mod tests {
         }
     }
 
-    /// (label, center in window-logical coords) of every menu button.
-    fn button_rects(app: &mut App) -> Vec<(String, Vec2)> {
+    /// Name of the known menu root a button descends from ("" when none).
+    /// Root scoping (T7): every menu root reuses the same button markers at
+    /// different positions ("Settings" on Title *and* Pause, "Back" on both
+    /// versus submenus), and the old first-match lookup resolved them by
+    /// entity iteration order — which Bevy 0.19 reshuffles whenever ANY
+    /// resource or entity is added (resources are entities!), so a new
+    /// `init_resource` silently rerouted taps (measured at T5: red from +2
+    /// resource entities on). Buttons are now addressed by (root, label).
+    fn root_name_of(world: &World, entity: Entity) -> &'static str {
+        let mut node = entity;
+        loop {
+            if world.get::<TitleRoot>(node).is_some() {
+                return "title";
+            }
+            if world.get::<PauseRoot>(node).is_some() {
+                return "pause";
+            }
+            if world.get::<GameOverRoot>(node).is_some() {
+                return "over";
+            }
+            if world.get::<VersusRulesRoot>(node).is_some() {
+                return "rules";
+            }
+            if world.get::<VersusOpponentRoot>(node).is_some() {
+                return "opponent";
+            }
+            if world.get::<VersusOverRoot>(node).is_some() {
+                return "versus";
+            }
+            let Some(child_of) = world.get::<ChildOf>(node) else {
+                return "";
+            };
+            node = child_of.get();
+        }
+    }
+
+    /// `(root, label, center in window-logical coords)` of every menu
+    /// button, sorted deterministically by `(root, label)` — never by
+    /// entity iteration order (see [`root_name_of`]).
+    fn button_rects(app: &mut App) -> Vec<(String, &'static str, Vec2)> {
         let world = app.world_mut();
         let mut q = world.query::<(
+            Entity,
             &UiGlobalTransform,
             Option<&StartButton>,
             Option<&OneVOneButton>,
@@ -2070,7 +2148,7 @@ mod tests {
             Option<&VersusMenuButton>,
         )>();
         let mut out = Vec::new();
-        for (t, start, one, settings, quit, g, r, h, b, back, rematch, menu) in q.iter(world) {
+        for (e, t, start, one, settings, quit, g, r, h, b, back, rematch, menu) in q.iter(world) {
             let label = if start.is_some() {
                 "start"
             } else if one.is_some() {
@@ -2096,17 +2174,27 @@ mod tests {
             } else {
                 continue;
             };
-            out.push((label.to_string(), t.translation.xy()));
+            out.push((
+                root_name_of(world, e).to_string(),
+                label,
+                t.translation.xy(),
+            ));
         }
+        out.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(b.1))
+                .then(a.2.x.total_cmp(&b.2.x))
+                .then(a.2.y.total_cmp(&b.2.y))
+        });
         out
     }
 
-    fn rect_of(app: &mut App, label: &str) -> Vec2 {
+    fn rect_of_under(app: &mut App, root: &str, label: &str) -> Vec2 {
         button_rects(app)
             .into_iter()
-            .find(|(l, _)| l == label)
-            .unwrap_or_else(|| panic!("{label} button laid out"))
-            .1
+            .find(|(r, l, _)| r == root && *l == label)
+            .unwrap_or_else(|| panic!("{root}/{label} button laid out"))
+            .2
     }
 
     fn set_cursor(app: &mut App, at: Vec2) {
@@ -2179,13 +2267,13 @@ mod tests {
         let mut app = menu_ui_test_app();
         set_state(&mut app, AppState::Title);
         app.update();
-        let one = rect_of(&mut app, "1v1");
+        let one = rect_of_under(&mut app, "title", "1v1");
         // Title "Settings" y-range sits under the rules panel but inside no
         // submenu button — the pre-fix build opened Settings through the
         // (invisible-under-title) submenu here.
-        let title_settings = rect_of(&mut app, "settings");
-        let garbage = rect_of(&mut app, "garbage");
-        let bot = rect_of(&mut app, "bot");
+        let title_settings = rect_of_under(&mut app, "title", "settings");
+        let garbage = rect_of_under(&mut app, "rules", "garbage");
+        let bot = rect_of_under(&mut app, "opponent", "bot");
 
         tap_fast(&mut app, one);
         assert_eq!(flow(&app).stage, VersusStage::Rules, "1v1 opens rules");
@@ -2237,10 +2325,10 @@ mod tests {
         set_state(&mut app, AppState::Title);
         app.update();
 
-        let one = rect_of(&mut app, "1v1");
-        let title_settings = rect_of(&mut app, "settings");
-        let garbage = rect_of(&mut app, "garbage");
-        let bot = rect_of(&mut app, "bot");
+        let one = rect_of_under(&mut app, "title", "1v1");
+        let title_settings = rect_of_under(&mut app, "title", "settings");
+        let garbage = rect_of_under(&mut app, "rules", "garbage");
+        let bot = rect_of_under(&mut app, "opponent", "bot");
 
         tap_fast(&mut app, one);
         assert_eq!(flow(&app).stage, VersusStage::Rules, "1v1 opens rules");
@@ -2257,6 +2345,53 @@ mod tests {
         assert_eq!(app_state(&app), AppState::Playing);
     }
 
+    /// The T7 deterministic-helper fix: rect lookups resolve the *intended*
+    /// button by (owning root, label) and are invariant under resource AND
+    /// entity churn. The old helper returned the first label match in
+    /// entity-iteration order — it conflated the Title and Pause
+    /// "Settings" buttons, and Bevy 0.19 reshuffles that order whenever any
+    /// resource (which are entities) or UI entity appears, which is exactly
+    /// how the T5 `Countdown` resource and the T7 mode-select screen would
+    /// have silently rerouted these taps.
+    #[test]
+    fn root_scoped_rect_resolution_survives_resource_and_entity_churn() {
+        #[derive(Resource)]
+        struct DummyA;
+        #[derive(Resource)]
+        struct DummyB(u32);
+        #[derive(Resource)]
+        struct DummyC;
+
+        // `menu_test_app` already mounts `ModeSelectPlugin` (rows add
+        // Button entities + a resource — the exact T5 red condition).
+        let mut app = menu_ui_test_app();
+        let start = rect_of_under(&mut app, "title", "start");
+        let title_settings = rect_of_under(&mut app, "title", "settings");
+        let pause_settings = rect_of_under(&mut app, "pause", "settings");
+        // The two "settings" buttons are distinct widgets: the old
+        // first-match helper silently picked one (the pause twin at a
+        // different y) depending on spawn order.
+        assert_ne!(title_settings, pause_settings);
+        assert_ne!(rect_of_under(&mut app, "title", "1v1"), start);
+
+        let dummy_entity = app
+            .world_mut()
+            .spawn((Visibility::default(), Node::default()))
+            .id();
+        app.insert_resource(DummyA);
+        app.insert_resource(DummyB(7));
+        app.insert_resource(DummyC);
+        app.update();
+        assert_eq!(rect_of_under(&mut app, "title", "start"), start);
+        assert_eq!(rect_of_under(&mut app, "title", "settings"), title_settings);
+        assert_eq!(rect_of_under(&mut app, "pause", "settings"), pause_settings);
+
+        app.world_mut().despawn(dummy_entity);
+        app.update();
+        assert_eq!(rect_of_under(&mut app, "title", "start"), start);
+        assert_eq!(rect_of_under(&mut app, "title", "settings"), title_settings);
+    }
+
     /// Walking the flow with the submenu's Back button (which overlaps the
     /// title's 1v1 button) returns to the title and restores it.
     #[test]
@@ -2264,8 +2399,8 @@ mod tests {
         let mut app = menu_ui_test_app();
         set_state(&mut app, AppState::Title);
         app.update();
-        let one = rect_of(&mut app, "1v1");
-        let back = rect_of(&mut app, "back");
+        let one = rect_of_under(&mut app, "title", "1v1");
+        let back = rect_of_under(&mut app, "rules", "back");
         tap_fast(&mut app, one);
         assert_eq!(flow(&app).stage, VersusStage::Rules);
 
@@ -2274,10 +2409,11 @@ mod tests {
         assert_eq!(vis_of::<TitleRoot>(&mut app), Visibility::Visible);
         assert_eq!(app_state(&app), AppState::Title);
 
-        // …and the title buttons work again afterwards.
-        let start = rect_of(&mut app, "start");
+        // …and the title buttons work again afterwards (T7: "Start" opens
+        // the mode list, it no longer jumps straight into a run).
+        let start = rect_of_under(&mut app, "title", "start");
         tap_fast(&mut app, start);
-        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(app_state(&app), AppState::ModeSelect);
     }
 
     #[test]

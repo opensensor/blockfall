@@ -17,6 +17,7 @@ mod modes;
 mod records;
 mod render;
 mod screens_menu;
+mod screens_modes;
 mod screens_settings;
 mod settings_persist;
 mod state;
@@ -34,6 +35,7 @@ use input::InputPlugin;
 use juice::JuicePlugin;
 use render::RenderPlugin;
 use screens_menu::MenuScreensPlugin;
+use screens_modes::ModeSelectPlugin;
 use screens_settings::SettingsScreenPlugin;
 use settings_persist::SettingsPersistPlugin;
 use state::{AppState, RebindingCapture, Settings};
@@ -63,6 +65,7 @@ pub fn main() {
             InputPlugin,
             HudPlugin,
             MenuScreensPlugin,
+            ModeSelectPlugin,
             SettingsScreenPlugin,
             AudioPlugin,
             JuicePlugin,

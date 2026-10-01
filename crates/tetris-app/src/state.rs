@@ -63,6 +63,8 @@ pub enum AppState {
     Playing,
     /// Title screen (T17).
     Title,
+    /// Mode select list opened by Title "Start" (T7).
+    ModeSelect,
     /// Paused overlay; simulation frozen (T17).
     Paused,
     /// Settings screen (T16).
