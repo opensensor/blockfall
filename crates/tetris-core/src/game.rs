@@ -23,15 +23,40 @@ use crate::event::GameEvent;
 use crate::gravity;
 use crate::hold::HoldSlot;
 use crate::lock::LockTimer;
-use crate::mode::{FinishReason, Goal, ModeConfig};
+use crate::mode::{FinishReason, GarbageFeed, Goal, ModeConfig};
 use crate::piece::{spawn_state, Piece, PieceState};
+use crate::prng::Rng;
 use crate::score::ScoreState;
 use crate::srs::{self, RotateDir};
 use crate::tspin::{self, TSpinKind};
+use crate::versus::{push_garbage_rows, MAX_GARBAGE_PER_LAND};
 
 /// Number of upcoming pieces exposed by [`Game::snapshot`] (T3 keeps deeper
 /// peeks available through [`Game::peek_next`], up to 6 for the app).
 pub const NEXT_PREVIEW: usize = 5;
+
+/// Seed-stream salt for the Survival feed's garbage hole columns (T12):
+/// keeps the hole stream independent of both the 7-bag's `Rng::new(seed)`
+/// stream and `StartBoard::build`'s buried-garbage stream (a different
+/// salt constant, `mode::BURIED_GARBAGE_SALT`).
+const FEED_HOLE_SALT: u64 = 0x51F0_7D3A_9C6B_4E21;
+
+/// Survival garbage-feed runtime state (T12); `Some` only when
+/// `config.garbage_feed` is `Some`. Queue events derive from game ticks
+/// alone; rows touch the board only when they land on a lock.
+struct FeedState {
+    /// The feed rule set this game was configured with.
+    rules: GarbageFeed,
+    /// Absolute game tick on which the next garbage row queues.
+    next_queue_tick: u64,
+    /// Queued rows not yet landed on a lock (versus-style landing, cap
+    /// [`MAX_GARBAGE_PER_LAND`] rows per lock, surplus trickles).
+    pending: u32,
+    /// Independent splitmix64 stream for hole columns: exactly one draw per
+    /// *landing* batch (hole constant within a batch, like versus), never
+    /// from the bag's stream — bag draws stay untouched.
+    hole_rng: Rng,
+}
 
 /// Everything T11/T13/T18 need to render a full frame from scratch —
 /// including right after a restart, where no events have been seen yet.
@@ -90,6 +115,9 @@ pub struct Game {
     /// to `TopOut` alongside `game_over`. Kept out of `GameSnapshot` (wire
     /// stability); read through [`Game::finished_reason`].
     finished: Option<FinishReason>,
+    /// Survival garbage feed (T12); `Some` only under a `garbage_feed`
+    /// config. Not part of `GameSnapshot` (wire stability).
+    feed: Option<FeedState>,
 }
 
 impl Game {
@@ -108,6 +136,12 @@ impl Game {
             Some(start) => start.build(seed),
             None => Board::new(),
         };
+        let feed = config.garbage_feed.map(|rules| FeedState {
+            next_queue_tick: rules.interval_at(0),
+            rules,
+            pending: 0,
+            hole_rng: Rng::new(seed ^ FEED_HOLE_SALT),
+        });
         let mut g = Self {
             board,
             bag: Bag::new(seed),
@@ -125,6 +159,7 @@ impl Game {
             config: config.clone(),
             ticks: 0,
             finished: None,
+            feed,
         };
         let first = g.bag.next();
         g.spawn(first, &mut Vec::new());
@@ -141,6 +176,17 @@ impl Game {
             return ev;
         }
         self.ticks += 1;
+        // Survival feed (T12): one row queues whenever this live tick reaches
+        // the scheduled queue tick; the next wait is the interval in force
+        // *at* this tick (`interval_at`), i.e. decay applies from the first
+        // queue event on/after each 1800-tick window boundary. Queued rows
+        // only touch the board when they land on a lock.
+        if let Some(feed) = self.feed.as_mut() {
+            if self.ticks >= feed.next_queue_tick {
+                feed.pending += 1;
+                feed.next_queue_tick = self.ticks + feed.rules.interval_at(self.ticks);
+            }
+        }
         self.gravity_elapsed += 1;
         if self.gravity_elapsed >= gravity::interval_for(self.level) {
             self.gravity_elapsed = 0;
@@ -308,6 +354,25 @@ impl Game {
             .count()
     }
 
+    /// Feed-queued garbage rows not yet landed on a lock (T12 Survival;
+    /// always 0 without `garbage_feed`). Rows land on the player's next
+    /// lock, at most [`crate::versus::MAX_GARBAGE_PER_LAND`] per lock with
+    /// the surplus trickling over later locks.
+    pub fn pending_garbage(&self) -> u32 {
+        self.feed.as_ref().map_or(0, |feed| feed.pending)
+    }
+
+    /// Game ticks until the feed queues its *next* garbage row, or `None`
+    /// without `garbage_feed` (T12 Survival). Semantics: the wait for the
+    /// next queue event only — rows already queued and waiting for a lock
+    /// live in [`Game::pending_garbage`] and do not affect it. While the
+    /// game is frozen the tick clock stops, so this value freezes in place.
+    pub fn ticks_to_next_row(&self) -> Option<u64> {
+        self.feed
+            .as_ref()
+            .map(|feed| feed.next_queue_tick.saturating_sub(self.ticks))
+    }
+
     /// T24 versus contract exception (crate-internal only; not part of the
     /// frozen public `Game` API): replace the settled stack with `board`
     /// after [`crate::versus`] has pushed garbage rows underneath it.
@@ -405,6 +470,33 @@ impl Game {
             if level > self.level {
                 self.level = level;
                 ev.push(GameEvent::LevelUp { level });
+            }
+        }
+        // Survival feed landing (T12): this lock lands the queued garbage
+        // batch — same settle point as versus's garbage (after this lock's
+        // merge/clear/scoring). Here it runs *before* the next spawn: a
+        // stack buried up into the spawn area then ends the game through
+        // `spawn`'s own block-out (one `GameOver`), which is equivalent to
+        // versus's post-spawn overlap top-out. At most
+        // `MAX_GARBAGE_PER_LAND` rows land per lock (surplus trickles over
+        // later locks); one hole column per landing batch, drawn from the
+        // feed's independent stream. A push overflow tops out exactly like
+        // a block-out and outranks the goal check below: the terminal is
+        // always the single `GameOver`, `finished == TopOut`.
+        if let Some(feed) = self.feed.as_mut() {
+            if feed.pending > 0 {
+                let rows = feed.pending.min(MAX_GARBAGE_PER_LAND);
+                feed.pending -= rows;
+                let hole = feed.hole_rng.next_below(board::COLS as u64) as usize;
+                let (pushed, overflow) = push_garbage_rows(&self.board, rows as usize, hole);
+                self.board = pushed;
+                if overflow {
+                    self.active = None;
+                    self.game_over = true;
+                    self.finished = Some(FinishReason::TopOut);
+                    ev.push(GameEvent::GameOver);
+                    return;
+                }
             }
         }
         // Terminal goal: evaluated after this lock's line clear (T2/T3).
@@ -1060,6 +1152,447 @@ mod tests {
             bytes
         };
         assert_eq!(run(12345), run(12345));
+    }
+
+    // ------------------------------------------------------------------
+    // T12: Survival garbage feed
+    // ------------------------------------------------------------------
+
+    /// Feed config helper: Marathon rules plus a garbage feed.
+    fn feed_config(feed: GarbageFeed) -> ModeConfig {
+        ModeConfig {
+            garbage_feed: Some(feed),
+            ..ModeConfig::default()
+        }
+    }
+
+    /// Count rows made entirely of [`Piece::Garbage`] cells except a single
+    /// hole. Feeds (and only feeds) create such rows via
+    /// [`crate::versus::push_garbage_rows`], so this detects landed feed
+    /// garbage even after later clears/shifts.
+    fn garbage_hole_row_count(board: &Board) -> usize {
+        (0..ROWS)
+            .filter(|&r| {
+                let cells: Vec<Option<Piece>> =
+                    (0..COLS).map(|c| board.get(r, c)).collect::<Vec<_>>();
+                cells.iter().filter(|c| **c == Some(Piece::Garbage)).count() == COLS - 1
+                    && cells.iter().filter(|c| c.is_none()).count() == 1
+            })
+            .count()
+    }
+
+    /// Hole column of a full-except-one-hole row (panics otherwise).
+    fn hole_of_row(board: &Board, r: usize) -> usize {
+        (0..COLS)
+            .find(|&c| board.get(r, c).is_none())
+            .expect("row with exactly one hole")
+    }
+
+    /// Keep the game live with an empty stack and a mid-air active piece
+    /// (unit tests may poke private state): no locks, no game-overs. Used
+    /// to observe the pure queue schedule.
+    fn pin_airborne(g: &mut Game) {
+        g.board = Board::new();
+        g.active = Some(spawn_state(Piece::O));
+    }
+
+    #[test]
+    fn feed_first_row_queues_at_interval_and_lands_on_next_lock() {
+        let mut g = Game::with_config(7, &feed_config(GarbageFeed::default()));
+        assert_eq!(g.pending_garbage(), 0);
+        assert_eq!(g.ticks_to_next_row(), Some(300));
+
+        for _ in 0..299 {
+            g.tick();
+        }
+        assert_eq!(
+            g.pending_garbage(),
+            0,
+            "row 1 must not queue before tick 300"
+        );
+        assert_eq!(g.ticks_to_next_row(), Some(1));
+        g.tick(); // tick 300
+        assert_eq!(g.pending_garbage(), 1, "first row queues at tick 300");
+        assert_eq!(g.ticks_to_next_row(), Some(300));
+        assert_eq!(
+            g.garbage_rows_left(),
+            0,
+            "queued rows must not touch the board"
+        );
+
+        // No lock yet — keep ticking; the row stays pending.
+        for _ in 0..50 {
+            g.tick();
+        }
+        assert_eq!(g.pending_garbage(), 1);
+        assert_eq!(g.garbage_rows_left(), 0);
+
+        // The first lock after tick 300 lands it.
+        let ev = g.apply(Action::HardDrop);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, GameEvent::PieceLocked { .. })),
+            "{ev:?}"
+        );
+        assert_eq!(
+            g.pending_garbage(),
+            0,
+            "the pending batch lands on the lock"
+        );
+        assert_eq!(g.garbage_rows_left(), 1);
+        let board = g.snapshot().board;
+        assert_eq!(garbage_hole_row_count(&board), 1);
+        hole_of_row(&board, ROWS - 1);
+        assert_eq!(g.finished_reason(), None);
+    }
+
+    #[test]
+    fn feed_ticks_to_next_row_none_without_feed() {
+        let g = Game::new(7);
+        assert_eq!(g.ticks_to_next_row(), None);
+        assert_eq!(g.pending_garbage(), 0);
+    }
+
+    #[test]
+    fn feed_queue_schedule_decays_per_window_to_floor() {
+        // Pure queue schedule (T12): rows queue every `interval` game ticks,
+        // where the wait committed at tick `from` is the interval in force
+        // *there*: `max(60, 300 - 15 * (from / 1800))`. Window 0's 300
+        // divides 1800, so the first post-decay row lands exactly on the
+        // tick-1800 boundary at 285 spacing; later windows keep the
+        // previously committed wait across the boundary (decay applies at
+        // each queue event, once per fully elapsed window).
+        let mut g = Game::with_config(31337, &feed_config(GarbageFeed::default()));
+        let mut queue_ticks: Vec<u64> = Vec::new();
+        let mut prev_next = g.ticks_to_next_row().expect("feed present");
+        for _ in 0..40_000 {
+            g.tick();
+            pin_airborne(&mut g);
+            let next = g.ticks_to_next_row().expect("feed present");
+            if next > prev_next {
+                queue_ticks.push(g.tick_count());
+            }
+            prev_next = next;
+        }
+        assert_eq!(
+            &queue_ticks[..14],
+            &[300, 600, 900, 1200, 1500, 1800, 2085, 2370, 2655, 2940, 3225, 3510, 3795, 4065],
+            "queue ticks around the first two decay windows"
+        );
+        // decay_by applies exactly once per 1800-tick window: every wait
+        // equals the interval in force at the tick its row queued.
+        for (i, &e) in queue_ticks.iter().enumerate() {
+            let from = if i == 0 { 0 } else { queue_ticks[i - 1] };
+            let expect = 300u64.saturating_sub(15 * (from / 1800)).max(60);
+            assert_eq!(e - from, expect, "queue {} spacing from tick {}", i, from);
+        }
+        // Floor: once rows arrive at window-16 pace, they are exactly 60
+        // ticks apart forever.
+        let from_floor: Vec<u64> = queue_ticks
+            .iter()
+            .copied()
+            .filter(|&t| t >= 28_860)
+            .collect();
+        assert!(
+            from_floor.len() > 100,
+            "expected many floor-interval queues, got {}",
+            from_floor.len()
+        );
+        let first_floor = *queue_ticks
+            .iter()
+            .find(|&&t| t >= 28_800)
+            .expect("a queue at floor pace by tick 28 860");
+        assert!(
+            first_floor < 28_800 + 75,
+            "floor pace started late: {first_floor}"
+        );
+        for pair in from_floor.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                60,
+                "floor spacing violated at {}",
+                pair[0]
+            );
+        }
+        // Rows were never landed (airborne pin) ⇒ all queues accumulate.
+        assert_eq!(g.pending_garbage() as usize, queue_ticks.len());
+    }
+
+    #[test]
+    fn feed_cap_four_per_lock_trickles_surplus() {
+        let feed = GarbageFeed {
+            interval_ticks: 100,
+            decay_ticks: 1_000_000,
+            decay_by: 0,
+            floor_ticks: 0,
+        };
+        let mut g = Game::with_config(7, &feed_config(feed));
+        // Queue 6 rows without ever locking.
+        for _ in 0..599 {
+            g.tick();
+            pin_airborne(&mut g);
+        }
+        // ... the 600th tick queues row 6 — and would be followed by a lock.
+        g.tick();
+        pin_airborne(&mut g);
+        assert_eq!(g.pending_garbage(), 6);
+
+        g.active = Some(spawn_state(Piece::T));
+        let ev = g.apply(Action::HardDrop);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, GameEvent::PieceLocked { .. })),
+            "{ev:?}"
+        );
+        assert_eq!(g.pending_garbage(), 2, "cap 4 lands, 2 stay queued");
+        let board = g.snapshot().board;
+        let holes: Vec<usize> = (0..ROWS)
+            .filter(|&r| {
+                (0..COLS)
+                    .map(|c| board.get(r, c))
+                    .filter(|c| *c == Some(Piece::Garbage))
+                    .count()
+                    == COLS - 1
+                    && (0..COLS).filter(|&c| board.get(r, c).is_none()).count() == 1
+            })
+            .map(|r| hole_of_row(&board, r))
+            .collect();
+        assert_eq!(holes.len(), MAX_GARBAGE_PER_LAND as usize);
+        assert!(
+            holes.iter().all(|&h| h == holes[0]),
+            "one hole column per landing batch: {holes:?}"
+        );
+
+        // The surplus trickles on the next lock.
+        g.apply(Action::HardDrop);
+        assert_eq!(g.pending_garbage(), 0);
+        assert!(g.garbage_rows_left() >= 6);
+    }
+
+    #[test]
+    fn feed_overflow_tops_out_and_freezes() {
+        let feed = GarbageFeed {
+            interval_ticks: 30,
+            decay_ticks: 1_000_000,
+            decay_by: 0,
+            floor_ticks: 0,
+        };
+        let mut g = Game::with_config(11, &feed_config(feed));
+        // Queue one row.
+        for _ in 0..29 {
+            g.tick();
+        }
+        assert_eq!(g.pending_garbage(), 0);
+        g.tick(); // tick 30 queues the first row
+        assert_eq!(g.pending_garbage(), 1);
+
+        // Stack from row 1 down (column 0 open, so no row is clearable):
+        // locking the hidden-row O stamps cells into row 0, and the landing
+        // push then runs those cells past the ceiling. The next spawn never
+        // happens — the overflow alone ends the game.
+        for r in 1..ROWS {
+            for c in 1..COLS {
+                g.board.set(r, c, Some(Piece::Z));
+            }
+        }
+        g.active = Some(PieceState {
+            piece: Piece::O,
+            rot: Rotation::Spawn,
+            row: -1,
+            col: 4,
+        });
+        let ev = g.apply(Action::HardDrop);
+        assert_eq!(g.snapshot().lines, 0, "the lock must not clear anything");
+        assert_eq!(
+            ev.iter().filter(|e| **e == GameEvent::GameOver).count(),
+            1,
+            "exactly one GameOver: {ev:?}"
+        );
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::PieceSpawned { .. })));
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+        let s = g.snapshot();
+        assert!(s.game_over);
+        assert!(s.active.is_none());
+        assert_eq!(g.pending_garbage(), 0);
+        for _ in 0..10 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+        }
+        assert_eq!(g.tick_count(), 30, "the game froze without further ticks");
+    }
+
+    #[test]
+    fn feed_landing_topout_wins_over_goal_on_the_same_lock() {
+        // The lock clears one line (meeting `Goal::Lines(1)`), and the same
+        // lock's landing push overflows the ceiling. A top-out must win:
+        // exactly one coherent terminal, `GameOver` + `TopOut`, no
+        // `GoalReached`.
+        let config = ModeConfig {
+            goal: Some(Goal::Lines(1)),
+            garbage_feed: Some(GarbageFeed {
+                interval_ticks: 30,
+                decay_ticks: 1_000_000,
+                decay_by: 0,
+                floor_ticks: 0,
+            }),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(3, &config);
+        for _ in 0..60 {
+            g.tick();
+        }
+        assert_eq!(g.pending_garbage(), 2, "rows queued at ticks 30 and 60");
+
+        // Row 0: full except the column-5 corridor. Rows 1..=20: full
+        // except columns 5 (corridor) and 9 (keeps them from completing
+        // under the I). Row 21: full except the column-5 hole the vertical
+        // I completes — a one-line clear. The shift after that clear moves
+        // the old row 0 into row 1, so the 2-row landing push overflows.
+        for c in 0..COLS {
+            if c != 5 {
+                g.board.set(0, c, Some(Piece::Z));
+            }
+        }
+        for r in 1..(ROWS - 1) {
+            for c in 0..COLS {
+                if c != 5 && c != 9 {
+                    g.board.set(r, c, Some(Piece::Z));
+                }
+            }
+        }
+        for c in 0..COLS {
+            if c != 5 {
+                g.board.set(ROWS - 1, c, Some(Piece::Z));
+            }
+        }
+        g.active = Some(PieceState {
+            piece: Piece::I,
+            rot: Rotation::Cw,
+            row: -3,
+            col: 3,
+        });
+        let ev = g.apply(Action::HardDrop);
+        assert_eq!(g.snapshot().lines, 1, "the I completes exactly row 21");
+        assert_eq!(
+            ev.iter().filter(|e| **e == GameEvent::GameOver).count(),
+            1,
+            "exactly one GameOver: {ev:?}"
+        );
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, GameEvent::GoalReached { .. })),
+            "top-out wins over the goal on the same lock: {ev:?}"
+        );
+        assert!(ev.contains(&GameEvent::LineCleared { lines: 1 }), "{ev:?}");
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+        assert!(g.snapshot().game_over);
+        for _ in 0..10 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+        }
+    }
+
+    #[test]
+    fn feed_replay_is_deterministic() {
+        // A fast feed (one row every 60 ticks, no decay) queues and lands
+        // rows well before the scripted pile tops out. Same seed ⇒ identical
+        // event streams, snapshots and queue countdowns — hole columns and
+        // landing ticks are observable only through those, so equality there
+        // proves hole/landing determinism.
+        fn replay(
+            seed: u64,
+        ) -> (
+            Vec<GameEvent>,
+            Vec<GameSnapshot>,
+            Vec<u32>,
+            Vec<Option<u64>>,
+        ) {
+            let feed = GarbageFeed {
+                interval_ticks: 60,
+                decay_ticks: 1_000_000,
+                decay_by: 0,
+                floor_ticks: 60,
+            };
+            let mut g = Game::with_config(seed, &feed_config(feed));
+            let mut events = Vec::new();
+            let mut snaps = Vec::new();
+            let mut pendings = Vec::new();
+            let mut nexts = Vec::new();
+            for round in 0..60u64 {
+                if round % 3 == 0 {
+                    events.extend(g.apply(Action::Hold));
+                }
+                events.extend(g.apply(Action::RotateCw));
+                for _ in 0..(round % 4) {
+                    events.extend(g.apply(Action::MoveLeft));
+                }
+                events.extend(g.apply(Action::HardDrop));
+                for _ in 0..20 {
+                    events.extend(g.tick());
+                    if g.finished_reason().is_some() {
+                        break;
+                    }
+                }
+                pendings.push(g.pending_garbage());
+                nexts.push(g.ticks_to_next_row());
+                snaps.push(g.snapshot());
+            }
+            (events, snaps, pendings, nexts)
+        }
+        let a = replay(4242);
+        let b = replay(4242);
+        assert_eq!(a.0, b.0, "same-seed feed event streams diverged");
+        assert_eq!(a.1, b.1, "same-seed feed snapshots diverged");
+        assert_eq!(a.2, b.2, "same-seed pending_garbage diverged");
+        assert_eq!(a.3, b.3, "same-seed ticks_to_next_row diverged");
+        // The scripted run actually saw feed garbage land (non-vacuous).
+        assert!(a
+            .1
+            .iter()
+            .any(|s| s.board.get(ROWS - 1, 0) == Some(Piece::Garbage)
+                || s.board.get(ROWS - 1, 9) == Some(Piece::Garbage)));
+        // A different seed must diverge (hole stream follows the seed).
+        let c = replay(4243);
+        assert_ne!(a.0, c.0, "different seeds must diverge");
+    }
+
+    #[test]
+    fn feed_never_disturbs_bag_draws() {
+        // Same seed, no feed vs an aggressive feed config: the first six
+        // peek_next draws must be identical (the feed's hole stream is
+        // independent of the bag).
+        let plain = Game::with_config(31337, &ModeConfig::default());
+        let fed = Game::with_config(
+            31337,
+            &feed_config(GarbageFeed {
+                interval_ticks: 10,
+                decay_ticks: 100,
+                decay_by: 5,
+                floor_ticks: 10,
+            }),
+        );
+        assert_eq!(plain.peek_next(6), fed.peek_next(6));
+    }
+
+    #[test]
+    fn feed_default_config_game_identical_to_new() {
+        // `garbage_feed: None` (every existing config) reproduces `Game::new`
+        // bit-for-bit, including the new getters.
+        for seed in [1u64, 31337, 20261001] {
+            let mut a = Game::new(seed);
+            let mut b = Game::with_config(seed, &ModeConfig::default());
+            let (mut ea, mut eb) = (Vec::new(), Vec::new());
+            let (mut sa, mut sb) = (Vec::new(), Vec::new());
+            scripted_log(&mut a, &mut ea, &mut sa);
+            scripted_log(&mut b, &mut eb, &mut sb);
+            assert_eq!(ea, eb, "seed {seed}: no-feed event stream diverged");
+            assert_eq!(sa, sb, "seed {seed}: no-feed snapshots diverged");
+            assert_eq!(a.pending_garbage(), b.pending_garbage());
+            assert_eq!(a.ticks_to_next_row(), b.ticks_to_next_row());
+            assert_eq!(a.ticks_to_next_row(), None);
+        }
     }
 
     // ------------------------------------------------------------------

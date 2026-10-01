@@ -10,8 +10,6 @@
 //! - `GameSnapshot`/`MatchSnapshot` gain **no** fields from modes (wire
 //!   stability until T19); terminal state is exposed via
 //!   [`crate::game::Game::finished_reason`].
-//! - `T12` will extend this module with a `GarbageFeed` field; keep
-//!   `ModeConfig` open to additional fields.
 
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +104,68 @@ pub enum BlockOutBehavior {
     WipeAndContinue,
 }
 
+/// Default Survival feed: queue one garbage row every 5 s (at 60 Hz).
+pub const FEED_INTERVAL_TICKS: u64 = 300;
+/// Length of a decay window: every `decay_ticks` game ticks the queue
+/// interval drops by `decay_by`.
+pub const FEED_DECAY_TICKS: u64 = 1800;
+/// Queue-interval reduction per elapsed decay window.
+pub const FEED_DECAY_BY: u64 = 15;
+/// Lower bound of the queue interval — the fastest the feed ever gets.
+pub const FEED_FLOOR_TICKS: u64 = 60;
+
+/// Timed garbage feed (T12, Survival): queues one garbage row every
+/// `interval_ticks` game ticks. The queue interval decays by `decay_by`
+/// ticks for every full `decay_ticks` decay window elapsed, never below
+/// `floor_ticks` (a `decay_ticks` of 0 disables decay). Queued rows land on
+/// the player's next lock through the versus garbage pusher (cap
+/// [`crate::versus::MAX_GARBAGE_PER_LAND`] rows per lock, surplus trickles
+/// over later locks, one hole column per landing batch); a push that runs
+/// the stack past the ceiling tops out exactly like a block-out. The queue
+/// events depend only on game ticks, never on locks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GarbageFeed {
+    /// Starting queue interval, and the interval in force for decay
+    /// window 0 (game ticks).
+    pub interval_ticks: u64,
+    /// Length of one decay window (game ticks); `decay_by` applies once
+    /// per fully elapsed window.
+    pub decay_ticks: u64,
+    /// Interval reduction applied per elapsed decay window.
+    pub decay_by: u64,
+    /// Minimum interval the decay can shrink to (game ticks). A floor above
+    /// `interval_ticks` wins: the feed runs at the floor from the start.
+    pub floor_ticks: u64,
+}
+
+impl Default for GarbageFeed {
+    /// Survival defaults: one row every 300 ticks, dropping 15 ticks per
+    /// 1800-tick window down to a 60-tick floor.
+    fn default() -> Self {
+        Self {
+            interval_ticks: FEED_INTERVAL_TICKS,
+            decay_ticks: FEED_DECAY_TICKS,
+            decay_by: FEED_DECAY_BY,
+            floor_ticks: FEED_FLOOR_TICKS,
+        }
+    }
+}
+
+impl GarbageFeed {
+    /// Queue interval in force at absolute game tick `t`:
+    /// `interval_ticks - decay_by * (t / decay_ticks)`, clamped below by
+    /// `floor_ticks` (windows are 0-based, so window `w` spans ticks
+    /// `w * decay_ticks..(w + 1) * decay_ticks`).
+    pub fn interval_at(&self, t: u64) -> u64 {
+        // `checked_div` covers `decay_ticks == 0`: no windows elapsed, no
+        // decay ever.
+        let windows = t.checked_div(self.decay_ticks).unwrap_or(0);
+        self.interval_ticks
+            .saturating_sub(self.decay_by.saturating_mul(windows))
+            .max(self.floor_ticks)
+    }
+}
+
 /// Why a game froze. Exposed through [`crate::game::Game::finished_reason`]
 /// (the snapshot carries no such field — wire stability).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +202,9 @@ pub struct ModeConfig {
     pub start_board: Option<StartBoard>,
     /// What a block-out does.
     pub on_block_out: BlockOutBehavior,
+    /// Optional timed garbage feed (T12, Survival). `None` (the default)
+    /// means no feed: every pre-T12 config behaves exactly as before.
+    pub garbage_feed: Option<GarbageFeed>,
 }
 
 impl Default for ModeConfig {
@@ -155,6 +218,7 @@ impl Default for ModeConfig {
             clock_ticks: None,
             start_board: None,
             on_block_out: BlockOutBehavior::End,
+            garbage_feed: None,
         }
     }
 }
@@ -173,6 +237,78 @@ mod tests {
         assert_eq!(c.clock_ticks, None);
         assert_eq!(c.start_board, None);
         assert_eq!(c.on_block_out, BlockOutBehavior::End);
+        assert_eq!(c.garbage_feed, None);
+    }
+
+    #[test]
+    fn garbage_feed_defaults_are_survival_constants() {
+        let f = GarbageFeed::default();
+        assert_eq!(f.interval_ticks, FEED_INTERVAL_TICKS);
+        assert_eq!(f.decay_ticks, FEED_DECAY_TICKS);
+        assert_eq!(f.decay_by, FEED_DECAY_BY);
+        assert_eq!(f.floor_ticks, FEED_FLOOR_TICKS);
+        assert_eq!(
+            f,
+            GarbageFeed {
+                interval_ticks: 300,
+                decay_ticks: 1800,
+                decay_by: 15,
+                floor_ticks: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn feed_interval_at_decays_once_per_window_to_floor() {
+        let f = GarbageFeed::default();
+        // Window 0 spans ticks 0..1800 at the starting interval.
+        assert_eq!(f.interval_at(0), 300);
+        assert_eq!(f.interval_at(1799), 300);
+        // decay_by applies exactly once per elapsed 1800-tick window…
+        for w in 1..17u64 {
+            assert_eq!(
+                f.interval_at(w * 1800),
+                300 - 15 * w,
+                "first tick of window {w}"
+            );
+            assert_eq!(
+                f.interval_at(w * 1800 - 1),
+                300 - 15 * (w - 1),
+                "last tick of window {}",
+                w - 1
+            );
+        }
+        // …and floors at 60 from window 16 (tick 28 800) onward.
+        assert_eq!(f.interval_at(15 * 1800), 75);
+        assert_eq!(f.interval_at(16 * 1800), 60);
+        assert_eq!(f.interval_at(100_000_000), 60);
+    }
+
+    #[test]
+    fn feed_interval_at_degenerate_configs() {
+        // decay_ticks == 0 disables decay; a floor above the start wins;
+        // huge windows saturate instead of overflowing or wrapping.
+        let no_decay = GarbageFeed {
+            interval_ticks: 100,
+            decay_ticks: 0,
+            decay_by: 15,
+            floor_ticks: 10,
+        };
+        assert_eq!(no_decay.interval_at(u64::MAX), 100);
+        let floored = GarbageFeed {
+            interval_ticks: 10,
+            decay_ticks: 1,
+            decay_by: 1,
+            floor_ticks: 120,
+        };
+        assert_eq!(floored.interval_at(0), 120);
+        let saturating = GarbageFeed {
+            interval_ticks: 300,
+            decay_ticks: 1,
+            decay_by: u64::MAX,
+            floor_ticks: 0,
+        };
+        assert_eq!(saturating.interval_at(u64::MAX), 0);
     }
 
     /// Buried-garbage start-board invariants over 100 seeds:
