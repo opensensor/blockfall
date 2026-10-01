@@ -593,7 +593,17 @@ fn render_playfield(
     let Some(core) = core else { return };
     let layout = FieldLayout::fit_window(size.x, size.y);
     sync_frame(&mut commands, &mut frames.solo, &layout, None);
-    let cells = frame_cells(&core.game.snapshot());
+    let mut cells = frame_cells(&core.game.snapshot());
+    // T23 **No Ghost**: render-only suppression — the core keeps computing
+    // `ghost_row` and the snapshot wire is untouched, the cells are simply
+    // never handed to the sprite pool.
+    if core
+        .active_mode
+        .mutators
+        .contains(crate::mutators::Mutators::NO_GHOST)
+    {
+        cells.retain(|cell| cell.kind != CellKind::Ghost);
+    }
     sync_pool(&mut commands, &mut pool.entities, &cells, &layout, None);
 }
 
@@ -1255,6 +1265,105 @@ mod tests {
             snapshot_drawn(&mut app),
             reference,
             "solo after versus renders exactly like a fresh solo"
+        );
+    }
+}
+
+#[cfg(test)]
+mod t23_tests {
+    use super::*;
+    use crate::core_bridge::{CoreBridgePlugin, GameCore};
+    use crate::modes::ModeId;
+    use crate::mutators::Mutators;
+    use crate::state::AppState;
+
+    use bevy::app::FixedUpdate;
+    use bevy::window::WindowPlugin;
+
+    fn render_app(seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(WindowPlugin {
+            primary_window: Some(Window {
+                title: "tetris t23 render".into(),
+                resolution: (1280, 720).into(),
+                resizable: true,
+                visible: false,
+                ..default()
+            }),
+            ..default()
+        });
+        app.add_plugins((CoreBridgePlugin, RenderPlugin));
+        app.insert_non_send(GameCore::new(seed));
+        app.init_resource::<AppState>();
+        app
+    }
+
+    fn render_frame(app: &mut App) {
+        app.world_mut().run_schedule(FixedUpdate);
+        let _ = app.world_mut().try_run_schedule(Update);
+    }
+
+    fn drawn_cells(app: &mut App, kind: CellKind) -> usize {
+        let mut query = app.world_mut().query::<&PlayfieldCell>();
+        query
+            .iter(app.world())
+            .filter(|cell| cell.kind == kind)
+            .count()
+    }
+
+    /// **No Ghost** (T23): the renderer skips ghost cells while the mutator
+    /// is active on the run — the core keeps computing `ghost_row` (the
+    /// snapshot is untouched), and a clean restart brings the ghost back.
+    #[test]
+    fn no_ghost_mutator_suppresses_ghost_cells_in_render() {
+        let mut app = render_app(0x051);
+        render_frame(&mut app);
+        let baseline_ghost = drawn_cells(&mut app, CellKind::Ghost);
+        assert!(
+            baseline_ghost > 0,
+            "baseline clean run draws ghost cells (got {baseline_ghost})"
+        );
+        let baseline_active = drawn_cells(&mut app, CellKind::Active);
+
+        let seed = app.world().non_send::<GameCore>().seed;
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::NO_GHOST;
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        render_frame(&mut app);
+        assert_eq!(
+            drawn_cells(&mut app, CellKind::Ghost),
+            0,
+            "No Ghost: zero drawn ghost cells"
+        );
+        assert_eq!(
+            drawn_cells(&mut app, CellKind::Active),
+            baseline_active,
+            "the active piece still renders"
+        );
+        assert!(
+            app.world()
+                .non_send::<GameCore>()
+                .game
+                .snapshot()
+                .ghost_row
+                .is_some(),
+            "core still computes the ghost — snapshot untouched"
+        );
+
+        let seed = app.world().non_send::<GameCore>().seed;
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::empty();
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        render_frame(&mut app);
+        assert_eq!(
+            drawn_cells(&mut app, CellKind::Ghost),
+            baseline_ghost,
+            "clean re-run draws the ghost again (regression)"
         );
     }
 }

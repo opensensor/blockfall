@@ -146,6 +146,11 @@ impl Records {
 
     /// Fold a finished run into the records; `true` when it became (or
     /// replaced) the record under the variant's improvement rule.
+    ///
+    /// **Raw fold.** Solo game-over paths must go through
+    /// [`Records::record_run_mutated`] instead (the T23 mutator gate); this
+    /// entry point stays for non-run writers that are never mutated (the bot
+    /// ladder crowning in `screens_ladder`, tests) and as the gate's tail.
     pub fn record_run(&mut self, key: ModeKey, record: Record) -> bool {
         match self.records.get_mut(key) {
             Some(existing) if !Record::is_improvement(existing, &record) => false,
@@ -158,6 +163,27 @@ impl Records {
                 true
             }
         }
+    }
+
+    /// The **central mutator gate** (T23): fold a finished run into the
+    /// records unless the run was mutated. `mutated` (`true` when the run
+    /// had any mutator active, per the owner decision "mutated runs get no
+    /// records") skips the record *content* write entirely and returns
+    /// `false` (no NEW RECORD marker).
+    ///
+    /// This suppresses every record kind routed through here (BestScore and
+    /// BestTime today). The T17 `Daily` entry is covered by the *same rule*
+    /// at its only mutated-reachable writer — `terminal_record_system`
+    /// skips the whole daily fold for mutated runs (a mutated daily run
+    /// writes no `Daily` record), because `daily.rs`'s date gate owns that
+    /// `record_run` call. Play counters are deliberately **not** gated:
+    /// they live in [`Records::bump_plays`], which `start_mode_run` still
+    /// calls for mutated runs.
+    pub fn record_run_mutated(&mut self, key: ModeKey, record: Record, mutated: bool) -> bool {
+        if mutated {
+            return false;
+        }
+        self.record_run(key, record)
     }
 
     /// Count one play for `key`; returns the new count.
@@ -421,6 +447,49 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::settings_persist::{CONFIG_DIR_ENV, ENV_LOCK};
+
+    /// T23 central mutator gate: a mutated fold writes nothing (and never
+    /// claims NEW RECORD), cannot overwrite an existing record, while a
+    /// clean fold behaves bit-identically to [`Records::record_run`]. Play
+    /// counters are the start path's job — [`Records::record_run_mutated`]
+    /// never touches them, mutated or not.
+    #[test]
+    fn record_run_mutated_suppresses_content_but_not_plays() {
+        let mut records = Records::default();
+        assert!(
+            !records.record_run_mutated(
+                MARATHON,
+                Record::BestScore {
+                    score: 100,
+                    level: 1,
+                    lines: 10
+                },
+                true,
+            ),
+            "a mutated run never becomes a record"
+        );
+        assert!(records.record_for(MARATHON).is_none());
+
+        assert!(records.record_run(SPRINT, Record::BestTime { ticks: 100 }));
+        assert!(
+            !records.record_run_mutated(SPRINT, Record::BestTime { ticks: 1 }, true),
+            "a mutated run cannot overwrite an existing record"
+        );
+        assert_eq!(
+            records.record_for(SPRINT),
+            Some(&Record::BestTime { ticks: 100 })
+        );
+
+        assert!(records.record_run_mutated(SPRINT, Record::BestTime { ticks: 1 }, false));
+        assert_eq!(
+            records.record_for(SPRINT),
+            Some(&Record::BestTime { ticks: 1 }),
+            "clean folds pass the gate through unchanged"
+        );
+
+        assert_eq!(records.bump_plays(MARATHON), 1, "plays stay bumpable");
+        assert_eq!(records.plays(MARATHON), 1);
+    }
 
     struct TempDir(PathBuf);
 

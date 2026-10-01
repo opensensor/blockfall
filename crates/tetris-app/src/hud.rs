@@ -829,6 +829,18 @@ fn sync_hud_previews(
     let configured = settings.as_deref().map_or(DEFAULT_QUEUE_SIZE, |s| {
         s.next_queue_size.clamp(1, MAX_NEXT as u8) as usize
     });
+    // T23 **One Preview**: the run's mutators beat the global setting while
+    // active (fixture-only HUDs have no `GameCore`, so fixtures are
+    // unaffected; versus panels render through `sync_versus_hud` instead).
+    let configured = if core.as_deref().is_some_and(|core| {
+        core.active_mode
+            .mutators
+            .contains(crate::mutators::Mutators::ONE_PREVIEW)
+    }) {
+        1
+    } else {
+        configured
+    };
     let wanted = configured.min(snapshot.next.len());
     while entities.next_roots.len() > wanted {
         let entity = entities.next_roots.pop().expect("length checked");
@@ -2723,5 +2735,104 @@ mod tests {
 
         std::env::remove_var(crate::settings_persist::CONFIG_DIR_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod t23_tests {
+    use super::*;
+    use crate::core_bridge::{CoreBridgePlugin, GameCore};
+    use crate::modes::ModeId;
+    use crate::mutators::Mutators;
+    use crate::state::AppState;
+
+    use bevy::window::WindowPlugin;
+
+    fn hud_app(seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(WindowPlugin {
+            primary_window: Some(Window {
+                title: "tetris t23 hud".into(),
+                resolution: (1280, 720).into(),
+                resizable: true,
+                visible: false,
+                ..default()
+            }),
+            ..default()
+        });
+        app.add_plugins((CoreBridgePlugin, HudPlugin));
+        app.insert_non_send(GameCore::new(seed));
+        app.init_resource::<AppState>();
+        app.init_resource::<Settings>();
+        app
+    }
+
+    fn next_previews(app: &mut App) -> Vec<(usize, Piece)> {
+        let mut query = app.world_mut().query::<&NextPreview>();
+        let mut previews: Vec<(usize, Piece)> = query
+            .iter(app.world())
+            .map(|preview| (preview.index, preview.piece))
+            .collect();
+        previews.sort_by_key(|(index, _)| *index);
+        previews
+    }
+
+    fn snapshot(app: &App) -> GameSnapshot {
+        app.world().non_send::<GameCore>().game.snapshot()
+    }
+
+    /// **One Preview** (T23): an active mutator pins the HUD next queue to
+    /// exactly one preview; a clean run keeps the configured queue size.
+    #[test]
+    fn one_preview_mutator_forces_single_next_preview() {
+        let mut app = hud_app(0x052);
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            next_previews(&mut app).len(),
+            5,
+            "baseline clean run shows the configured queue"
+        );
+
+        let seed = app.world().non_send::<GameCore>().seed;
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::ONE_PREVIEW;
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        let _ = app.world_mut().try_run_schedule(Update);
+        let previews = next_previews(&mut app);
+        assert_eq!(previews.len(), 1, "One Preview: exactly one slot");
+        assert_eq!(previews[0].0, 0, "the surviving slot is index 0");
+        assert_eq!(
+            previews[0].1,
+            snapshot(&app).next[0],
+            "and it shows the first queued piece"
+        );
+
+        // A *settings* change must not undo the mutator clamp (the run's
+        // mutators beat the global setting).
+        app.world_mut().resource_mut::<Settings>().next_queue_size = 6;
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            next_previews(&mut app).len(),
+            1,
+            "mutator wins over Settings"
+        );
+
+        // Clean run back to the configured size (regression for other modes).
+        let seed = app.world().non_send::<GameCore>().seed;
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.selected_mutators = Mutators::empty();
+            core.start_mode(seed, ModeId::Marathon);
+        }
+        app.world_mut().resource_mut::<Settings>().next_queue_size = 5;
+        let _ = app.world_mut().try_run_schedule(Update);
+        assert_eq!(
+            next_previews(&mut app).len(),
+            5,
+            "clean runs keep the existing HUD behavior"
+        );
     }
 }

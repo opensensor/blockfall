@@ -189,6 +189,15 @@ pub struct GameCore {
     /// `NonSend<GameCore>` (no separate resource, no borrow conflicts);
     /// `restart_on_r_system` retries this id.
     pub active_mode: ActiveMode,
+    /// The **pending mutator selection** on the mode-select screen (T23).
+    /// Session-scoped (never persisted). Read exclusively by
+    /// [`GameCore::start_mode`], which snapshots it onto
+    /// [`ActiveMode::mutators`]; consumers of the live run read only that
+    /// snapshot, so toggling mid-run never affects it. Lives as a field on
+    /// the existing `NonSend` `GameCore` — no new resource entity (house
+    /// resource-count discipline), and the frozen `start_mode_run` free
+    /// functions reach it through their existing `&mut GameCore` parameter.
+    pub selected_mutators: crate::mutators::Mutators,
 }
 
 impl GameCore {
@@ -200,6 +209,7 @@ impl GameCore {
             steps: 0,
             pending_events: Vec::new(),
             active_mode: ActiveMode::default(),
+            selected_mutators: crate::mutators::Mutators::empty(),
         }
     }
 
@@ -212,6 +222,10 @@ impl GameCore {
     /// Deterministic variant of [`GameCore::restart`] for tests and replays.
     /// Always Marathon (the legacy path): [`Self::active_mode`] is reset to
     /// match, so the R retry after a title-screen restart stays consistent.
+    /// The (T23) [`Self::selected_mutators`] pending selection is
+    /// deliberately **kept** — the legacy path never *applies* mutators
+    /// (`active_mode` resets clean), while the R retry goes through
+    /// [`start_mode_run`] and snapshots the current selection as usual.
     pub fn restart_with(&mut self, seed: u64) {
         self.game = Game::new(seed);
         self.seed = seed;
@@ -225,32 +239,51 @@ impl GameCore {
     /// [`GameCore::restart_with`] bit-for-bit for that mode. Seed resolution
     /// (`TETRIS_SEED`) and the countdown/play-count bookkeeping live in the
     /// free [`start_mode_run`], mirroring [`restart_run`].
+    ///
+    /// T23: this is the one start path, so it owns the mutator handoff —
+    /// [`Self::selected_mutators`] is **snapshotted here** onto
+    /// [`ActiveMode::mutators`] (later selection changes never touch the
+    /// live run), and the **20G** mutator's config override (`start_level =
+    /// 20`, plan R7: pure R1 config, core untouched) is applied to the
+    /// `Game` *and* the recorded config before construction.
     pub fn start_mode(&mut self, seed: u64, id: ModeId) {
-        self.game = Game::with_config(seed, &modes::mode_config(id));
+        let mut config = modes::mode_config(id);
+        let mutators = self.selected_mutators;
+        if mutators.contains(crate::mutators::Mutators::TWENTY_G) {
+            config.start_level = 20;
+        }
+        self.game = Game::with_config(seed, &config);
         self.seed = seed;
         self.steps = 0;
         self.pending_events.clear();
         self.active_mode = ActiveMode {
             id,
-            config: modes::mode_config(id),
+            config,
+            mutators,
         };
     }
 }
 
 /// The solo mode a [`GameCore`] run was started as: the catalogue
 /// [`ModeId`] plus the [`ModeConfig`] its `Game` was built from (T8's HUD
-/// reads the goal/clock off `config` without re-deriving it from the id).
+/// reads the goal/clock off `config` without re-deriving it from the id),
+/// plus the **mutators snapshotted at run start** (T23 — the sole mutator
+/// read-out for every consumer: bridge HOLD filter, render, HUD, records).
 ///
 /// Lives as a field on `GameCore`, not a standalone resource: it is only
 /// meaningful together with the `!Send` game it was built for, and systems
 /// that need it already hold `NonSend<GameCore>` (plan T5 design note).
-/// `Default` is Marathon, matching [`GameCore::default`].
+/// `Default` is clean Marathon, matching [`GameCore::default`].
 #[derive(Debug, Clone)]
 pub struct ActiveMode {
     /// Catalogue id of the live run.
     pub id: ModeId,
-    /// The config `game` was constructed from.
+    /// The config `game` was constructed from (post-mutator overrides — a
+    /// 20G run's `start_level` is already `20` here).
     pub config: ModeConfig,
+    /// The mutators [`GameCore::start_mode`] snapshotted from
+    /// [`GameCore::selected_mutators`] when this run began. Empty ⇒ clean.
+    pub mutators: crate::mutators::Mutators,
 }
 
 impl Default for ActiveMode {
@@ -258,6 +291,7 @@ impl Default for ActiveMode {
         Self {
             id: ModeId::Marathon,
             config: ModeConfig::default(),
+            mutators: crate::mutators::Mutators::empty(),
         }
     }
 }
@@ -1124,7 +1158,19 @@ fn core_bridge_system(
 ) {
     let core = core.into_inner();
     if !paused.0 && countdown.0 == 0 && *app_state == AppState::Playing && !versus.active {
+        // T23 **No Hold**: while the run's mutators carry NO_HOLD, HOLD
+        // actions are silently dropped here — the last point before the
+        // core, so `input.rs`/touch bindings stay untouched and the core
+        // never sees the action (a queued HOLD held by a pause freeze is
+        // filtered at apply time, not at push time).
+        let no_hold = core
+            .active_mode
+            .mutators
+            .contains(crate::mutators::Mutators::NO_HOLD);
         for action in pending.queue.drain(..) {
+            if no_hold && matches!(action, Action::Hold) {
+                continue;
+            }
             core.pending_events.extend(core.game.apply(action));
         }
         core.pending_events.extend(core.game.tick());
@@ -2223,6 +2269,169 @@ mod tests {
             mode_hud(&app).pieces_placed,
             0,
             "steps == 0 resets the count"
+        );
+    }
+
+    // ---- T23: mutator framework (No Hold / 20G / snapshot-at-start) ----
+
+    use crate::mutators::Mutators;
+
+    /// Move the mode-select selection, then start a mode through the shared
+    /// T5 path — the exact order the mode-select row press performs.
+    fn select_and_start(app: &mut App, mutators: Mutators, id: ModeId) {
+        app.world_mut().non_send_mut::<GameCore>().selected_mutators = mutators;
+        start_mode(app, id);
+    }
+
+    fn active_mutators(app: &App) -> Mutators {
+        app.world().non_send::<GameCore>().active_mode.mutators
+    }
+
+    #[test]
+    fn clean_start_carries_no_mutators() {
+        let mut app = test_app(0xA0);
+        start_mode(&mut app, ModeId::Marathon);
+        assert!(active_mutators(&app).is_empty());
+        assert_eq!(
+            app.world()
+                .non_send::<GameCore>()
+                .active_mode
+                .config
+                .start_level,
+            1,
+            "clean Marathon keeps the catalogue config"
+        );
+    }
+
+    #[test]
+    fn no_hold_mutator_makes_hold_a_silent_noop() {
+        let mut app = test_app(0xA1);
+        select_and_start(&mut app, Mutators::NO_HOLD, ModeId::Marathon);
+        let before = snapshot(&app);
+        let active_piece = before.active.expect("spawned piece").piece;
+
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::Hold);
+        fixed_step(&mut app);
+
+        let after = snapshot(&app);
+        assert!(after.hold.is_none(), "No Hold: hold slot stays empty");
+        assert!(!after.hold_used, "No Hold: hold_used never flips");
+        assert_eq!(
+            after.active.expect("still live").piece,
+            active_piece,
+            "No Hold: the active piece is not swapped"
+        );
+        assert_eq!(after.next, before.next, "No Hold: the next queue moves on");
+        assert_eq!(app.world().non_send::<GameCore>().steps, 1, "the tick ran");
+    }
+
+    #[test]
+    fn hold_works_when_the_mutator_is_absent() {
+        let mut app = test_app(0xA1);
+        select_and_start(&mut app, Mutators::empty(), ModeId::Marathon);
+        let active_piece = snapshot(&app).active.expect("spawned piece").piece;
+
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::Hold);
+        fixed_step(&mut app);
+
+        let after = snapshot(&app);
+        assert_eq!(after.hold, Some(active_piece), "clean run: hold parks it");
+        assert!(after.hold_used);
+    }
+
+    #[test]
+    fn mutators_snapshot_at_start_ignores_later_selection_changes() {
+        let mut app = test_app(0xA3);
+        select_and_start(&mut app, Mutators::NO_HOLD, ModeId::Marathon);
+        assert_eq!(active_mutators(&app), Mutators::NO_HOLD);
+
+        // Mid-run the (hypothetical) selection changes to clean: the live
+        // run must keep the snapshot taken at start.
+        app.world_mut().non_send_mut::<GameCore>().selected_mutators = Mutators::empty();
+
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::Hold);
+        fixed_step(&mut app);
+        let after = snapshot(&app);
+        assert!(
+            after.hold.is_none() && !after.hold_used,
+            "started with No Hold ⇒ HOLD stays dead for this run"
+        );
+    }
+
+    #[test]
+    fn mid_run_selection_change_does_not_break_a_clean_run() {
+        let mut app = test_app(0xA2);
+        start_mode(&mut app, ModeId::Marathon);
+        let active_piece = snapshot(&app).active.expect("spawned piece").piece;
+
+        // Toggle NO_HOLD on during Playing: snapshot-at-start means the
+        // clean run keeps its hold.
+        app.world_mut().non_send_mut::<GameCore>().selected_mutators = Mutators::NO_HOLD;
+
+        app.world_mut()
+            .resource_mut::<PendingActions>()
+            .push(Action::Hold);
+        fixed_step(&mut app);
+        let after = snapshot(&app);
+        assert_eq!(
+            after.hold,
+            Some(active_piece),
+            "started clean ⇒ HOLD keeps working in this run"
+        );
+        assert!(after.hold_used);
+    }
+
+    #[test]
+    fn twenty_g_mutator_overrides_start_level() {
+        let mut app = test_app(0xA4);
+        select_and_start(&mut app, Mutators::TWENTY_G, ModeId::Marathon);
+
+        {
+            let core = app.world().non_send::<GameCore>();
+            assert_eq!(core.active_mode.mutators, Mutators::TWENTY_G);
+            assert_eq!(
+                core.active_mode.config.start_level, 20,
+                "20G overrides the catalogue config in the start path"
+            );
+        }
+        let start = snapshot(&app);
+        assert_eq!(start.level, 20, "the run starts at level 20");
+        let row0 = start.active.expect("spawned piece").row;
+
+        // 20G = one row every 3 ticks: four steps must drop the piece.
+        for _ in 0..4 {
+            fixed_step(&mut app);
+        }
+        let dropped = snapshot(&app).active.expect("still alive").row;
+        assert!(dropped > row0, "20G gravity: row {row0} -> {dropped}");
+
+        // Control: the clean level-1 run (60 ticks/row) has not moved.
+        let mut clean = test_app(0xA4);
+        start_mode(&mut clean, ModeId::Marathon);
+        let clean_row = snapshot(&clean).active.expect("spawned piece").row;
+        for _ in 0..4 {
+            fixed_step(&mut clean);
+        }
+        assert_eq!(snapshot(&clean).active.expect("alive").row, clean_row);
+    }
+
+    #[test]
+    fn mutator_snapshot_travels_with_the_active_mode_not_the_selection() {
+        let mut app = test_app(0xA5);
+        select_and_start(&mut app, Mutators::NO_HOLD, ModeId::Marathon);
+        // Starting a *new* run snapshots whatever is selected *then*.
+        app.world_mut().non_send_mut::<GameCore>().selected_mutators =
+            Mutators::NO_GHOST | Mutators::ONE_PREVIEW;
+        start_mode(&mut app, ModeId::Marathon);
+        assert_eq!(
+            active_mutators(&app),
+            Mutators::NO_GHOST | Mutators::ONE_PREVIEW
         );
     }
 }

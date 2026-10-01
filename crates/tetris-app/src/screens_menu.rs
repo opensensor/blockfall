@@ -1117,23 +1117,35 @@ fn terminal_record_system(
     let daily_attempt = std::mem::replace(&mut flow.daily, DailyAttempt::Idle);
     let mut daily_share = None;
 
+    // T23: a run with **any mutator active** (snapshot taken at start)
+    // writes no records — owner decision. Play counters are unaffected
+    // (`start_mode_run` bumped them already, and that bump is the only one
+    // on this path).
+    let mutated = !core.active_mode.mutators.is_empty();
+
     let mut new_record = false;
     if let (Some(reason), Some(records)) = (reason, records.as_deref_mut()) {
+        // T17 daily fold — a **mutated daily run also skips the `Daily`
+        // record** (same central gate; `daily.rs`'s date gate owns the one
+        // `record_run` call for `Record::Daily`, so the mutated run's fold
+        // is suppressed wholesale here: no Daily write, no share line).
         if let DailyAttempt::Active { date } = daily_attempt {
-            if let Some((line, wrote)) =
-                daily::finish_daily_attempt(records, date, id, reason, ticks, snapshot.score)
-            {
-                daily_share = Some(line);
-                if wrote {
-                    if let Some(queue) = queue.as_deref_mut() {
-                        queue.pending = true;
-                        queue.force = true;
+            if !mutated {
+                if let Some((line, wrote)) =
+                    daily::finish_daily_attempt(records, date, id, reason, ticks, snapshot.score)
+                {
+                    daily_share = Some(line);
+                    if wrote {
+                        if let Some(queue) = queue.as_deref_mut() {
+                            queue.pending = true;
+                            queue.force = true;
+                        }
                     }
                 }
             }
         }
         if let Some(record) = terminal_record(id, reason, &snapshot, ticks) {
-            new_record = records.record_run(mode_key(id), record);
+            new_record = records.record_run_mutated(mode_key(id), record, mutated);
             if new_record {
                 if let Some(queue) = queue.as_deref_mut() {
                     queue.pending = true;
@@ -3270,7 +3282,11 @@ mod tests {
         core.seed = seed;
         core.steps = 0;
         core.pending_events.clear();
-        core.active_mode = crate::core_bridge::ActiveMode { id, config };
+        core.active_mode = crate::core_bridge::ActiveMode {
+            id,
+            config,
+            mutators: crate::mutators::Mutators::empty(),
+        };
         *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
     }
 
@@ -3867,5 +3883,236 @@ mod tests {
             "the normal Marathon record still lands (matrix untouched)"
         );
         assert_eq!(flow_daily(&app), DailyAttempt::Idle);
+    }
+}
+
+#[cfg(test)]
+mod t23_tests {
+    use super::*;
+
+    use crate::core_bridge::{
+        start_mode_run, CoreBridgePlugin, Countdown, GameCore, PendingActions,
+    };
+    use crate::daily::{self, CivilDate, DailyAttempt};
+    use crate::modes::ModeId;
+    use crate::mutators::Mutators;
+    use crate::records::{self, Record, Records, DAILY, MARATHON};
+    use crate::settings_persist::{CONFIG_DIR_ENV, ENV_LOCK};
+
+    use bevy::app::FixedUpdate;
+    use tetris_core::actions::Action;
+    use tetris_core::mode::{FinishReason, ModeConfig};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("tetris-t23-{label}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("temp dir created");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Production-equivalent persistence tree (settings + records + the T9
+    /// terminal recorder) against an isolated `TETRIS_CONFIG_DIR`. The
+    /// caller points `CONFIG_DIR_ENV` at its dir before building.
+    fn persist_app(seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins((
+            CoreBridgePlugin,
+            crate::settings_persist::SettingsPersistPlugin,
+            MenuScreensPlugin,
+        ));
+        app.insert_non_send(GameCore::new(seed));
+        app.init_resource::<AppState>();
+        app.update();
+        app
+    }
+
+    /// The mode-select click order: move the selection, start `id` through
+    /// the shared T5 path (snapshots the selection into the run and bumps
+    /// plays), then pile hard drops until the core tops out.
+    fn start_mutated_and_top_out(app: &mut App, mutators: Mutators, id: ModeId) {
+        app.world_mut().non_send_mut::<GameCore>().selected_mutators = mutators;
+        let world = app.world_mut();
+        let mut state = world.remove_resource::<AppState>().unwrap();
+        let mut countdown = world.remove_resource::<Countdown>().unwrap();
+        let mut records = world.remove_resource::<Records>();
+        {
+            let mut core = world.non_send_mut::<GameCore>();
+            start_mode_run(
+                id,
+                core.as_mut(),
+                &mut countdown,
+                &mut state,
+                records.as_mut(),
+            );
+        }
+        world.insert_resource(state);
+        world.insert_resource(countdown);
+        if let Some(records) = records {
+            world.insert_resource(records);
+        }
+        while app.world().resource::<Countdown>().0 > 0 {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+        for _ in 0..2000 {
+            app.world_mut()
+                .resource_mut::<PendingActions>()
+                .push(Action::HardDrop);
+            app.world_mut().run_schedule(FixedUpdate);
+            if *app.world().resource::<AppState>() == AppState::GameOver {
+                break;
+            }
+        }
+        assert_eq!(
+            *app.world().resource::<AppState>(),
+            AppState::GameOver,
+            "pile-out reached"
+        );
+    }
+
+    #[test]
+    fn mutated_run_skips_best_record_but_still_bumps_plays() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("mutated");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = persist_app(0x23A1);
+        start_mutated_and_top_out(&mut app, Mutators::NO_HOLD, ModeId::Marathon);
+        app.update();
+        app.update();
+
+        {
+            let core = app.world().non_send::<GameCore>();
+            assert_eq!(core.active_mode.mutators, Mutators::NO_HOLD);
+            let snapshot = core.game.snapshot();
+            assert!(snapshot.score > 0, "precondition: the mutated run scored");
+        }
+        let records = app.world().resource::<Records>();
+        assert!(
+            records.record_for(MARATHON).is_none(),
+            "owner decision: mutated runs never write best records"
+        );
+        assert_eq!(
+            records.plays(MARATHON),
+            1,
+            "mutated runs still bump the per-mode play counter"
+        );
+        assert!(
+            !app.world().resource::<TerminalResult>().new_record,
+            "no NEW RECORD marker for a mutated run"
+        );
+
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let disk = records::load_from(dir.path());
+        assert!(
+            disk.record_for(MARATHON).is_none(),
+            "best.json gains no record from a mutated run"
+        );
+        assert_eq!(disk.plays(MARATHON), 1, "the play counter persists");
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    /// Regression: the gate is mutator-conditional — a clean run on the very
+    /// same tree records exactly as before T23.
+    #[test]
+    fn clean_run_still_records_best_score() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("clean");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = persist_app(0x23A2);
+        start_mutated_and_top_out(&mut app, Mutators::empty(), ModeId::Marathon);
+        app.update();
+        app.update();
+
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        let records = app.world().resource::<Records>();
+        assert_eq!(
+            records.record_for(MARATHON),
+            Some(&Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            }),
+            "clean runs keep recording"
+        );
+        assert_eq!(records.plays(MARATHON), 1);
+        assert!(app.world().resource::<TerminalResult>().new_record);
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    /// A **mutated daily run also skips the `Daily` record** (owner
+    /// decision — same central rule as the best-record gate, applied at the
+    /// daily fold's only mutated-reachable call site in
+    /// `terminal_record_system`). Ultra's TopOut row *does* earn a record,
+    /// so any suppression observed is the gate, not an unrecordable finish.
+    #[test]
+    fn mutated_daily_attempt_writes_no_daily_record() {
+        daily::set_today_override(Some(CivilDate::from_ymd(2026, 10, 1)));
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins((CoreBridgePlugin, MenuScreensPlugin));
+        app.insert_non_send(GameCore::new(0x23A4));
+        app.init_resource::<AppState>();
+        app.init_resource::<Records>();
+        app.update();
+        app.world_mut().resource_mut::<VersusFlow>().daily = DailyAttempt::Active {
+            date: CivilDate::from_ymd(2026, 10, 1),
+        };
+        {
+            let mut core = app.world_mut().non_send_mut::<GameCore>();
+            core.active_mode = crate::core_bridge::ActiveMode {
+                id: ModeId::Ultra,
+                config: ModeConfig::default(),
+                mutators: Mutators::ONE_PREVIEW,
+            };
+        }
+        for _ in 0..4000 {
+            app.world_mut()
+                .resource_mut::<PendingActions>()
+                .push(Action::HardDrop);
+            app.world_mut().run_schedule(FixedUpdate);
+            if *app.world().resource::<AppState>() == AppState::GameOver {
+                break;
+            }
+        }
+        assert_eq!(*app.world().resource::<AppState>(), AppState::GameOver);
+        app.update();
+
+        assert_eq!(
+            app.world().non_send::<GameCore>().game.finished_reason(),
+            Some(FinishReason::TopOut),
+            "Ultra tops out — a row the terminal matrix records"
+        );
+        let records = app.world().resource::<Records>();
+        assert!(
+            records.record_for(crate::records::ULTRA).is_none(),
+            "mutated run earns no per-mode BestScore"
+        );
+        assert!(
+            records.record_for(DAILY).is_none(),
+            "a mutated daily run also writes no Daily record (owner decision)"
+        );
+        assert_eq!(
+            app.world().resource::<VersusFlow>().daily,
+            DailyAttempt::Idle,
+            "the attempt marker is still consumed"
+        );
+        daily::set_today_override(None);
     }
 }

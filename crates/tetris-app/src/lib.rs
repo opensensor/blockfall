@@ -18,6 +18,7 @@ mod hud;
 mod input;
 mod juice;
 pub mod modes;
+mod mutators;
 pub mod records;
 mod render;
 mod screens_ladder;

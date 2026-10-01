@@ -24,6 +24,18 @@
 //! (a ModeSelect-internal flow on
 //! [`VersusFlow`](crate::screens_menu::VersusFlow) — the list hides behind
 //! it) instead of starting a solo run.
+//!
+//! ## Mutator toggles (T23)
+//!
+//! Above the row list, four [`MutatorToggleButton`]s (spawned from
+//! [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order,
+//! compact + wrap-friendly for portrait) flip bits of the session-scoped
+//! pending selection on `GameCore::selected_mutators`. A row press snapshots
+//! that selection into the run (`GameCore::start_mode` →
+//! `ActiveMode::mutators`), so the toggles never affect a live run, and
+//! the selection persists across screen navigation within the session
+//! (never across app restarts — not persisted by design). Mutated runs get
+//! no best records (`Records::record_run_mutated`) but still bump plays.
 //! Back (and Escape) walk to [`AppState::Title`] via
 //! [`goto_title`](crate::screens_menu::goto_title); the 1v1 / Online /
 //! Settings / Quit entries stay on the Title screen (reachable by Back), so
@@ -170,6 +182,31 @@ pub struct ModeBackButton;
 #[derive(Component)]
 pub struct DailyRowButton;
 
+/// One mutator toggle on the mode list (T23). A press flips exactly one bit
+/// of [`GameCore::selected_mutators`](crate::core_bridge::GameCore); the
+/// next started run snapshots the selection
+/// (`GameCore::start_mode` → `ActiveMode::mutators`), so toggling never
+/// affects a live run. The buttons are spawned from
+/// [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order;
+/// [`sync_mutator_toggle_labels`] keeps their ON/OFF text on the selection
+/// (which persists across screen navigation within the session, never
+/// across app restarts).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutatorToggleButton {
+    /// The single mutator bit this button toggles.
+    pub bit: crate::mutators::Mutators,
+}
+
+/// Toggle button text: `NO HOLD OFF` / `20G ON`.
+#[must_use]
+pub fn mutator_toggle_text(
+    bit: crate::mutators::Mutators,
+    selected: crate::mutators::Mutators,
+) -> String {
+    let state = if selected.contains(bit) { "ON" } else { "OFF" };
+    format!("{} {state}", bit.label())
+}
+
 /// The overflow-scrolling viewport around the row list
 /// ([`mode_scroll_system`] drives its `ScrollPosition`).
 #[derive(Component)]
@@ -200,6 +237,13 @@ const ROW_REC_PX_PORTRAIT: f32 = 16.0;
 
 /// Pixels one mouse-wheel notch scrolls.
 const WHEEL_STEP: f32 = 90.0;
+
+/// Mutator toggle metrics (T23): compact but thumb-friendly; portrait gets
+/// the taller label targets.
+const MUT_TOGGLE_H: f32 = 44.0;
+const MUT_TOGGLE_H_PORTRAIT: f32 = 52.0;
+const MUT_TOGGLE_PX: f32 = 14.0;
+const MUT_TOGGLE_PX_PORTRAIT: f32 = 16.0;
 
 /// Spawn one row per mode in `ids` under `parent` (landscape metrics — the
 /// public entry the tests drive; `build_mode_select_ui` uses the sized
@@ -258,7 +302,12 @@ fn spawn_mode_rows_sized(
     }
 }
 
-fn build_mode_select_ui(mut commands: Commands, windows: Query<&Window>, records: Res<Records>) {
+fn build_mode_select_ui(
+    mut commands: Commands,
+    windows: Query<&Window>,
+    records: Res<Records>,
+    core: Option<NonSend<'_, GameCore>>,
+) {
     let portrait = windows
         .iter()
         .next()
@@ -273,6 +322,9 @@ fn build_mode_select_ui(mut commands: Commands, windows: Query<&Window>, records
     } else {
         (ROW_H, ROW_NAME_PX, ROW_DESC_PX, ROW_REC_PX)
     };
+    // T23: seed the toggle labels from the session's pending mutator
+    // selection; [`sync_mutator_toggle_labels`] keeps them current after.
+    let selected_mutators = core.map(|core| core.selected_mutators).unwrap_or_default();
 
     commands
         .spawn((
@@ -316,6 +368,49 @@ fn build_mode_select_ui(mut commands: Commands, windows: Query<&Window>, records
                 TextFont::from_font_size(18.0),
                 TextColor(RECORD_COLOR),
             ));
+            // Mutator toggles (T23): the session's selection on GameCore
+            // (never persisted), snapshotted into the run by the shared
+            // start path. Fixed order from `Mutators::SELECTABLE`, wrapping
+            // on portrait widths; INVISIBLE stays reserved for T24.
+            root.spawn((
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(8.0),
+                    row_gap: Val::Px(6.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
+            .with_children(|row| {
+                for bit in crate::mutators::Mutators::SELECTABLE {
+                    row.spawn((
+                        Button,
+                        MutatorToggleButton { bit },
+                        BackgroundColor(BUTTON_BG),
+                        Node {
+                            min_height: Val::Px(if portrait {
+                                MUT_TOGGLE_H_PORTRAIT
+                            } else {
+                                MUT_TOGGLE_H
+                            }),
+                            padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        Text::new(mutator_toggle_text(bit, selected_mutators)),
+                        TextFont::from_font_size(if portrait {
+                            MUT_TOGGLE_PX_PORTRAIT
+                        } else {
+                            MUT_TOGGLE_PX
+                        }),
+                    ));
+                }
+            });
             // Native scroll viewport: clips its overflow and takes
             // `ScrollPosition` input; rows outside the clip never catch a
             // tap (bevy_ui `ui_focus_system` honors overflow clipping).
@@ -428,7 +523,29 @@ fn sync_daily_banner(
     }
 }
 
-/// Row / Back clicks while the list is open.
+/// Keep the four mutator toggle labels (T23) on the pending selection while
+/// the list is open (also after a revisit, since the selection persists
+/// across navigation within the session). Writes only on an actual text
+/// change; runs after [`mode_select_clicks`] in the chain, so a press
+/// updates its own label the same frame.
+fn sync_mutator_toggle_labels(
+    state: Res<AppState>,
+    core: Option<NonSend<GameCore>>,
+    mut toggles: Query<(&MutatorToggleButton, &mut Text)>,
+) {
+    if *state != AppState::ModeSelect {
+        return;
+    }
+    let selected = core.map(|core| core.selected_mutators).unwrap_or_default();
+    for (toggle, mut text) in &mut toggles {
+        let want = mutator_toggle_text(toggle.bit, selected);
+        if text.0 != want {
+            *text = Text::new(want);
+        }
+    }
+}
+
+/// Row / Back / mutator-toggle clicks while the list is open.
 type ModeSelectClickQuery<'w, 's> = Query<
     'w,
     's,
@@ -438,6 +555,7 @@ type ModeSelectClickQuery<'w, 's> = Query<
         Option<&'static ModeRowButton>,
         Has<ModeBackButton>,
         Has<DailyRowButton>,
+        Option<&'static MutatorToggleButton>,
     ),
     (With<Button>, Changed<Interaction>),
 >;
@@ -458,9 +576,16 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
     if *params.state != AppState::ModeSelect {
         return;
     }
-    for (_entity, interaction, row, back, daily_row) in params.buttons.iter() {
+    for (_entity, interaction, row, back, daily_row, toggle) in params.buttons.iter() {
         if *interaction != Interaction::Pressed {
             continue;
+        }
+        if let Some(toggle) = toggle {
+            // T23: flip this bit of the pending selection; the label sync
+            // system rewrites the text in the same frame (later in the
+            // chain). Never starts a run, never leaves the screen.
+            params.core.selected_mutators.toggle(toggle.bit);
+            return;
         }
         if let Some(row) = row {
             // Bot Ladder (T16) is not a solo bridge run: its row opens the
@@ -652,6 +777,7 @@ impl Plugin for ModeSelectPlugin {
             (
                 mode_select_key_system,
                 mode_select_clicks,
+                sync_mutator_toggle_labels,
                 mode_scroll_system,
                 sync_mode_select_visibility,
                 sync_mode_record_labels,
@@ -1376,6 +1502,143 @@ mod tests {
             app.world().resource::<VersusFlow>().daily,
             DailyAttempt::Idle,
             "normal rows never inherit or keep the daily marker"
+        );
+    }
+
+    // ---- T23: mutator toggles ----
+
+    use crate::mutators::Mutators;
+
+    fn toggle_bits(app: &mut App) -> Vec<Mutators> {
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&MutatorToggleButton, With<Button>>();
+        q.iter(world).map(|t| t.bit).collect()
+    }
+
+    fn selected_mutators(app: &App) -> Mutators {
+        app.world().non_send::<GameCore>().selected_mutators
+    }
+
+    fn click_mutator(app: &mut App, bit: Mutators) {
+        click_button_under(
+            app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<MutatorToggleButton>(e)
+                    .is_some_and(|t| t.bit == bit)
+            },
+        );
+    }
+
+    fn mutator_text(app: &mut App, bit: Mutators) -> String {
+        text_of(app, |world, e| {
+            world
+                .get::<MutatorToggleButton>(e)
+                .is_some_and(|t| t.bit == bit)
+        })
+    }
+
+    #[test]
+    fn mutator_toggles_render_in_fixed_order_off_by_default() {
+        let mut app = mode_select_test_app();
+        set_state(&mut app, AppState::ModeSelect);
+        assert_eq!(
+            toggle_bits(&mut app),
+            Mutators::SELECTABLE.to_vec(),
+            "four toggles, fixed left-to-right order (INVISIBLE stays T24)"
+        );
+        for bit in Mutators::SELECTABLE {
+            assert_eq!(
+                mutator_text(&mut app, bit),
+                mutator_toggle_text(bit, Mutators::empty()),
+                "{bit:?} starts OFF"
+            );
+        }
+        assert!(!toggle_bits(&mut app).contains(&Mutators::INVISIBLE));
+        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD OFF");
+    }
+
+    #[test]
+    fn clicking_a_toggle_flips_only_that_bit_and_stays_on_the_screen() {
+        let mut app = mode_select_test_app();
+        set_state(&mut app, AppState::ModeSelect);
+
+        click_mutator(&mut app, Mutators::NO_HOLD);
+        assert_eq!(app_state(&app), AppState::ModeSelect, "no run started");
+        assert_eq!(selected_mutators(&app), Mutators::NO_HOLD);
+        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD ON");
+        assert_eq!(mutator_text(&mut app, Mutators::TWENTY_G), "20G OFF");
+
+        click_mutator(&mut app, Mutators::TWENTY_G);
+        assert_eq!(
+            selected_mutators(&app),
+            Mutators::NO_HOLD | Mutators::TWENTY_G
+        );
+        assert_eq!(mutator_text(&mut app, Mutators::TWENTY_G), "20G ON");
+
+        click_mutator(&mut app, Mutators::NO_HOLD);
+        assert_eq!(selected_mutators(&app), Mutators::TWENTY_G);
+        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD OFF");
+    }
+
+    #[test]
+    fn mutator_selection_persists_across_navigation_within_the_session() {
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+        click_mutator(&mut app, Mutators::NO_GHOST);
+
+        // Leave via a row press (Playing), then revisit the list (Back →
+        // Title → Start ≈ a direct state flip here).
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<ModeRowButton>(e)
+                    .is_some_and(|row| row.id == ModeId::Marathon)
+            },
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.mutators,
+            Mutators::NO_GHOST,
+            "the started run snapshotted the selection"
+        );
+
+        set_state(&mut app, AppState::ModeSelect);
+        assert_eq!(
+            selected_mutators(&app),
+            Mutators::NO_GHOST,
+            "selection persists"
+        );
+        assert_eq!(mutator_text(&mut app, Mutators::NO_GHOST), "NO GHOST ON");
+    }
+
+    #[test]
+    fn row_press_snapshots_selection_into_the_run() {
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+        click_mutator(&mut app, Mutators::TWENTY_G);
+
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<ModeRowButton>(e)
+                    .is_some_and(|row| row.id == ModeId::Sprint)
+            },
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(core.active_mode.id, ModeId::Sprint);
+        assert_eq!(core.active_mode.mutators, Mutators::TWENTY_G);
+        assert_eq!(
+            core.active_mode.config.start_level, 20,
+            "20G rides into the mode config through the shared start path"
         );
     }
 }
