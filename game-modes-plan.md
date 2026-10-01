@@ -92,9 +92,32 @@ T1 ──► T2 ──┬──────────────────�
   is the R1 release gate's "Marathon unchanged" criterion.
 - **validation**: `cargo test -p tetris-core marathon` passes on current code;
   stays green through T2–T11.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — 3 seeds (31337, 20261001, 42) driven to top-out by a
+  deterministic scripted driver using only the public `Game` API: per-piece
+  cycle = optional Hold (every 4th) + rotation + column moves + optional
+  SoftDrop (every 3rd) + HardDrop + 2 gravity ticks; placements chosen by a
+  greedy solver mirroring `core_bridge`'s bot weights, so all 8 `Action`
+  variants are exercised per seed and each log is reproducible from the seed
+  alone. Pins per seed: scalar snapshot fields (score/level/lines/combo/b2b/
+  game_over/hold/hold_used/next), FNV-1a-64 digest over the 10×22 board,
+  exact bincode byte length (fixint + reject-trailing codec, mirrored from
+  `protocol.rs`) and FNV-1a-64 over those bytes (same loop as
+  `snapshot_hash`). Rich goldens: seeds clear 49/164/485 lines, reach levels
+  5/17/49, seed 42 ends b2b-armed. `bincode` added as tetris-core dev-dep
+  (workspace-inherited); no production code touched. Green: workspace tests,
+  clippy `-D warnings`, fmt. Canary proven: flipping seed 42's fnv1a64 by 1
+  fails with the Golden diff, restored value passes.
+  Gotchas: (a) a purely blind scripted rush tops out but never completes a
+  row (~0/100k seeds clear a line) — the greedy placement phase is what makes
+  line clears/combo/level/b2b values non-trivial, keep it if regenerating;
+  (b) goldens assume the driver's deterministic phase cadence
+  (`cycles % 4` hold, `% 3` soft-drop, `% 5` rotation round trip) and the
+  solver's tie-break — regenerate all three seeds together if the driver
+  ever changes; (c) T2's `Game::new` delegation must reproduce these exact
+  values — that diff is the gate signal.
+- **files edited/created**: `crates/tetris-core/tests/marathon_regression.rs`
+  (new), `crates/tetris-core/Cargo.toml` (+`bincode` dev-dep), `Cargo.lock`
 
 ### T2: Core mode config, tick clock, goal/time-up events
 - **depends_on**: [T1]
