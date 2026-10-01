@@ -289,9 +289,56 @@ T1 ──► T2 ──┬──────────────────�
   pattern already in `settings_persist`): legacy file migrates to Marathon;
   corrupt file ⇒ defaults; time/score/rung/daily record updates; play counters
   increment. Existing `app_boots_and_game_over_persists_best_score` adapted.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — new `records.rs`: `Records` resource (per-mode
+  `Record` + per-mode play counts, `BTreeMap` keyed by `ModeKey = &'static str`
+  with constants `MARATHON, SPRINT, ULTRA, DIG, SURVIVAL, ZEN, BOT_LADDER,
+  DAILY, DIG_DUEL, SWITCH` + `ALL_MODE_KEYS`), internally-tagged
+  `#[serde(tag = "kind", rename_all = "snake_case")]`
+  `Record { BestTime{ticks}, BestScore{score,level,lines}, LifetimeLines{total},
+  HighestRung{rung}, Daily{date,result} }`, API
+  `record_for(key) -> Option<&Record>`, `record_run(key, record) -> bool`
+  (time: lower wins; score/lifetime/rung: higher wins; daily: latest differing
+  content; cross-variant replaces), `bump_plays(key) -> u64`,
+  `plays(key) -> u64`, `add_lifetime_lines(n) -> u64` (saturating, Zen).
+  `best.json` wrapper `{"version":1,"records":{...},"plays":{...}}`; unknown
+  record kinds/fields skipped per-entry (forward compat); load = raw-JSON
+  dispatch: top-level `score` ⇒ legacy migrate to Marathon `BestScore`,
+  else versioned shape; corrupt ⇒ defaults + `warn!`, never panics. A pure
+  load never writes (downgrade safety). Persistence reuses
+  `settings_persist::{write_atomic, SAVE_DEBOUNCE_SECS, CONFIG_DIR_ENV}` +
+  `RecordsSaveQueue` (debounce/force, force-flush on improved Marathon
+  game-over, flush on `AppExit`); `RecordsPlugin` (init resources, Startup
+  load, Update flush, Last exit flush) mounted from `SettingsPersistPlugin`.
+  **Single-writer fix done:** `save_to`/`save_once`/`flush_system`/
+  `exit_flush_system` write settings.json only (`save_to`'s `best` param kept,
+  ignored); `best_score_system` now calls `Records::record_run(MARATHON, …)`
+  from the `GameCore` snapshot on `CoreEvent(GameOver)` and forces a records
+  flush only when improved; new `best_score_view_system` refreshes
+  `PersistedBestScore` from the Marathon entry (view only, assign-on-difference);
+  `screens_menu.rs` untouched (API compatible). `records::save_to` is the
+  only `best.json` writer. Tests: legacy-migration/never-rewritten-on-load,
+  corrupt/missing ⇒ defaults, unknown-kind tolerance, per-variant improvement
+  rules, saturating lifetime lines, play counters, read-only-boot writes
+  nothing, exit flush, view tracks record and never regresses, settings exit
+  flush never creates best.json. GREEN: `cargo test -p tetris-app` 364 pass,
+  workspace green, clippy `-D warnings` clean, fmt clean. Validation done in
+  a clean `git worktree` at HEAD because another agent's WIP core edits
+  (`GoalReached`/`TimeUp`) broke the shared tree's `audio.rs` mid-task —
+  verify against the merged tree too.
+  Gotchas for T7/T9/T14/T16/T17: (a) T9 gates `record_run` per mode × terminal
+  reason and should also `bump_plays` — T6 deliberately does NOT bump plays on
+  game-over (would double-count); (b) only Marathon auto-records via the interim
+  `best_score_system` — remove it in T9 when the result screen calls
+  `record_run` directly, and gate it so non-Marathon game-overs don't write
+  the Marathon record; (c) `add_lifetime_lines` keys off `ZEN`; (d) env-mutating
+  tests must hold `settings_persist::ENV_LOCK` (historical flake); (e) legacy
+  files are rewritten to the new shape only on first real save, and legacy
+  `{score,level,lines}` is detected by the top-level `score` key — the new
+  wrapper must never put `score` at top level.
+- **files edited/created**: `crates/tetris-app/src/records.rs` (new),
+  `crates/tetris-app/src/settings_persist.rs`, `crates/tetris-app/src/lib.rs`
+  (`mod records;`) — `screens_menu.rs` NOT touched (view kept API-compatible)
 
 ### T7: Mode select screen (portrait-first)
 - **depends_on**: [T5, T6]
