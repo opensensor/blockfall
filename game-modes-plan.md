@@ -919,9 +919,55 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Core test: force a block-out with `WipeAndContinue`, assert
   play continues, no `GameOver`, board empty, same-seed replay identical. App
   test: lifetime lines persist across a simulated restart of the config dir.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `9bd01ea`. Core (`game.rs::spawn`): on a spawn collision under
+  `WipeAndContinue`, the whole stack is wiped (owner decision), `feed.pending`
+  is reset defensively, and the colliding piece re-spawns at its spawn state
+  (always fits an empty board). `GameEvent::StackWiped { tick }` (appended,
+  index 12; events never cross the wire) is emitted immediately before the
+  re-spawn's `PieceSpawned`; never alongside `GameOver`. `game_over` stays
+  `false` / `finished_reason()` stays `None`. Counters kept as-is — score,
+  lines, level **and combo/b2b** (the wipe is not a lock: never scores, never
+  emits `LineCleared`/`PerfectClear`, never resets chains). End behavior
+  100% unchanged (canary + explicit parity test). `install_board`/versus
+  top-out paths untouched (unreachable for Zen: solo-only, no feed). Hold
+  swaps block out through the same spawn path.
+  App: `is_shipped(Zen)` flipped (description polished; `screens_modes`
+  data-driven rows picked the mode up automatically); HUD gains
+  `HudTextSlot::Lifetime` (`LIFETIME <n>` from `Records::LifetimeLines`
+  via `record_for(ZEN)`, Zen-only, pooled slot reusing the feed meter's
+  row — they never coexist; no new resources) while session lines ride the
+  existing `LINES` stat; `zen_lifetime_lines_system` (hud.rs, Update,
+  drains `CoreEvent` in every mode) folds each Zen `LineCleared` into
+  `Records::add_lifetime_lines` — debounced save, no per-line disk writes;
+  exit via pause → "Quit to title" verified end-to-end (600-piece pile never
+  leaves `Playing`; Zen has no terminal-matrix row by design). Lifetime
+  survives app exit: exit-flush test writes `AppExit` → `Records::load` of
+  the isolated `TETRIS_CONFIG_DIR` shows the total.
+  TDD: RED = continuation test failed with `[PieceLocked, ScoreChanged,
+  GameOver]` (WipeAndContinue acted like End) → GREEN. New core tests (7):
+  wipe+continuation incl. event-order (StackWiped→PieceSpawned) and all-
+  pieces-arm lemma, counter/chain preservation (hold-path wipe), 3-wipe
+  survival, tick_count through wipes, same-seed replay equality across
+  wipes, End parity, defensive pending-feed reset. App tests (5): lifetime
+  == snapshot.lines (seed 7, 4 clears), marathon clears never touch the Zen
+  counter, LIFETIME 0 before first record, exit-flush persistence, zen
+  pause-quit + never-ends. Validation: `cargo test -p tetris-core` (177+6+3+5
+  incl. T1 golden), `-p tetris-app` (431+7), `cargo test --workspace` 15
+  suites green, `cargo clippy --workspace --all-targets -- -D warnings`
+  clean, `cargo fmt --all --check` clean.
+  Files beyond the task location list (all forced/minimal):
+  `tetris-core/src/event.rs` (the `GameEvent` enum itself — where
+  `StackWiped` had to be appended); `tetris-app/src/audio.rs` (silent
+  `StackWiped` arm in the exhaustive `sfx_for_event`, same class as T2's
+  terminal arms, pre-approved); `tetris-app/src/screens_modes.rs` (one
+  test's "hypothetically unshipped" row switched Zen→BotLadder since Zen
+  now renders in the real list).
+- **files edited/created**: `crates/tetris-core/src/game.rs`,
+  `crates/tetris-core/src/event.rs`, `crates/tetris-core/src/mode.rs`,
+  `crates/tetris-app/src/modes.rs`, `crates/tetris-app/src/hud.rs`,
+  `crates/tetris-app/src/screens_menu.rs`, `crates/tetris-app/src/audio.rs`,
+  `crates/tetris-app/src/screens_modes.rs` (test-only)
 
 ### T15: Bot speed as a per-match parameter
 - **depends_on**: [T11]
