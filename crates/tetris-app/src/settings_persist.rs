@@ -41,9 +41,6 @@ use bevy::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use tetris_core::event::GameEvent;
-
-use crate::core_bridge::{CoreEvent, GameCore};
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::state::Settings;
 
@@ -516,52 +513,15 @@ fn change_detection_system(
     queue.timer.reset();
 }
 
-/// Interim Marathon recorder (T6, until T9 makes the game-over screen the
-/// caller of [`crate::records::Records::record_run`]): on
-/// `CoreEvent(GameEvent::GameOver)` fold the finished run's snapshot into the
-/// Marathon [`crate::records::Record::BestScore`] and force a records flush
-/// **only when the record improved**. Exclusive (direct `&mut World`) because
-/// `GameCore` is a non-send resource; no-ops in apps without the core bridge.
-/// Writes through [`crate::records`] — the sole `best.json` writer; never
-/// touches [`PersistedBestScore`] or the settings [`SaveQueue`].
-fn best_score_system(world: &mut World) {
-    let game_over = world
-        .get_resource::<Messages<CoreEvent>>()
-        .is_some_and(|messages| {
-            let mut cursor = messages.get_cursor();
-            cursor
-                .read(messages)
-                .any(|event| event.0 == GameEvent::GameOver)
-        });
-    if !game_over {
-        return;
-    }
-    let Some(core) = world.get_non_send::<GameCore>() else {
-        return;
-    };
-    let snapshot = core.game.snapshot();
-    let improved = match world.get_resource_mut::<crate::records::Records>() {
-        Some(mut records) => records.record_run(
-            crate::records::MARATHON,
-            crate::records::Record::BestScore {
-                score: snapshot.score,
-                level: snapshot.level,
-                lines: snapshot.lines,
-            },
-        ),
-        None => return,
-    };
-    if improved {
-        if let Some(mut queue) = world.get_resource_mut::<crate::records::RecordsSaveQueue>() {
-            queue.pending = true;
-            queue.force = true;
-        }
-    }
-}
-
 /// Refresh the [`PersistedBestScore`] display view from the Marathon entry
 /// (T6): a pure view, no disk access, and only assigned on difference so the
 /// resource never self-dirties every frame.
+///
+/// T9 retired the interim T6 recorder (`best_score_system`) that folded
+/// every `GameEvent::GameOver` into the Marathon `BestScore` — with modes
+/// live it recorded Sprint/Dig top-outs as Marathon bests. The game-over
+/// screen's [`crate::screens_menu::terminal_record_system`] is now the only
+/// per-mode caller of [`crate::records::Records::record_run`].
 fn best_score_view_system(
     records: Res<crate::records::Records>,
     mut best: ResMut<PersistedBestScore>,
@@ -651,7 +611,6 @@ impl Plugin for SettingsPersistPlugin {
             .add_systems(
                 Update,
                 (
-                    best_score_system,
                     best_score_view_system,
                     change_detection_system,
                     flush_system,
@@ -677,7 +636,7 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::*;
 
-    use crate::core_bridge::CoreBridgePlugin;
+    use crate::core_bridge::{CoreBridgePlugin, GameCore};
     use crate::input::ALL_BIND_SLOTS;
     use crate::state::{AppState, EffectsQuality};
 
@@ -912,15 +871,17 @@ mod tests {
         std::env::remove_var(CONFIG_DIR_ENV);
     }
 
-    /// Full integration path (T6): boot the persistence + records plugins
-    /// (plus the real core bridge) against a temp dir, play to game over
-    /// through the fixed schedule and assert the Marathon record — not a raw
-    /// best — reaches disk via the sole writer, and the title-screen view
-    /// refreshes from it.
+    /// T9 retirement of the interim recorder (T6 bridge): the settings +
+    /// records persistence tree alone must NOT record anything on game over
+    /// — the sole per-mode recorder is the game-over screen's
+    /// `crate::screens_menu::terminal_record_system` (its end-to-end disk
+    /// coverage lives there). The startup-load discipline and the
+    /// view-refresh path (`best_score_view_tracks_marathon_record`) stay
+    /// owned here.
     #[test]
-    fn app_boots_and_game_over_persists_best_score() {
+    fn game_over_writes_no_record_from_settings_tree() {
         let _env = ENV_LOCK.lock().unwrap();
-        let dir = TempDir::new("integration");
+        let dir = TempDir::new("retired");
         std::env::set_var(CONFIG_DIR_ENV, dir.path());
 
         let mut app = App::new();
@@ -950,36 +911,22 @@ mod tests {
             }
         }
         assert_eq!(*app.world().resource::<AppState>(), AppState::GameOver);
-
         let expected = app.world().non_send::<GameCore>().game.snapshot();
         assert!(expected.score > 0, "precondition: the run scored");
 
-        // Several Update frames: record + refresh the view, then flush.
-        for _ in 0..3 {
+        // Several Update frames: the retired recorder must not come back.
+        for _ in 0..5 {
             app.update();
         }
-
-        // The Marathon record is the sole thing written to best.json (new shape).
-        let marathon = crate::records::load_from(dir.path());
-        assert_eq!(
-            marathon.record_for(crate::records::MARATHON),
-            Some(&crate::records::Record::BestScore {
-                score: expected.score,
-                level: expected.level,
-                lines: expected.lines,
-            })
+        assert!(
+            app.world()
+                .resource::<crate::records::Records>()
+                .record_for(crate::records::MARATHON)
+                .is_none(),
+            "T9 retired the interim GameOver → Marathon auto-recorder"
         );
-        // ... and the title-screen view (via `load_from` too) reflects it.
-        let (settings, bindings, best_view) = load_from(dir.path());
-        assert_eq!(best_view.score, expected.score);
-        assert_eq!(
-            app.world().resource::<PersistedBestScore>().score,
-            expected.score
-        );
-        // Game over no longer forces a settings write: settings.json absent.
+        assert!(!dir.path().join(BEST_FILE).exists());
         assert!(!dir.path().join(SETTINGS_FILE).exists());
-        assert_eq!(settings, Settings::default());
-        assert_eq!(bindings, KeyBindings::default());
 
         std::env::remove_var(CONFIG_DIR_ENV);
     }

@@ -23,7 +23,7 @@
 //! The user pause owns [`SimPaused`] while it is held: the toggle sets
 //! `SimPaused(true)` on Playing → Paused and clears it on resume. Following
 //! juice's ownership contract (`JuiceFreeze` only ever releases the flag it
-//! set itself), `resume_game` / `goto_title` / `start_new_run` *never write
+//! set itself), `resume_game` / `goto_title` / `retry_run` *never write
 //! the flag while juice owns it* — juice's freeze gate releases it after its
 //! owned frames elapse. The core bridge already double-gates stepping on
 //! `AppState != Playing`, so a juice release landing mid user-pause can
@@ -34,12 +34,18 @@
 //! - The pause **chord** is `KeyBindings::slot(BindSlot::Pause)` (default
 //!   Esc/P), read directly here — it is never a core `Action` (T12's module
 //!   docs), and is suppressed while [`RebindingCapture`] is active.
-//! - Restart always goes through
-//!   [`restart_run`](crate::core_bridge::restart_run); the R key is bound by
-//!   the core bridge (T14) and is *not* re-bound here.
-//! - The best score is recorded solely by T15's `best_score_system` on the
-//!   `GameEvent::GameOver` core event; this screen only *reads*
-//!   [`PersistedBestScore`] for display and never writes it.
+//! - Retry (Pause → Restart and Game Over → Play again) goes through
+//!   [`retry_run`] → [`start_mode_run`], i.e. the same mode-aware path the
+//!   R key took since T5 (fresh seed unless `TETRIS_SEED`, mode pre-roll
+//!   re-armed, play counter bumped); the R key itself stays in the core
+//!   bridge (T14) and is *not* re-bound here.
+//! - Terminal records are written once per entry into `AppState::GameOver`
+//!   by [`terminal_record_system`], gated by the PRD mode × terminal-reason
+//!   matrix in [`terminal_record`] (Sprint/Dig top-out records *nothing*;
+//!   Ultra's score stands either way). T9 retired T15's interim
+//!   `settings_persist` auto-recorder, which folded EVERY `GameOver` into
+//!   the Marathon best and would pollute records from Sprint/Dig top-outs.
+//!   The result screen reads [`TerminalResult`] plus [`Records`] for display.
 //! - Opening [`AppState::Settings`] is just a state write — T16's
 //!   `track_settings_entry` records the origin (Pause → back → Pause) and
 //!   `handle_back` returns here, closing T16's deferred round-trip check.
@@ -72,15 +78,19 @@ use crate::core_bridge::net::online_ui::{
 };
 use crate::core_bridge::net::{NetRole, NetSession, NetStatus};
 use crate::core_bridge::{
-    end_versus, restart_run, start_versus, Controller, GameCore, SimPaused, VersusMatch,
-    VersusWinner,
+    end_versus, start_mode_run, start_versus, Controller, Countdown, GameCore, SimPaused,
+    VersusMatch, VersusWinner,
 };
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
-use crate::screens_modes::open_mode_select;
+use crate::modes::{format_time_ticks, mode_key, ModeId};
+use crate::records::{Record, Records};
+use crate::screens_modes::{open_mode_select, record_line};
 use crate::settings_persist::PersistedBestScore;
 use crate::state::{AppState, CaptureOrder, RebindingCapture};
+use tetris_core::game::GameSnapshot;
+use tetris_core::mode::FinishReason;
 
 /// App version shown on the title screen (PRD §7 "extras").
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -156,18 +166,23 @@ pub fn toggle_pause(state: &mut AppState, sim: &mut SimPaused, freeze: &JuiceFre
     }
 }
 
-/// Fresh run via the shared T14 restart path (honors `TETRIS_SEED`); used by
-/// Pause → Restart and Game Over → Play again. Title → Start no longer runs
-/// through here — since T7 it opens [`AppState::ModeSelect`] and the picked
-/// mode starts via `start_mode_run` in [`crate::screens_modes`].
-pub fn start_new_run(
+/// Fresh run of the **active mode** via the shared T5
+/// [`start_mode_run`] path: honors `TETRIS_SEED`, re-arms the mode's
+/// pre-roll and bumps its play counter — the exact contract of the R retry
+/// since T5. Used by Pause → Restart and Game Over → Play again (T9: both
+/// resume the *selected* mode, never a silent Marathon fallback). Title →
+/// Start opens [`AppState::ModeSelect`](crate::screens_modes) instead.
+pub fn retry_run(
     core: &mut GameCore,
+    countdown: &mut Countdown,
     state: &mut AppState,
     sim: &mut SimPaused,
     freeze: &JuiceFreeze,
-) {
+    records: Option<&mut Records>,
+) -> u64 {
     release_sim(sim, freeze);
-    restart_run(core, state);
+    let id = core.active_mode.id;
+    start_mode_run(id, core, countdown, state, records)
 }
 
 /// Abandon the run back to the title (PRD §7.3 "quit to title"); un-freezes
@@ -185,10 +200,52 @@ pub fn open_settings(state: &mut AppState) {
     *state = AppState::Settings;
 }
 
-/// PRD §7.4 highlight: the run tied the best score, which must be a real
-/// record (`best > 0` keeps the 0 == 0 first-run case quiet).
-pub fn is_new_record(final_score: u64, best: &PersistedBestScore) -> bool {
-    final_score == best.score && best.score > 0
+/// PRD §"records" terminal matrix (T9): what a finished run is worth, keyed
+/// by `(mode, terminal reason)`. Anything the table omits records **nothing**
+/// — that is the whole Sprint/Dig top-out rule ("a top-out gives no
+/// result"), and unshipped modes (Zen, Bot Ladder, …) simply have no row
+/// yet. **T13 extends this table with exactly one row**:
+/// `(ModeId::Survival, FinishReason::TopOut) => Some(Record::BestTime { ticks })`
+/// ("the result is time survived").
+#[must_use]
+pub fn terminal_record(
+    id: ModeId,
+    reason: FinishReason,
+    snapshot: &GameSnapshot,
+    ticks: u64,
+) -> Option<Record> {
+    match (id, reason) {
+        // Marathon: the top-out score/level/lines is the record (today's
+        // behavior, preserved).
+        (ModeId::Marathon, FinishReason::TopOut)
+        // Ultra: "The score stands either way" (PRD) — TimeUp *and* TopOut.
+        | (ModeId::Ultra, FinishReason::TimeUp | FinishReason::TopOut) => Some(Record::BestScore {
+            score: snapshot.score,
+            level: snapshot.level,
+            lines: snapshot.lines,
+        }),
+        // Sprint/Dig: a time exists only when the goal was reached.
+        (ModeId::Sprint | ModeId::Dig, FinishReason::GoalReached) => Some(Record::BestTime { ticks }),
+        _ => None,
+    }
+}
+
+/// Headline row of the mode-aware game-over screen (T9). Empty string = no
+/// headline (Marathon keeps exactly today's layout, and unfinished /
+/// foreign GameOver flips stay silent).
+#[must_use]
+pub fn result_text(id: ModeId, reason: Option<FinishReason>, ticks: u64) -> String {
+    match (id, reason) {
+        (ModeId::Sprint | ModeId::Dig, Some(FinishReason::GoalReached)) => {
+            format!("Time {}", format_time_ticks(ticks))
+        }
+        (ModeId::Sprint | ModeId::Dig, Some(FinishReason::TopOut)) => "No result".to_string(),
+        (ModeId::Ultra, Some(FinishReason::TimeUp)) => "Time up".to_string(),
+        (ModeId::Ultra, Some(FinishReason::TopOut)) => "Top out".to_string(),
+        // T13 (Survival) extends: `(ModeId::Survival, Some(TopOut))` shows
+        // the survived time exactly like the Sprint/Dig goal row.
+        _ => String::new(),
+    }
 }
 
 /// Final stats line (PRD §7.4: score, level and lines).
@@ -199,6 +256,35 @@ pub fn stats_text(score: u64, level: u32, lines: u32) -> String {
 /// Persisted best line (PRD §7.4 "best").
 pub fn best_text(best: &PersistedBestScore) -> String {
     format!("Best {}", best.score)
+}
+
+/// What the finished run meant, latched once per entry into
+/// [`AppState::GameOver`] by [`terminal_record_system`] and consumed by the
+/// result screen (T9). `reason` is `None` until a real terminal has been
+/// observed (core missing or a foreign GameOver flip), which keeps the
+/// legacy Marathon layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
+pub struct TerminalResult {
+    /// The [`ModeId`] of the run that ended.
+    pub mode: ModeId,
+    /// Why the game finished (`Game::finished_reason()` at terminal).
+    pub reason: Option<FinishReason>,
+    /// `Game::tick_count()` at terminal — the finish time for `GoalReached`.
+    pub ticks: u64,
+    /// `true` when the terminal fold improved the mode's stored record
+    /// (`Records::record_run` returned `true`) — drives the NEW RECORD marker.
+    pub new_record: bool,
+}
+
+impl Default for TerminalResult {
+    fn default() -> Self {
+        Self {
+            mode: ModeId::Marathon,
+            reason: None,
+            ticks: 0,
+            new_record: false,
+        }
+    }
 }
 
 /// Which step of the Title → 1v1 submenu flow is showing (T26). Versus has
@@ -311,7 +397,7 @@ pub struct GameOverRoot;
 #[derive(Component)]
 pub struct StartButton;
 
-/// Game-over "Play again" button ([`start_new_run`]).
+/// Game-over "Play again" button ([`retry_run`] — same mode, fresh seed).
 #[derive(Component)]
 pub struct PlayAgainButton;
 
@@ -320,7 +406,7 @@ pub struct PlayAgainButton;
 pub struct ResumeButton;
 
 /// Restart button on both the pause overlay and game-over screen
-/// ([`start_new_run`]).
+/// ([`retry_run`] — restarts the *selected* mode, T9).
 #[derive(Component)]
 pub struct RestartButton;
 
@@ -328,7 +414,9 @@ pub struct RestartButton;
 #[derive(Component)]
 pub struct OpenSettingsButton;
 
-/// "Menu" button (PRD §7.3 quit-to-title, PRD §7.4 title) → [`goto_title`].
+/// "Menu" button: on the pause overlay [`goto_title`] (PRD §7.3), on the
+/// game-over screen [`open_mode_select`] (T9 — straight back to the mode
+/// list).
 #[derive(Component)]
 pub struct QuitToTitleButton;
 
@@ -340,13 +428,20 @@ pub struct QuitButton;
 #[derive(Component)]
 pub struct StatsText;
 
-/// Best-score label on the title and game-over screens ([`best_text`]).
+/// Best-score label on the title and game-over screens: the Marathon
+/// [`best_text`] on the title, and the *per-mode* record line
+/// ([`record_line`]) on the game-over screen (T9).
 #[derive(Component)]
 pub struct BestText;
 
-/// "NEW RECORD!" label ([`is_new_record`]).
+/// "NEW RECORD!" label (latched [`TerminalResult::new_record`], T9).
 #[derive(Component)]
 pub struct RecordText;
+
+/// Mode-aware headline row of the game-over screen ([`result_text`], T9);
+/// display-hidden whenever the mode reports no headline.
+#[derive(Component)]
+pub struct ResultText;
 
 /// Latched `true` when a quit button requested [`AppExit::Success`]. The
 /// exit message itself is consumed by the App during `update()`, so headless
@@ -578,6 +673,7 @@ type MenuClickQuery<'w, 's> = Query<
 struct MenuClickParams<'w, 's> {
     buttons: MenuClickQuery<'w, 's>,
     core: NonSendMut<'w, GameCore>,
+    countdown: ResMut<'w, Countdown>,
     state: ResMut<'w, AppState>,
     sim: ResMut<'w, SimPaused>,
     freeze: Res<'w, JuiceFreeze>,
@@ -585,6 +681,7 @@ struct MenuClickParams<'w, 's> {
     flow: Res<'w, VersusFlow>,
     versus: Option<NonSendMut<'w, VersusMatch>>,
     winner: Option<ResMut<'w, VersusWinner>>,
+    records: Option<ResMut<'w, Records>>,
     exits: MessageWriter<'w, AppExit>,
 }
 
@@ -624,11 +721,13 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                 if resume {
                     resume_game(&mut params.state, &mut params.sim, &params.freeze);
                 } else if restart {
-                    start_new_run(
+                    retry_run(
                         params.core.as_mut(),
+                        params.countdown.as_mut(),
                         &mut params.state,
                         &mut params.sim,
                         &params.freeze,
+                        params.records.as_deref_mut(),
                     );
                 } else if settings {
                     open_settings(&mut params.state);
@@ -653,14 +752,19 @@ fn menu_button_clicks(mut params: MenuClickParams) {
             }
             AppState::GameOver => {
                 if again {
-                    start_new_run(
+                    retry_run(
                         params.core.as_mut(),
+                        params.countdown.as_mut(),
                         &mut params.state,
                         &mut params.sim,
                         &params.freeze,
+                        params.records.as_deref_mut(),
                     );
                 } else if to_title {
-                    goto_title(&mut params.state, &mut params.sim, &params.freeze);
+                    // T9: the result screen's "Menu" walks back to the mode
+                    // list (the mode you just played is one row away), not
+                    // past it to the title.
+                    open_mode_select(&mut params.state, &mut params.sim, &params.freeze);
                 } else if quit {
                     quit_now();
                 }
@@ -824,6 +928,53 @@ fn versus_flow_esc_system(
     }
 }
 
+/// The central terminal recorder (T9): fires exactly once per entry into
+/// [`AppState::GameOver`] (the state write the bridge performs on the
+/// terminal event; `is_changed` clears on the next frame, so repeated frames
+/// inside GameOver never re-record — and equal re-entries are idempotent
+/// anyway because `record_run` keeps the first on ties). Reads
+/// `GameCore::active_mode.id` + `Game::finished_reason()` + snapshot, folds
+/// them through the [`terminal_record`] matrix via
+/// [`Records::record_run`], force-flushes an improved record (same disk
+/// policy as the retired interim writer) and latches the
+/// [`TerminalResult`] the result screen renders. Play counters are *not*
+/// bumped here — `start_mode_run` owns that (T5/T6). No-ops without the
+/// core bridge or for foreign GameOver flips (`finished_reason() == None`).
+fn terminal_record_system(
+    state: Res<AppState>,
+    core: Option<NonSend<GameCore>>,
+    mut records: Option<ResMut<Records>>,
+    mut queue: Option<ResMut<crate::records::RecordsSaveQueue>>,
+    mut result: ResMut<TerminalResult>,
+) {
+    if !state.is_changed() || *state != AppState::GameOver {
+        return;
+    }
+    let Some(core) = core else { return };
+    let id = core.active_mode.id;
+    let snapshot = core.game.snapshot();
+    let ticks = core.game.tick_count();
+    let reason = core.game.finished_reason();
+    let mut new_record = false;
+    if let (Some(reason), Some(records)) = (reason, records.as_deref_mut()) {
+        if let Some(record) = terminal_record(id, reason, &snapshot, ticks) {
+            new_record = records.record_run(mode_key(id), record);
+            if new_record {
+                if let Some(queue) = queue.as_deref_mut() {
+                    queue.pending = true;
+                    queue.force = true;
+                }
+            }
+        }
+    }
+    *result = TerminalResult {
+        mode: id,
+        reason,
+        ticks,
+        new_record,
+    };
+}
+
 /// Winner-headline label query.
 type VersusWinnerLabels<'w, 's> = Query<'w, 's, &'static mut Text, With<VersusWinnerText>>;
 
@@ -857,58 +1008,123 @@ fn sync_versus_winner_text(
 }
 
 /// Final-stats label query.
-type StatsLabels<'w, 's> =
-    Query<'w, 's, &'static mut Text, (With<StatsText>, Without<BestText>, Without<RecordText>)>;
+type StatsLabels<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Text,
+    (
+        With<StatsText>,
+        Without<BestText>,
+        Without<RecordText>,
+        Without<ResultText>,
+    ),
+>;
 
 /// Best-score label query.
-type BestLabels<'w, 's> = Query<'w, 's, &'static mut Text, (With<BestText>, Without<RecordText>)>;
+type BestLabels<'w, 's> =
+    Query<'w, 's, &'static mut Text, (With<BestText>, Without<RecordText>, Without<ResultText>)>;
 
 /// Record-highlight label query.
-type RecordLabels<'w, 's> = Query<'w, 's, &'static mut Text, With<RecordText>>;
+type RecordLabels<'w, 's> =
+    Query<'w, 's, &'static mut Text, (With<RecordText>, Without<ResultText>)>;
 
-/// Rewrite the dynamic labels (stats / best / NEW RECORD) whenever the state
-/// or best score moves. T15 records the best on the GameOver core event —
-/// this display path never writes it back.
+/// Mode-headline label query (text + layout slot, T9 — `Display::None`
+/// keeps Marathon's screen pixel-identical to today's when empty).
+type ResultLabels<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Text, &'static mut Node),
+    (
+        With<ResultText>,
+        Without<StatsText>,
+        Without<BestText>,
+        Without<RecordText>,
+    ),
+>;
+
+/// Rewrite the dynamic labels (headline / stats / best / NEW RECORD)
+/// whenever the state, the best view or the terminal result moves. The
+/// recording itself is T9's exclusive job (`terminal_record_system`); this
+/// display path never writes records. Per mode (T9): Marathon keeps today's
+/// exact layout, Sprint/Dig/Ultra read their own record line from
+/// [`Records`] and their headline from [`TerminalResult`].
 #[derive(SystemParam)]
 struct ScreenTextParams<'w, 's> {
     state: Res<'w, AppState>,
     best: Res<'w, PersistedBestScore>,
+    records: Option<Res<'w, Records>>,
+    result: Res<'w, TerminalResult>,
     core: Option<NonSend<'w, GameCore>>,
     stats: StatsLabels<'w, 's>,
     best_labels: BestLabels<'w, 's>,
     record_labels: RecordLabels<'w, 's>,
+    result_labels: ResultLabels<'w, 's>,
 }
 
 fn sync_screen_texts(params: ScreenTextParams) {
     let ScreenTextParams {
         state,
         best,
+        records,
+        result,
         core,
         mut stats,
         mut best_labels,
         mut record_labels,
+        mut result_labels,
     } = params;
-    if !state.is_changed() && !best.is_changed() {
+    if !state.is_changed() && !best.is_changed() && !result.is_changed() {
         return;
     }
-    let best_string = best_text(&best);
+    let game_over = *state == AppState::GameOver;
+    // Per-mode best line (T9): the title and Marathon keep the persisted
+    // Marathon view verbatim; a finished Sprint/Dig/Ultra run shows its own
+    // record row (`record_line` from T7).
+    let mode = if game_over {
+        core.as_deref().map(|core| core.active_mode.id)
+    } else {
+        None
+    };
+    let best_string = match mode {
+        Some(mode) if mode != ModeId::Marathon => records.map_or_else(
+            || "-".to_string(),
+            |records| record_line(records.record_for(mode_key(mode))),
+        ),
+        _ => best_text(&best),
+    };
     for mut text in best_labels.iter_mut() {
         *text = Text::new(best_string.clone());
     }
-    let game_over = *state == AppState::GameOver;
+    let record = if game_over && result.new_record {
+        "NEW RECORD!"
+    } else {
+        ""
+    };
+    for mut text in record_labels.iter_mut() {
+        *text = Text::new(record);
+    }
+    let headline = if game_over {
+        result_text(result.mode, result.reason, result.ticks)
+    } else {
+        String::new()
+    };
+    let headline_shown = !headline.is_empty();
+    for (mut text, mut node) in result_labels.iter_mut() {
+        *text = Text::new(headline.clone());
+        let wanted = if headline_shown {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != wanted {
+            node.display = wanted;
+        }
+    }
     if let Some(core) = core {
         let snapshot = core.game.snapshot();
         let stats_string = stats_text(snapshot.score, snapshot.level, snapshot.lines);
         for mut text in stats.iter_mut() {
             *text = Text::new(stats_string.clone());
-        }
-        let record = if game_over && is_new_record(snapshot.score, &best) {
-            "NEW RECORD!"
-        } else {
-            ""
-        };
-        for mut text in record_labels.iter_mut() {
-            *text = Text::new(record);
         }
     }
 }
@@ -1107,6 +1323,17 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
 
     add_menu_root(&mut commands, GameOverRoot, DIM_BG, |root| {
         root.spawn(label_node("GAME OVER".to_string(), 48.0));
+        // T9 mode-aware headline (final time / "No result" / Ultra ending);
+        // layout-hidden unless the mode reports one, keeping the Marathon
+        // screen pixel-identical to the legacy layout.
+        root.spawn((
+            ResultText,
+            Node {
+                display: Display::None,
+                ..default()
+            },
+            label_node(String::new(), 26.0),
+        ));
         root.spawn((StatsText, label_node(String::new(), 24.0)));
         root.spawn((BestText, label_node(String::new(), 20.0)));
         root.spawn((
@@ -1142,7 +1369,18 @@ impl Plugin for MenuScreensPlugin {
             .init_resource::<JuiceFreeze>()
             .init_resource::<PersistedBestScore>()
             .init_resource::<QuitRequested>()
-            .init_resource::<VersusFlow>();
+            .init_resource::<VersusFlow>()
+            // T9 terminal recorder resources: the screen-side latch plus the
+            // two resources its systems touch (no-op when the owning plugins
+            // registered them, but the menu screen stays functional in bare
+            // headless trees).
+            .init_resource::<TerminalResult>();
+        if !app.world().contains_resource::<Countdown>() {
+            app.init_resource::<Countdown>();
+        }
+        if !app.world().contains_resource::<Records>() {
+            app.init_resource::<Records>();
+        }
         if !app.world().contains_resource::<ButtonInput<KeyCode>>() {
             app.init_resource::<ButtonInput<KeyCode>>();
         }
@@ -1162,10 +1400,13 @@ impl Plugin for MenuScreensPlugin {
             // Input first: a chord/button transition shows its overlay in the
             // same frame, and the label/visibility sync then sees the change.
             // The chord pins to [`CaptureOrder::Chord`] so it reads the
-            // capture flag before the settings screen's cleanup runs.
+            // capture flag before the settings screen's cleanup runs. The
+            // terminal recorder runs ahead of the click handlers so a
+            // same-frame Retry click can never skip the record write.
             (
                 pause_chord_system.in_set(CaptureOrder::Chord),
                 versus_flow_esc_system,
+                terminal_record_system,
                 menu_button_clicks,
                 versus_button_clicks,
                 sync_versus_menu_visibility,
@@ -1274,12 +1515,102 @@ mod tests {
     }
 
     #[test]
-    fn new_record_requires_positive_matching_best() {
-        let mut best = PersistedBestScore::default();
-        assert!(!is_new_record(0, &best), "first run 0 == 0 is not a record");
-        best.score = 1000;
-        assert!(is_new_record(1000, &best));
-        assert!(!is_new_record(999, &best));
+    fn terminal_record_matrix_follows_the_prd() {
+        let snapshot = GameSnapshot {
+            board: tetris_core::board::Board::new(),
+            active: None,
+            ghost_row: None,
+            hold: None,
+            hold_used: false,
+            next: Vec::new(),
+            score: 500,
+            level: 3,
+            lines: 40,
+            combo: 0,
+            b2b: false,
+            game_over: true,
+        };
+        let best_score = Record::BestScore {
+            score: 500,
+            level: 3,
+            lines: 40,
+        };
+        // Marathon: top-out score (today's behavior, preserved).
+        assert_eq!(
+            terminal_record(ModeId::Marathon, FinishReason::TopOut, &snapshot, 999),
+            Some(best_score.clone())
+        );
+        // Sprint/Dig: only a goal finish is timed; top-outs record nothing.
+        assert_eq!(
+            terminal_record(ModeId::Sprint, FinishReason::GoalReached, &snapshot, 9835),
+            Some(Record::BestTime { ticks: 9835 })
+        );
+        assert_eq!(
+            terminal_record(ModeId::Dig, FinishReason::GoalReached, &snapshot, 42),
+            Some(Record::BestTime { ticks: 42 })
+        );
+        assert_eq!(
+            terminal_record(ModeId::Sprint, FinishReason::TopOut, &snapshot, 10),
+            None,
+            "PRD: a top-out gives no result"
+        );
+        assert_eq!(
+            terminal_record(ModeId::Dig, FinishReason::TopOut, &snapshot, 10),
+            None
+        );
+        // Ultra: score stands either way.
+        assert_eq!(
+            terminal_record(ModeId::Ultra, FinishReason::TimeUp, &snapshot, 7200),
+            Some(best_score.clone())
+        );
+        assert_eq!(
+            terminal_record(ModeId::Ultra, FinishReason::TopOut, &snapshot, 10),
+            Some(best_score)
+        );
+        // T13's extension point: Survival (and every other unshipped mode)
+        // records nothing until its one row lands in the table.
+        assert_eq!(
+            terminal_record(ModeId::Survival, FinishReason::TopOut, &snapshot, 10),
+            None
+        );
+        assert_eq!(
+            terminal_record(ModeId::Zen, FinishReason::TimeUp, &snapshot, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn result_text_per_mode_and_reason() {
+        assert_eq!(
+            result_text(ModeId::Sprint, Some(FinishReason::GoalReached), 9835),
+            format!("Time {}", crate::modes::format_time_ticks(9835))
+        );
+        assert_eq!(
+            result_text(ModeId::Dig, Some(FinishReason::GoalReached), 9835),
+            format!("Time {}", crate::modes::format_time_ticks(9835))
+        );
+        assert_eq!(
+            result_text(ModeId::Sprint, Some(FinishReason::TopOut), 10),
+            "No result"
+        );
+        assert_eq!(
+            result_text(ModeId::Dig, Some(FinishReason::TopOut), 10),
+            "No result"
+        );
+        assert_eq!(
+            result_text(ModeId::Ultra, Some(FinishReason::TimeUp), 7200),
+            "Time up"
+        );
+        assert_eq!(
+            result_text(ModeId::Ultra, Some(FinishReason::TopOut), 100),
+            "Top out"
+        );
+        // Marathon keeps today's exact layout: no headline row.
+        assert_eq!(
+            result_text(ModeId::Marathon, Some(FinishReason::TopOut), 10),
+            ""
+        );
+        assert_eq!(result_text(ModeId::Marathon, None, 0), "");
     }
 
     #[test]
@@ -1605,20 +1936,22 @@ mod tests {
         assert_eq!(vis_of::<GameOverRoot>(&mut app), Visibility::Visible);
 
         let snapshot = app.world().non_send::<GameCore>().game.snapshot();
-        // A previous best below the final score: no record highlight yet.
-        app.world_mut().resource_mut::<PersistedBestScore>().score =
-            snapshot.score.saturating_sub(1);
-        app.update();
+        // T9: the terminal recorder already folded the (first) Marathon run
+        // into Records — the fresh improvement marks the run.
         assert_eq!(
-            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
-            ""
+            app.world().resource::<Records>().record_for(MARATHON),
+            Some(&Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            })
         );
-
-        // Tie the best to this run -> NEW RECORD per PRD §7.4. T15 owns the
-        // write in production; the test sets the resource the same way.
+        // The title-screen Marathon view follows the record (production does
+        // this via the settings view system; set it here to the same value).
         app.world_mut().resource_mut::<PersistedBestScore>().score = snapshot.score;
         app.update();
 
+        // Marathon layout is exactly today's: stats + best, no headline row.
         assert_eq!(
             text_of(&mut app, |world, e| world.get::<StatsText>(e).is_some()),
             stats_text(snapshot.score, snapshot.level, snapshot.lines)
@@ -1631,10 +1964,47 @@ mod tests {
             text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
             "NEW RECORD!"
         );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            ""
+        );
     }
 
     #[test]
-    fn game_over_play_again_starts_fresh_and_menu_returns_title() {
+    fn new_record_marker_shows_only_on_improvement() {
+        let mut app = menu_test_app();
+        // First run improves the (empty) record -> marker shows.
+        force_game_over(&mut app);
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "NEW RECORD!"
+        );
+
+        // A second (hard-drop) run cannot beat the pile-up it inherits the
+        // board-independent best from... to make "worse" explicit: seed a
+        // huge best, top out again, expect no marker.
+        app.world_mut().resource_mut::<Records>().record_run(
+            MARATHON,
+            Record::BestScore {
+                score: u32::MAX as u64,
+                level: 9,
+                lines: 999,
+            },
+        );
+        let over_root = |world: &World, e: Entity| world.get::<GameOverRoot>(e).is_some();
+        click_button_under(&mut app, over_root, |world, e| {
+            world.get::<PlayAgainButton>(e).is_some()
+        });
+        force_game_over(&mut app);
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "",
+            "a worse run must not re-show NEW RECORD!"
+        );
+    }
+
+    #[test]
+    fn game_over_play_again_starts_fresh_and_menu_returns_mode_select() {
         let mut app = menu_test_app();
         force_game_over(&mut app);
         let over_root = |world: &World, e: Entity| world.get::<GameOverRoot>(e).is_some();
@@ -1646,10 +2016,11 @@ mod tests {
         assert_eq!(app.world().non_send::<GameCore>().steps, 0);
 
         force_game_over(&mut app);
+        // T9: "Menu" walks back to the mode list, not past it to the title.
         click_button_under(&mut app, over_root, |world, e| {
             world.get::<QuitToTitleButton>(e).is_some()
         });
-        assert_eq!(app_state(&app), AppState::Title);
+        assert_eq!(app_state(&app), AppState::ModeSelect);
     }
 
     #[test]
@@ -2519,6 +2890,429 @@ mod tests {
             });
             assert_eq!(label, expected, "{role:?} winner {winner:?}");
         }
+    }
+
+    // ---- T9: terminal recording matrix + interim recorder retirement ----
+
+    use crate::core_bridge::{start_mode_run, Countdown};
+    use crate::records::{self, Record, Records, DIG, MARATHON, SPRINT, ULTRA};
+    use crate::settings_persist::{CONFIG_DIR_ENV, ENV_LOCK};
+    use tetris_core::game::Game;
+    use tetris_core::mode::{BlockOutBehavior, FinishReason, Goal, ModeConfig};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("tetris-t9-{label}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("temp dir created");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Production-equivalent persistence tree (settings + records + the T9
+    /// terminal recorder) against an isolated `TETRIS_CONFIG_DIR`.
+    /// (the caller points `CONFIG_DIR_ENV` at `dir` *before* calling — the
+    /// persistence plugins resolve the directory at build time).
+    fn persist_app(_dir: &TempDir, seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins((
+            CoreBridgePlugin,
+            crate::settings_persist::SettingsPersistPlugin,
+            MenuScreensPlugin,
+        ));
+        app.insert_non_send(GameCore::new(seed));
+        app.init_resource::<AppState>();
+        app.update();
+        app
+    }
+
+    /// Start `id` through the shared T5 path, burn its pre-roll, then pile
+    /// hard drops until the core tops out (the bridge flips `GameOver`).
+    fn start_and_top_out(app: &mut App, id: ModeId) {
+        let world = app.world_mut();
+        let mut state = world.remove_resource::<AppState>().unwrap();
+        let mut countdown = world.remove_resource::<Countdown>().unwrap();
+        let mut records = world.remove_resource::<Records>();
+        {
+            let mut core = world.non_send_mut::<GameCore>();
+            start_mode_run(
+                id,
+                core.as_mut(),
+                &mut countdown,
+                &mut state,
+                records.as_mut(),
+            );
+        }
+        world.insert_resource(state);
+        world.insert_resource(countdown);
+        if let Some(records) = records {
+            world.insert_resource(records);
+        }
+        while app.world().resource::<Countdown>().0 > 0 {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+        for _ in 0..2000 {
+            app.world_mut()
+                .resource_mut::<crate::core_bridge::PendingActions>()
+                .push(tetris_core::actions::Action::HardDrop);
+            app.world_mut().run_schedule(FixedUpdate);
+            if app_state(app) == AppState::GameOver {
+                break;
+            }
+        }
+        assert_eq!(app_state(app), AppState::GameOver, "pile-out reached");
+    }
+
+    /// Reach `GoalReached` quickly: a goal config satisfied on the first
+    /// lock (`GarbageCleared` over a board without garbage — T2 contract),
+    /// claimed as `id` via `active_mode` exactly like a catalogue start.
+    fn set_terminal_game(app: &mut App, id: ModeId, config: ModeConfig, seed: u64) {
+        let mut core = app.world_mut().non_send_mut::<GameCore>();
+        core.game = Game::with_config(seed, &config);
+        core.seed = seed;
+        core.steps = 0;
+        core.pending_events.clear();
+        core.active_mode = crate::core_bridge::ActiveMode { id, config };
+        *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
+    }
+
+    fn goal_on_first_lock() -> ModeConfig {
+        ModeConfig {
+            start_level: 1,
+            levels_advance: false,
+            goal: Some(Goal::GarbageCleared),
+            clock_ticks: None,
+            start_board: None,
+            on_block_out: BlockOutBehavior::End,
+        }
+    }
+
+    /// Terminal-recorder retirement (T9): a Sprint top-out must write NO
+    /// record — neither `Records` nor `best.json` — even on the full
+    /// production persistence tree. Pre-T9 the interim
+    /// `settings_persist::best_score_system` folded EVERY `GameOver`
+    /// (Sprint top-outs included) into the Marathon `BestScore`; this test
+    /// is the gate against that pollution ever coming back.
+    #[test]
+    fn sprint_top_out_records_nothing_anywhere() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new("sprint-pollution");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = persist_app(&dir, 0x7E90);
+        start_and_top_out(&mut app, ModeId::Sprint);
+        app.update();
+        app.update();
+
+        let records = app.world().resource::<Records>();
+        assert!(
+            records.record_for(MARATHON).is_none(),
+            "a Sprint top-out must not touch the Marathon record (PRD: no result)"
+        );
+        assert!(records.record_for(SPRINT).is_none());
+
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let disk = records::load_from(dir.path());
+        assert!(
+            disk.record_for(MARATHON).is_none(),
+            "best.json must gain no Marathon record from a Sprint top-out"
+        );
+        assert!(disk.record_for(SPRINT).is_none());
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    /// Regression through the persistence tree (T9 owns the recorder now):
+    /// a Marathon top-out folds into the Marathon `BestScore`, the forced
+    /// flush lands it in `best.json`, and the title-screen view follows.
+    #[test]
+    fn marathon_top_out_persists_best_score_to_disk() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new("marathon-disk");
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let mut app = persist_app(&dir, 0xD05E);
+        force_game_over(&mut app);
+        app.update();
+
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        let disk = records::load_from(dir.path());
+        assert_eq!(
+            disk.record_for(MARATHON),
+            Some(&Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            })
+        );
+        assert_eq!(
+            app.world().resource::<PersistedBestScore>().score,
+            snapshot.score,
+            "the Marathon view keeps following the record"
+        );
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
+
+    /// Sprint goal finish: BestTime lands in `Records`, the headline shows
+    /// the final `m:ss.hh` time, and a *slower* second finish neither
+    /// replaces it nor re-shows the marker.
+    #[test]
+    fn sprint_goal_finish_records_best_time_and_shows_time() {
+        let mut app = menu_test_app();
+        set_terminal_game(&mut app, ModeId::Sprint, goal_on_first_lock(), 0xC1EA);
+        app.world_mut()
+            .resource_mut::<crate::core_bridge::PendingActions>()
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut().run_schedule(FixedUpdate);
+        assert_eq!(app_state(&app), AppState::GameOver);
+        app.update();
+
+        let ticks = app.world().non_send::<GameCore>().game.tick_count();
+        assert_eq!(
+            app.world().resource::<Records>().record_for(SPRINT),
+            Some(&Record::BestTime { ticks }),
+            "goal finish writes the finish-time record"
+        );
+        assert!(app
+            .world()
+            .resource::<Records>()
+            .record_for(MARATHON)
+            .is_none());
+        let time = crate::modes::format_time_ticks(ticks);
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            format!("Time {time}"),
+            "the headline shows the final time"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<BestText>(e).is_some()),
+            format!("Best {time}"),
+            "best line follows the Sprint record"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "NEW RECORD!"
+        );
+
+        // A slower finish (one gravity step before the drop): the stored
+        // BestTime stands and no marker shows.
+        set_terminal_game(&mut app, ModeId::Sprint, goal_on_first_lock(), 0xC1EB);
+        *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
+        app.world_mut().run_schedule(FixedUpdate);
+        app.world_mut()
+            .resource_mut::<crate::core_bridge::PendingActions>()
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut().run_schedule(FixedUpdate);
+        assert_eq!(app_state(&app), AppState::GameOver);
+        let slower = app.world().non_send::<GameCore>().game.tick_count();
+        assert!(
+            slower > ticks,
+            "second finish is slower: {slower} vs {ticks}"
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<Records>().record_for(SPRINT),
+            Some(&Record::BestTime { ticks }),
+            "a slower time keeps the first record"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "",
+            "no marker on a non-improving run"
+        );
+    }
+
+    /// Sprint top-out on screen: explicit `No result` instead of a time,
+    /// score/lines context kept, and `Records` untouched.
+    #[test]
+    fn sprint_top_out_screen_says_no_result_without_recording() {
+        let mut app = menu_test_app();
+        start_and_top_out(&mut app, ModeId::Sprint);
+        app.update();
+
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            "No result"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            ""
+        );
+        let snapshot = app.world().non_send::<GameCore>().game.snapshot();
+        assert!(snapshot.score > 0, "precondition: the run scored");
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<StatsText>(e).is_some()),
+            stats_text(snapshot.score, snapshot.level, snapshot.lines),
+            "score/lines context stays visible"
+        );
+        let records = app.world().resource::<Records>();
+        assert!(records.record_for(SPRINT).is_none());
+        assert!(records.record_for(MARATHON).is_none());
+    }
+
+    /// Dig top-out (real buried-garbage board): same no-result rule.
+    #[test]
+    fn dig_top_out_records_nothing_and_says_no_result() {
+        let mut app = menu_test_app();
+        start_and_top_out(&mut app, ModeId::Dig);
+        app.update();
+
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            "No result"
+        );
+        let records = app.world().resource::<Records>();
+        assert!(records.record_for(DIG).is_none());
+        assert!(records.record_for(MARATHON).is_none());
+    }
+
+    /// Ultra clock expiry: BestScore recorded, `Time up` headline, marker.
+    #[test]
+    fn ultra_time_up_records_best_score_either_way() {
+        let mut app = menu_test_app();
+        set_terminal_game(
+            &mut app,
+            ModeId::Ultra,
+            ModeConfig {
+                clock_ticks: Some(120),
+                ..ModeConfig::default()
+            },
+            0x7174,
+        );
+        for _ in 0..130 {
+            app.world_mut().run_schedule(FixedUpdate);
+            if app_state(&app) == AppState::GameOver {
+                break;
+            }
+        }
+        assert_eq!(app_state(&app), AppState::GameOver);
+        app.update();
+
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(core.game.finished_reason(), Some(FinishReason::TimeUp));
+        let snapshot = core.game.snapshot();
+        let records = app.world().resource::<Records>();
+        assert_eq!(
+            records.record_for(ULTRA),
+            Some(&Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            }),
+            "Ultra's clock ending records the score"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            "Time up"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<RecordText>(e).is_some()),
+            "NEW RECORD!"
+        );
+    }
+
+    /// Ultra top-out before the clock: the score still stands (PRD).
+    #[test]
+    fn ultra_top_out_still_records_best_score() {
+        let mut app = menu_test_app();
+        start_and_top_out(&mut app, ModeId::Ultra);
+        app.update();
+
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(core.game.finished_reason(), Some(FinishReason::TopOut));
+        let snapshot = core.game.snapshot();
+        let records = app.world().resource::<Records>();
+        assert_eq!(
+            records.record_for(ULTRA),
+            Some(&Record::BestScore {
+                score: snapshot.score,
+                level: snapshot.level,
+                lines: snapshot.lines,
+            }),
+            "an Ultra top-out keeps the score it earned"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            "Top out"
+        );
+    }
+
+    /// T9 retry semantics: "Play again" re-runs the mode that just ended
+    /// (not always-Marathon like the old `restart_run` path), fresh board,
+    /// pre-roll re-armed.
+    #[test]
+    fn game_over_retry_reruns_the_selected_mode() {
+        let mut app = menu_test_app();
+        start_and_top_out(&mut app, ModeId::Sprint);
+        app.update();
+        let over_root = |world: &World, e: Entity| world.get::<GameOverRoot>(e).is_some();
+
+        click_button_under(&mut app, over_root, |world, e| {
+            world.get::<PlayAgainButton>(e).is_some()
+        });
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            ModeId::Sprint,
+            "retry must resume the selected mode, not Marathon"
+        );
+        assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+        assert_eq!(
+            app.world().resource::<Countdown>().0,
+            crate::modes::PRE_ROLL_TICKS,
+            "the pre-roll re-arms for the retry"
+        );
+    }
+
+    /// The pause panel's Restart uses the same mode-aware retry (T7 board
+    /// note: it used to go through `restart_run` → always Marathon).
+    #[test]
+    fn pause_restart_resumes_the_selected_mode() {
+        let mut app = menu_test_app();
+        set_state(&mut app, AppState::Title);
+        let title_root = |world: &World, e: Entity| world.get::<TitleRoot>(e).is_some();
+        click_button_under(&mut app, title_root, |world, e| {
+            world.get::<StartButton>(e).is_some()
+        });
+        assert_eq!(app_state(&app), AppState::ModeSelect);
+        let modes_root = |world: &World, e: Entity| world.get::<ModeSelectRoot>(e).is_some();
+        click_button_under(&mut app, modes_root, |world, e| {
+            world
+                .get::<ModeRowButton>(e)
+                .is_some_and(|row| row.id == ModeId::Sprint)
+        });
+        assert_eq!(app_state(&app), AppState::Playing);
+
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app_state(&app), AppState::Paused);
+        let pause_root = |world: &World, e: Entity| world.get::<PauseRoot>(e).is_some();
+        click_button_under(&mut app, pause_root, |world, e| {
+            world.get::<RestartButton>(e).is_some()
+        });
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            ModeId::Sprint,
+            "pause-Restart resumes the selected mode"
+        );
+        assert_eq!(app.world().non_send::<GameCore>().steps, 0);
+        assert_eq!(
+            app.world().resource::<Countdown>().0,
+            crate::modes::PRE_ROLL_TICKS
+        );
     }
 
     #[test]
