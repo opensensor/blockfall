@@ -5282,6 +5282,7 @@ dependencies = [
 name = "tetris-core"
 version = "0.3.2"
 dependencies = [
+ "bincode",
  "proptest",
  "serde",
 ]

@@ -9,4 +9,5 @@ license.workspace = true
 serde = { workspace = true }
 
 [dev-dependencies]
+bincode = { workspace = true }
 proptest = { workspace = true }
