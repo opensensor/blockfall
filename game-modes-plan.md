@@ -1140,9 +1140,19 @@ T1 ──► T2 ──┬──────────────────�
   Manual Android portrait check for Survival/Zen/Bot Ladder/Daily.
 - **validation**: All green + playtest notes in log. No R3 task starts before
   this gate.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: R2 automated gate GREEN at commit cc0b748 (2026-10-01). `cargo test
+  --workspace` = 15/15 suites ok incl. T1 golden canary (3 golden, 0 fail) —
+  proves Marathon behavior AND `GameSnapshot`/`MatchSnapshot` wire shape
+  untouched across R2 (T12–T17); T6 single-writer + migration, T13 Survival
+  record path, T14 Zen exit-flush persistence, T16 rung persistence, T17
+  first-run-wins all pinned by tests. `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; `cargo fmt --all --check` clean. MANUAL (deferred to
+  owner): Android APK portrait check for Survival/Zen/Bot Ladder/Daily;
+  Survival feed pacing + rung-curve playtest (`FEED_*` consts in core
+  `mode.rs`, `RUNG_COOLDOWNS` in `screens_ladder.rs`). R3 (T19 protocol bump)
+  unlocked by this gate.
+- **files edited/created**: (gate — no code; this plan entry only)
 
 ### T19: Match-level tick clock + protocol bump + new AttackRule variants
 - **depends_on**: [T18]
