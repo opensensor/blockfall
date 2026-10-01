@@ -209,9 +209,49 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Core unit test: seed a buried board, script clears to zero
   garbage ⇒ `GoalReached { tick }`; top-out before that ⇒ `GameOver` only, no
   goal. Same-seed replay equality test for a full Dig run.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `98b5099`. **T2 fully covered goal firing**:
+  `lock_and_spawn` already evaluates `Goal::GarbageCleared` after
+  `clear_full_rows()`, freezes and emits `GoalReached` — no production change
+  needed (diff is test-only + doc). 6 new tests in `game.rs`: scripted Dig
+  clear (full Dig config + hand-made paired well board, public-API driver
+  drops Os into the cols 4-5 well / balanced-dumps everything else: 87 steps,
+  garbage 10→0, exactly one `GoalReached { tick }` at tick 56, frozen after,
+  `finished_reason() == GoalReached`, no GameOver/LevelUp), top-out under the
+  Dig config w/ real `BuriedGarbage` board (Z stack + O lock ⇒ `GameOver`,
+  `TopOut`, garbage intact, no goal ever), same-seed replay equality (events
+  + snapshots + final bincode bytes; seeds 1 vs 2 diverge), `LineCleared`
+  strictly-before-`GoalReached` in the final lock's batch (and GoalReached
+  ends the batch), retire/shift semantics (lone garbage cell counts; row
+  retires via line clear; survivors shift down counted — documents AC5),
+  Sprint config `Lines(40)` fires exactly once at 40 lines, level pinned 1,
+  never `LevelUp`, freezes ⇒ Sprint needs no further core work. RED-equivalent
+  (T2 already correct ⇒ behavior-red impossible): scratch-disabled
+  `GarbageCleared => false` ⇒ scripted/replay/batch-ordering tests all fail
+  (goal never fires ⇒ driver runs past budget), restored ⇒ green; scratch
+  run with disabled firing captured. `mode.rs`: `Goal::GarbageCleared` doc
+  now states the retire-a-row-on-any-garbage-cell-cleared semantics.
+  GREEN: `cargo test -p tetris-core` 159 lib + 6 invariant + 3 marathon
+  golden pass (canary untouched); clippy `--all-targets -D warnings` clean;
+  `cargo fmt --all --check` clean.
+  **GOTCHA (matters for T4/T10/T20):** a `BuriedGarbage { rows: 10 }` board
+  is NOT clearable by any simple scripted or greedy solver. Each row's hole
+  is only reachable while that row is the band top (band below is solid
+  garbage; only a vertical-I-in-the-hole-column drop completes a 1-hole
+  row), and every dig leaves its I's debris directly above the new band top,
+  permanently blocking that column for all deeper digs. Clearing all 10 rows
+  therefore needs hole columns never reused (~10!/10^10 of seeds) *and* a
+  legal place for the ~25+ non-I pieces dealt meanwhile — every column is a
+  future descent column, so naive stacks always die (empirical: 0/200k seeds
+  win with a top-down vertical-I + hold-fishing driver; balanced dump-zone
+  drivers win only against hand-made paired-well boards). Win requires the
+  deep line-clearing dig heuristic T10 is charged with building; T4's
+  "Dig config completes headlessly" criterion and T20's duel win-path depend
+  on it. `GarbageCleared` firing itself is proven correct regardless of the
+  start board (hand-made garbage via the test-friendlier `g.board =` path
+  used in the AC tests).
+- **files edited/created**: `crates/tetris-core/src/game.rs` (tests only),
+  `crates/tetris-core/src/mode.rs` (doc only)
 
 ### T4: Sprint + Ultra config semantics, headless completion tests
 - **depends_on**: [T2, T3]
