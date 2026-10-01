@@ -864,9 +864,46 @@ T1 ──► T2 ──┬──────────────────�
 - **validation**: Headless test: bot survives ≥ 30 s of feed then eventually
   tops out with a recorded time; HUD fixture shows queue count and
   countdown-to-next-row strings.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `b7ae3ea`. App-only (core untouched). Catalogue: Survival =
+  `{ garbage_feed: Some(GarbageFeed::default()), ..Default::default() }`,
+  `is_shipped` flipped (description now names the rising feed); the mode
+  list is data-driven — `screens_modes::shipped_modes()` filters
+  `ModeId::ALL` through `is_shipped`, zero changes there (its
+  `rows_are_data_driven…` test picks the new row up automatically).
+  Bridge: `mode_hud_refresh_system` now fills the reserved `ModeHudInfo`
+  fields when `config.garbage_feed.is_some()`
+  (`feed_pending = Some(pending_garbage())`, `feed_next_row_in =
+  ticks_to_next_row()`; `None` otherwise — `swap_in` still reserved) and
+  `show_hud` = goal || clock || feed. No new resources (resource-count
+  discipline kept: the meter is a new `HudTextSlot` on the existing
+  `HudTextEntities` pool). HUD: new `HudTextSlot::Feed` —
+  `GARBAGE +N\nNEXT s.s` in the versus pending meter's idiom (same
+  `GARBAGE_COLOR`, the versus one is a startup-spawned `+N` per-side text
+  with no reusable piece, so only the idiom is shared, not coupled to
+  `MatchSnapshot.pending`), landscape right panel below the goal row
+  (-23.5c), portrait under the deck row; count-up clock comes free with
+  the T8 clock slot. Recording: `terminal_record` gained exactly the one
+  row `(Survival, TopOut) → BestTime{tick_count()}`; `result_text` gained
+  `(Survival, Some(TopOut)) → "Time m:ss.hh"` (same line as Sprint/Dig
+  completions; best line follows via `record_line`).
+  TDD: RED = 7 targeted failures (catalogue feed/is_shipped, bridge feed
+  fields queued/matrix row/headline), GREEN: app 426 pass. Tests: catalogue
+  feed+ship; bridge queue-at-305-steps-before-any-lock + countdown + land
+  on first lock (`board_has_garbage`); Marathon-past-350-steps fields stay
+  `None`/`show_hud` false; HUD fixtures (queue count, `+2` / `2.0s` /
+  `5.0s`, pre-roll + marathon gating, layout bounds); end-to-end
+  gravity-only Survival run: the feed buries the bot past the 30 s mark
+  (asserts `ticks >= 1800` and ≥ 4 landed garbage rows on top-out; stable
+  over repeated random-seed runs), `BestTime{tick_count}` under SURVIVAL,
+  Marathon record untouched, `Time m:ss.hh` headline + `NEW RECORD!`.
+  Validation:
+  `cargo test -p tetris-app` 426/7 green, `cargo test --workspace` all
+  suites green, `cargo clippy --workspace --all-targets -- -D warnings`
+  clean, `cargo fmt --all --check` clean.
+- **files edited/created**: `crates/tetris-app/src/modes.rs`,
+  `crates/tetris-app/src/core_bridge/mod.rs`, `crates/tetris-app/src/hud.rs`,
+  `crates/tetris-app/src/screens_menu.rs`
 
 ### T14: Zen mode (core wipe-on-block-out + app)
 - **depends_on**: [T11, T5]
