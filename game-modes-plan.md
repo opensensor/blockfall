@@ -266,9 +266,49 @@ T1 ──► T2 ──┬──────────────────�
   with score kept. These are the PRD's "Solo modes complete headlessly" CI
   criterion; re-run in CI on every push (not `#[ignore]`d).
 - **validation**: `cargo test -p tetris-core modes_headless` green in CI.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: 2026-10-01 — commit `9c6a96c`. New integration test file, test-only
+  (no production change). 5 tests, ~0.9 s debug runtime, NOT `#[ignore]`d:
+  (a) **Sprint** seed 31 337, greedy hard-drop driver (marathon-solver
+  weights) clears 40 lines ⇒ `GoalReached` exactly once at the goal tick,
+  `finished_reason() == GoalReached`, level pinned 1, no `LevelUp`/`GameOver`,
+  hard freeze, bounded ≤ 6000 steps.
+  (b) **Dig** — **REAL `BuriedGarbage { rows: 10 }` boards complete; the
+  hand-made fallback was NOT needed.** The nub-down heuristic (fill the
+  CURRENT top buried row's hole with a nub-down piece — T nub-down, J/L at
+  180°, or a vertical-I foot — clearing exactly that row; greedy dumps; hold-
+  fishing when an upcoming/held piece can dig) **won 6 of 40 probe seeds**
+  (9, 28, 30, 31, 35, 36 — all six pinned in the test, ~65–441 steps); most
+  losses die at 9/10 rows. This SUPERSEDES the T3 GOTCHA ("0/200k seeds win"):
+  that was driver-specific — T3's vertical-I digs bury their own debris
+  column, the nub-down top-down line does not (documented in the test under
+  `DIG-SOLVABILITY`). T10: reuse this heuristic; win rate ~15% ⇒ seed-fish.
+  Per seed: exactly one `GoalReached`, `garbage_rows_left() == 0`, no
+  `GameOver`/`LevelUp`, frozen.
+  (c) **Ultra** seed 42, greedy one-piece-per-30-ticks for marathon
+  progression ⇒ `TimeUp { tick: 7200 }` exactly (once), `tick_count() ==
+  7200`, score > 0, `game_over == false`, 7201st tick + applies empty, tick
+  clock frozen. Companion: blind hard-drop pile-up ⇒ `TopOut` well before
+  tick 7200, `GameOver` (no `TimeUp`), score retained > 0, frozen.
+  (d) **Replay**: same-seed Sprint × 2 — events, per-cycle snapshots and
+  final bincode bytes identical; seed 42 run differs (non-vacuity).
+  RED verified: pinning the Ultra tick to 7 199 and seed 23 (a losing dig
+  seed) each fail the respective test, restored ⇒ green. GREEN:
+  `cargo test -p tetris-core` 159 lib + 6 invariant + 3 marathon golden +
+  5 headless pass; `cargo clippy -p tetris-core --all-targets -- -D warnings`
+  clean; `cargo fmt -p tetris-core --check` clean (workspace `fmt --all`
+  still shows OTHER agents' in-flight tetris-app WIP files — untouched by
+  this task).
+  Gotchas: (a) `Game::board`/`install_board` are private — an integration
+  test CANNOT install a hand-made board, so the documented fallback path
+  was infeasible from `tests/` anyway (T3's paired-well fixture only works
+  in the crate's own unit tests); the nub-down win makes it moot;
+  (b) dig/dump scoring must match the probe exactly to keep the pinned
+  seeds winning; (c) greedy survives the 7 200-tick Ultra clock ONLY at
+  the one-piece-per-30-ticks cadence — a per-tick-pace driver places ~2×
+  more pieces and can top out before the clock.
+- **files edited/created**: `crates/tetris-core/tests/modes_headless.rs`
+  (new)
 
 ### T5: App solo bridge — mode-aware starts, countdown, terminal reasons
 - **depends_on**: [T2]
