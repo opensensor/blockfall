@@ -81,6 +81,7 @@ use crate::core_bridge::{
     end_versus, start_mode_run, start_versus, start_versus_with_cooldown, Controller, Countdown,
     GameCore, SimPaused, VersusMatch, VersusWinner,
 };
+use crate::daily::{self, DailyAttempt};
 use crate::hud::VersusHudRoot;
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::juice::JuiceFreeze;
@@ -271,7 +272,7 @@ pub fn best_text(best: &PersistedBestScore) -> String {
 /// result screen (T9). `reason` is `None` until a real terminal has been
 /// observed (core missing or a foreign GameOver flip), which keeps the
 /// legacy Marathon layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
+#[derive(Debug, Clone, PartialEq, Eq, Resource)]
 pub struct TerminalResult {
     /// The [`ModeId`] of the run that ended.
     pub mode: ModeId,
@@ -282,6 +283,12 @@ pub struct TerminalResult {
     /// `true` when the terminal fold improved the mode's stored record
     /// (`Records::record_run` returned `true`) — drives the NEW RECORD marker.
     pub new_record: bool,
+    /// Set when the finished run was a **daily attempt** (T17): the full
+    /// share line (`Blockfall Daily 2026-10-01 · Dig · 1:42.35`) shown as
+    /// the result headline in place of the mode headline — display-only
+    /// text (Bevy 0.19 has no clipboard, owner decision). `None` for every
+    /// normal run and for a daily attempt that earned no result.
+    pub daily_share: Option<String>,
 }
 
 impl Default for TerminalResult {
@@ -291,6 +298,7 @@ impl Default for TerminalResult {
             reason: None,
             ticks: 0,
             new_record: false,
+            daily_share: None,
         }
     }
 }
@@ -328,6 +336,13 @@ pub struct VersusFlow {
     /// Bot Ladder campaign state ([`LadderOrigin::Closed`] for every
     /// non-ladder flow). See [`crate::screens_ladder`].
     pub ladder: LadderOrigin,
+    /// Daily Challenge marker (T17, same flow-resource discipline as
+    /// `ladder`): [`DailyAttempt::Active`] from the banner press until the
+    /// terminal is folded at Game Over, [`DailyAttempt::Idle`] for every
+    /// normal run. Arming it is what makes a run record into
+    /// [`DAILY`](crate::records::DAILY) — the three underlying modes stay
+    /// fully normal on their own rows.
+    pub daily: DailyAttempt,
 }
 
 /// Advance the flow one step back: Opponent → Rules → Title.
@@ -791,6 +806,10 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                 if resume {
                     resume_game(&mut params.state, &mut params.sim, &params.freeze);
                 } else if restart {
+                    // T17: pausing out of a live daily run and restarting
+                    // starts a fresh (random-seed) run — drop the daily
+                    // marker so this attempt can never record into DAILY.
+                    params.flow.daily = DailyAttempt::Idle;
                     retry_run(
                         params.core.as_mut(),
                         params.countdown.as_mut(),
@@ -1056,12 +1075,24 @@ fn versus_flow_esc_system(
 /// [`TerminalResult`] the result screen renders. Play counters are *not*
 /// bumped here — `start_mode_run` owns that (T5/T6). No-ops without the
 /// core bridge or for foreign GameOver flips (`finished_reason() == None`).
+///
+/// T17: the **daily attempt marker is consumed here**. A Game Over ends any
+/// daily attempt (recorded or not, so a later R-retry of the same mode is a
+/// plain run); when it was active and the terminal earns a result,
+/// [`daily::finish_daily_attempt`] applies the first-run-wins-for-day gate
+/// (T6's `record_run` replaces Daily content unconditionally — the date gate
+/// lives in `daily.rs`), a fresh write force-flushes the save queue, and the
+/// share line rides on [`TerminalResult::daily_share`] as the result
+/// headline. The mode matrix is *not* suppressed for daily runs: a daily
+/// Sprint finish also counts toward the personal Sprint record.
+#[allow(clippy::too_many_lines)]
 fn terminal_record_system(
     state: Res<AppState>,
     core: Option<NonSend<GameCore>>,
     mut records: Option<ResMut<Records>>,
     mut queue: Option<ResMut<crate::records::RecordsSaveQueue>>,
     mut result: ResMut<TerminalResult>,
+    mut flow: ResMut<VersusFlow>,
 ) {
     if !state.is_changed() || *state != AppState::GameOver {
         return;
@@ -1071,8 +1102,27 @@ fn terminal_record_system(
     let snapshot = core.game.snapshot();
     let ticks = core.game.tick_count();
     let reason = core.game.finished_reason();
+
+    // T17: consume the daily marker — Game Over closes the attempt either
+    // way (a retry afterwards is a plain run of the same mode).
+    let daily_attempt = std::mem::replace(&mut flow.daily, DailyAttempt::Idle);
+    let mut daily_share = None;
+
     let mut new_record = false;
     if let (Some(reason), Some(records)) = (reason, records.as_deref_mut()) {
+        if let DailyAttempt::Active { date } = daily_attempt {
+            if let Some((line, wrote)) =
+                daily::finish_daily_attempt(records, date, id, reason, ticks, snapshot.score)
+            {
+                daily_share = Some(line);
+                if wrote {
+                    if let Some(queue) = queue.as_deref_mut() {
+                        queue.pending = true;
+                        queue.force = true;
+                    }
+                }
+            }
+        }
         if let Some(record) = terminal_record(id, reason, &snapshot, ticks) {
             new_record = records.record_run(mode_key(id), record);
             if new_record {
@@ -1088,6 +1138,7 @@ fn terminal_record_system(
         reason,
         ticks,
         new_record,
+        daily_share,
     };
 }
 
@@ -1220,7 +1271,13 @@ fn sync_screen_texts(params: ScreenTextParams) {
         *text = Text::new(record);
     }
     let headline = if game_over {
-        result_text(result.mode, result.reason, result.ticks)
+        // T17: a daily run's headline is its share line
+        // (`Blockfall Daily 2026-10-01 · Dig · 1:42.35` — display-only text,
+        // no clipboard in Bevy 0.19); normal runs keep the mode headline.
+        result
+            .daily_share
+            .clone()
+            .unwrap_or_else(|| result_text(result.mode, result.reason, result.ticks))
     } else {
         String::new()
     };
@@ -3601,5 +3658,169 @@ mod tests {
             world.get::<VersusWinnerText>(e).is_some()
         });
         assert_eq!(label, "PLAYER 1 WINS");
+    }
+
+    // ---- T17: Daily Challenge terminal recording ----
+
+    use crate::daily::{self, CivilDate, DailyAttempt};
+    use crate::records::DAILY;
+
+    /// A fixed "today" for the daily tests: 2026-10-01 is a **Thursday**,
+    /// so the rotation resolves to Sprint (Mon Sprint, Tue Ultra, Wed Dig,
+    /// Thu Sprint …).
+    fn daily_test_today() -> CivilDate {
+        CivilDate::from_ymd(2026, 10, 1)
+    }
+
+    fn arm_daily(app: &mut App) {
+        app.world_mut().resource_mut::<VersusFlow>().daily = DailyAttempt::Active {
+            date: daily_test_today(),
+        };
+    }
+
+    fn daily_record(app: &App) -> Option<Record> {
+        app.world().resource::<Records>().record_for(DAILY).cloned()
+    }
+
+    fn flow_daily(app: &App) -> DailyAttempt {
+        app.world().resource::<VersusFlow>().daily
+    }
+
+    /// A **completed** daily Sprint run records `Daily { date, time }` under
+    /// the first-run-wins gate, the result headline becomes the exact share
+    /// line, and a second completed run the same day changes nothing (the
+    /// share line keeps quoting the stored first result). The attempt marker
+    /// is consumed at Game Over, so Play Again would be a plain run.
+    #[test]
+    fn daily_sprint_goal_records_daily_and_shares_the_line() {
+        daily::set_today_override(Some(daily_test_today()));
+        let mut app = menu_test_app();
+        arm_daily(&mut app);
+        set_terminal_game(&mut app, ModeId::Sprint, goal_on_first_lock(), 0xDA11);
+        app.world_mut()
+            .resource_mut::<crate::core_bridge::PendingActions>()
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut().run_schedule(FixedUpdate);
+        assert_eq!(app_state(&app), AppState::GameOver);
+        app.update();
+
+        let ticks = app.world().non_send::<GameCore>().game.tick_count();
+        let time = crate::modes::format_time_ticks(ticks);
+        assert_eq!(
+            daily_record(&app),
+            Some(Record::Daily {
+                date: "2026-10-01".to_string(),
+                result: time.clone(),
+            }),
+            "the first completed daily run of the day is recorded"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            format!("Blockfall Daily 2026-10-01 \u{b7} Sprint \u{b7} {time}"),
+            "the headline is the exact share line (U+00B7 separators)"
+        );
+        assert_eq!(
+            flow_daily(&app),
+            DailyAttempt::Idle,
+            "Game Over consumes the daily attempt marker"
+        );
+
+        // A second completed run the same day changes nothing. (Realistic
+        // re-entry: the player presses the Daily banner again — a fresh
+        // attempt for the same date.)
+        arm_daily(&mut app);
+        set_terminal_game(&mut app, ModeId::Sprint, goal_on_first_lock(), 0xDA12);
+        *app.world_mut().resource_mut::<AppState>() = AppState::Playing;
+        app.world_mut().run_schedule(FixedUpdate);
+        app.world_mut()
+            .resource_mut::<crate::core_bridge::PendingActions>()
+            .push(tetris_core::actions::Action::HardDrop);
+        app.world_mut().run_schedule(FixedUpdate);
+        assert_eq!(app_state(&app), AppState::GameOver);
+        app.update();
+
+        assert_eq!(
+            daily_record(&app),
+            Some(Record::Daily {
+                date: "2026-10-01".to_string(),
+                result: time.clone(),
+            }),
+            "retries the same day change nothing (first-run-wins)"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            format!("Blockfall Daily 2026-10-01 \u{b7} Sprint \u{b7} {time}"),
+            "the share line keeps quoting the stored first result"
+        );
+        daily::set_today_override(None);
+    }
+
+    /// Ultra daily: the score **stands** on the top-out too — it records
+    /// `Daily { date, score }` and shares it (PRD: "the score stands").
+    #[test]
+    fn daily_ultra_top_out_records_the_standing_score() {
+        daily::set_today_override(Some(daily_test_today()));
+        let mut app = menu_test_app();
+        arm_daily(&mut app);
+        start_and_top_out(&mut app, ModeId::Ultra);
+        app.update();
+
+        let score = app.world().non_send::<GameCore>().game.snapshot().score;
+        assert_eq!(
+            daily_record(&app),
+            Some(Record::Daily {
+                date: "2026-10-01".to_string(),
+                result: score.to_string(),
+            }),
+            "an Ultra daily top-out records the score (it stands)"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            format!("Blockfall Daily 2026-10-01 \u{b7} Ultra \u{b7} {score}")
+        );
+        daily::set_today_override(None);
+    }
+
+    /// Sprint daily top-out: the mode rule bites — nothing is recorded and
+    /// the screen keeps the plain `No result` headline (no share line).
+    #[test]
+    fn daily_sprint_top_out_records_nothing() {
+        daily::set_today_override(Some(daily_test_today()));
+        let mut app = menu_test_app();
+        arm_daily(&mut app);
+        start_and_top_out(&mut app, ModeId::Sprint);
+        app.update();
+
+        assert!(
+            daily_record(&app).is_none(),
+            "a Sprint daily top-out earns nothing"
+        );
+        assert_eq!(
+            text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
+            "No result"
+        );
+        daily::set_today_override(None);
+    }
+
+    /// The isolation guard: a plain Marathon run (no daily marker) never
+    /// touches the DAILY record — the marker, not the mode, arms recording.
+    #[test]
+    fn plain_marathon_run_never_records_daily() {
+        let mut app = menu_test_app();
+        start_and_top_out(&mut app, ModeId::Marathon);
+        app.update();
+
+        assert!(
+            daily_record(&app).is_none(),
+            "no daily marker ⇒ no daily record"
+        );
+        assert!(
+            app.world()
+                .resource::<Records>()
+                .record_for(MARATHON)
+                .is_some(),
+            "the normal Marathon record still lands (matrix untouched)"
+        );
+        assert_eq!(flow_daily(&app), DailyAttempt::Idle);
     }
 }

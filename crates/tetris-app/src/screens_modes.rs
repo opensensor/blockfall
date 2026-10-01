@@ -48,6 +48,7 @@ use bevy::input::touch::{TouchInput, TouchPhase};
 use bevy::prelude::*;
 
 use crate::core_bridge::{start_mode_run, Countdown, GameCore, SimPaused};
+use crate::daily::{self, DailyAttempt};
 use crate::juice::JuiceFreeze;
 use crate::modes::{description, display_name, format_time_ticks, is_shipped, mode_key, ModeId};
 use crate::records::{Record, Records};
@@ -161,6 +162,13 @@ pub struct ModeRowButton {
 /// "Back" button on the mode list → [`AppState::Title`].
 #[derive(Component)]
 pub struct ModeBackButton;
+
+/// The Daily Challenge banner row (T17) — deliberately **not** a
+/// [`ModeRowButton`]: the row list stays data-driven from the shipped
+/// catalogue (Daily is not a play-mode row), while this one row shows
+/// today's rotation + status and starts *today's* mode with *today's* seed.
+#[derive(Component)]
+pub struct DailyRowButton;
 
 /// The overflow-scrolling viewport around the row list
 /// ([`mode_scroll_system`] drives its `ScrollPosition`).
@@ -286,6 +294,28 @@ fn build_mode_select_ui(mut commands: Commands, windows: Query<&Window>, records
         ))
         .with_children(|root| {
             root.spawn(label_node("SELECT MODE".to_string(), 40.0));
+            // Daily Challenge banner (T17): shows today's rotation slot and
+            // status (`Daily · Dig — Not yet` / `— 1:42.35`); a press starts
+            // TODAY'S mode with TODAY'S seed (daily::start_daily), so it is
+            // its own marker component — never a catalogue ModeRowButton.
+            root.spawn((
+                Button,
+                DailyRowButton,
+                BackgroundColor(BUTTON_BG),
+                Node {
+                    width: Val::Px(560.0),
+                    max_width: Val::Percent(94.0),
+                    min_height: Val::Px(52.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                Text::new(daily::banner_text(
+                    records.record_for(crate::records::DAILY),
+                )),
+                TextFont::from_font_size(18.0),
+                TextColor(RECORD_COLOR),
+            ));
             // Native scroll viewport: clips its overflow and takes
             // `ScrollPosition` input; rows outside the clip never catch a
             // tap (bevy_ui `ui_focus_system` honors overflow clipping).
@@ -379,6 +409,25 @@ fn sync_mode_record_labels(
     }
 }
 
+/// Rewrite the Daily banner (T17) whenever [`Records`] moves (the finished
+/// run's result replaces "Not yet") or [`AppState`] moves (a fresh visit
+/// re-reads "today", so crossing UTC midnight needs no timer).
+fn sync_daily_banner(
+    records: Res<Records>,
+    state: Res<AppState>,
+    mut banners: Query<&mut Text, With<DailyRowButton>>,
+) {
+    if !records.is_changed() && !state.is_changed() {
+        return;
+    }
+    let line = daily::banner_text(records.record_for(crate::records::DAILY));
+    for mut text in &mut banners {
+        if text.0 != line {
+            *text = Text::new(line.clone());
+        }
+    }
+}
+
 /// Row / Back clicks while the list is open.
 type ModeSelectClickQuery<'w, 's> = Query<
     'w,
@@ -388,6 +437,7 @@ type ModeSelectClickQuery<'w, 's> = Query<
         &'static Interaction,
         Option<&'static ModeRowButton>,
         Has<ModeBackButton>,
+        Has<DailyRowButton>,
     ),
     (With<Button>, Changed<Interaction>),
 >;
@@ -408,7 +458,7 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
     if *params.state != AppState::ModeSelect {
         return;
     }
-    for (_entity, interaction, row, back) in params.buttons.iter() {
+    for (_entity, interaction, row, back, daily_row) in params.buttons.iter() {
         if *interaction != Interaction::Pressed {
             continue;
         }
@@ -420,6 +470,10 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
                 crate::screens_ladder::open_ladder(&mut params.state, &mut params.flow);
                 return;
             }
+            // T17: a normal row is never a daily attempt — clearing the
+            // marker here is what keeps the three underlying modes fully
+            // independent of the daily record.
+            params.flow.daily = DailyAttempt::Idle;
             start_mode_row(
                 row.id,
                 params.core.as_mut(),
@@ -432,6 +486,19 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
             return;
         } else if back {
             goto_title(&mut params.state, &mut params.sim, &params.freeze);
+            return;
+        } else if daily_row {
+            // The Daily banner press: today's mode, today's seed (the
+            // forced seed wins over TETRIS_SEED — everyone plays the same
+            // board), and the run is flagged daily on the flow marker.
+            release_sim(&mut params.sim, &params.freeze);
+            let (date, _mode, _seed) = daily::start_daily(
+                params.core.as_mut(),
+                params.countdown.as_mut(),
+                &mut params.state,
+                params.records.as_deref_mut(),
+            );
+            params.flow.daily = DailyAttempt::Active { date };
             return;
         }
     }
@@ -473,6 +540,9 @@ fn mode_select_key_system(mut params: ModeSelectKeyParams) {
         let Some(first) = shipped_modes().first().copied() else {
             return;
         };
+        // T17: Enter starts the first row as a plain run — never a daily
+        // attempt.
+        params.flow.daily = DailyAttempt::Idle;
         start_mode_row(
             first,
             params.core.as_mut(),
@@ -585,6 +655,7 @@ impl Plugin for ModeSelectPlugin {
                 mode_scroll_system,
                 sync_mode_select_visibility,
                 sync_mode_record_labels,
+                sync_daily_banner,
             )
                 .chain(),
         );
@@ -811,24 +882,38 @@ mod tests {
 
         // The row renderer itself is catalogue-driven, not a fixed menu:
         // feeding it a hypothetical catalogue (a flipped `is_shipped`, e.g.
-        // Daily in R3) renders exactly those rows. T16 note: the
-        // hypothetical was Bot Ladder until it shipped — it now needs a mode
-        // that is still unshipped (T17: flip to DigDuel or Switch).
+        // DigDuel in R3) renders exactly those rows. T17 note: the
+        // hypothetical is no longer Daily — Daily ships as its own banner
+        // row (never a catalogue ModeRowButton); BotLadder (T16) shipped
+        // before it.
         let records = Records::default();
         {
             let mut cx = app.world_mut().commands();
             cx.spawn(Node::default()).with_children(|parent| {
-                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::Daily], &records);
+                spawn_mode_rows(parent, &[ModeId::Marathon, ModeId::DigDuel], &records);
             });
         }
         app.update();
         let ids = row_ids(&mut app);
-        assert_eq!(ids.iter().filter(|id| **id == ModeId::Daily).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == ModeId::DigDuel).count(), 1);
         assert_eq!(
             ids.len(),
             expected.len() + 2,
             "renderer emitted exactly the two requested rows"
         );
+        // T17: Daily is deliberately NOT shipped as a play-mode row — the
+        // list above must contain no Daily row while the banner (separate
+        // marker component) exists exactly once.
+        assert!(
+            !ids.contains(&ModeId::Daily),
+            "Daily is a banner, not a row"
+        );
+        let daily_banners = {
+            let world = app.world_mut();
+            let mut q = world.query_filtered::<Entity, With<DailyRowButton>>();
+            q.iter(world).count()
+        };
+        assert_eq!(daily_banners, 1, "exactly one Daily banner row");
     }
 
     #[test]
@@ -1180,5 +1265,117 @@ mod tests {
         assert_eq!(app_state(&app), AppState::ModeSelect);
         let _ = PauseRoot; // keep the import honest: pause state is untouched
         assert_eq!(app_state(&app), AppState::ModeSelect);
+    }
+
+    // ---- T17: Daily Challenge banner ----
+
+    use crate::daily::{self, CivilDate, DailyAttempt};
+
+    /// 2026-10-01 — a Thursday, so the rotation resolves to Sprint.
+    fn daily_test_today() -> CivilDate {
+        CivilDate::from_ymd(2026, 10, 1)
+    }
+
+    fn daily_banner_text(app: &mut App) -> String {
+        text_of(app, |world, e| world.get::<DailyRowButton>(e).is_some())
+    }
+
+    #[test]
+    fn daily_banner_shows_todays_mode_then_the_stored_result() {
+        daily::set_today_override(Some(daily_test_today()));
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+
+        assert_eq!(
+            daily_banner_text(&mut app),
+            "Daily \u{b7} Sprint \u{2014} Not yet",
+            "Thursday 2026-10-01 rotates to Sprint, nothing recorded yet"
+        );
+
+        let mut records = app.world().resource::<Records>().clone();
+        records.record_run(
+            crate::records::DAILY,
+            Record::Daily {
+                date: "2026-10-01".to_string(),
+                result: "1:42.35".to_string(),
+            },
+        );
+        app.insert_resource(records);
+        app.update();
+        assert_eq!(
+            daily_banner_text(&mut app),
+            "Daily \u{b7} Sprint \u{2014} 1:42.35",
+            "today's stored result replaces the placeholder"
+        );
+        daily::set_today_override(None);
+    }
+
+    #[test]
+    fn daily_banner_press_starts_todays_mode_with_todays_seed() {
+        daily::set_today_override(Some(daily_test_today()));
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| world.get::<DailyRowButton>(e).is_some(),
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        let core = app.world().non_send::<GameCore>();
+        assert_eq!(
+            core.active_mode.id,
+            daily::daily_mode(daily_test_today()),
+            "the banner starts TODAY'S rotated mode (Sprint on 2026-10-01)"
+        );
+        assert_eq!(
+            core.seed,
+            daily::daily_seed(daily_test_today()),
+            "with TODAY'S seed (forced, TETRIS_SEED-proof)"
+        );
+        assert_eq!(
+            app.world().resource::<Countdown>().0,
+            crate::modes::pre_roll_ticks(ModeId::Sprint),
+            "pre-roll re-armed through the shared start path"
+        );
+        assert_eq!(*app.world().resource::<SimPaused>(), SimPaused(false));
+        assert_eq!(
+            app.world().resource::<VersusFlow>().daily,
+            DailyAttempt::Active {
+                date: daily_test_today()
+            },
+            "the run is flagged as a daily attempt on the flow marker"
+        );
+        daily::set_today_override(None);
+    }
+
+    #[test]
+    fn normal_row_press_is_never_a_daily_attempt() {
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+        // A live daily marker (stale from an abandoned run) is cleared by
+        // starting a normal row.
+        app.world_mut().resource_mut::<VersusFlow>().daily = DailyAttempt::Active {
+            date: daily_test_today(),
+        };
+
+        click_button_under(
+            &mut app,
+            |world, e| world.get::<ModeSelectRoot>(e).is_some(),
+            |world, e| {
+                world
+                    .get::<ModeRowButton>(e)
+                    .is_some_and(|row| row.id == ModeId::Sprint)
+            },
+        );
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            app.world().resource::<VersusFlow>().daily,
+            DailyAttempt::Idle,
+            "normal rows never inherit or keep the daily marker"
+        );
     }
 }

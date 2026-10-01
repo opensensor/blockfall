@@ -290,16 +290,38 @@ pub fn start_mode_run(
     app_state: &mut AppState,
     records: Option<&mut Records>,
 ) -> u64 {
-    let seed = match env_seed() {
+    start_mode_run_with_seed(id, core, countdown, app_state, records, None)
+}
+
+/// [`start_mode_run`] with a **forced seed** (T17 Daily Challenge).
+/// `Some(seed)` wins over [`SEED_ENV`] and the wall clock — the daily run's
+/// whole point is that every player gets the same board — while `None`
+/// reproduces the env/wall-clock resolution verbatim ([`start_mode_run`]
+/// delegates with `None`, so the bookkeeping lives in exactly one place).
+pub fn start_mode_run_with_seed(
+    id: ModeId,
+    core: &mut GameCore,
+    countdown: &mut Countdown,
+    app_state: &mut AppState,
+    records: Option<&mut Records>,
+    seed_override: Option<u64>,
+) -> u64 {
+    let seed = match seed_override {
         Some(seed) => {
-            info!("start_mode {id:?}: seed {seed} (from {SEED_ENV})");
+            info!("start_mode {id:?}: seed {seed} (forced seed)");
             seed
         }
-        None => {
-            let seed = wall_clock_seed();
-            info!("start_mode {id:?}: seed {seed} (wall clock)");
-            seed
-        }
+        None => match env_seed() {
+            Some(seed) => {
+                info!("start_mode {id:?}: seed {seed} (from {SEED_ENV})");
+                seed
+            }
+            None => {
+                let seed = wall_clock_seed();
+                info!("start_mode {id:?}: seed {seed} (wall clock)");
+                seed
+            }
+        },
     };
     core.start_mode(seed, id);
     countdown.0 = modes::pre_roll_ticks(id);

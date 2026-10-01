@@ -13,6 +13,7 @@ mod audio;
 // bridge through these modules; widened from private to `pub` (crate is a
 // binary-only workspace member — nothing outside links it).
 pub mod core_bridge;
+mod daily;
 mod hud;
 mod input;
 mod juice;
