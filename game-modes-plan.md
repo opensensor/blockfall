@@ -752,9 +752,20 @@ T1 ──► T2 ──┬──────────────────�
   migrates and the title screen still shows the Marathon best.
 - **validation**: All of the above recorded in the plan log. No R2 task starts
   before this is green.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: R1 automated gate GREEN at commit e5c2411 (2026-10-01). `cargo test
+  --workspace` = 15/15 suites ok (0 failures), incl. `marathon_golden_snapshot_*`
+  canary (3 passed) proving Marathon unchanged through T2-T10, plus new
+  T10 `bot_modes.rs` headless gates (Sprint `mode_done time_ticks=522`, Dig on
+  pinned seeds {9,28,30,31,35,36}, Ultra cadence, abort path => `AppExit::error`).
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo fmt --all --check` clean. Legacy `best.json` migration + single-writer
+  pinned by T6/T9 tests. MANUAL (deferred to owner, cannot run headless here):
+  Android APK portrait touch check per R1 mode; Sprint/Ultra/Dig playtest to
+  tune `PRE_ROLL_TICKS`, 1800-tick decay consts; real-profile migration on device.
+  Known pre-existing flakes (not R1 regressions): `ultra_time_up` ~1-5% under
+  load; `real_gateway_host_registers_and_is_announced` under UDP contention.
+- **files edited/created**: (gate — no code; this plan entry only)
 
 ### T12: Core Survival garbage feed
 - **depends_on**: [T11]
