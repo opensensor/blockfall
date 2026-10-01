@@ -26,9 +26,21 @@ pub enum Goal {
     /// Reached when `lines_cleared >= n` at a lock (Sprint: `Lines(40)`).
     Lines(u32),
     /// Reached when [`crate::game::Game::garbage_rows_left`] hits 0 after a
-    /// lock (Dig). A game that starts with zero garbage rows satisfies this
-    /// on its first lock; modes using this goal must start with
-    /// [`StartBoard::BuriedGarbage`].
+    /// lock (Dig).
+    ///
+    /// Retire semantics: a settled row counts as a *garbage row* while it
+    /// contains at least one [`Piece::Garbage`] cell — a single garbage cell
+    /// on an otherwise empty row still counts. A garbage row retires the
+    /// moment a line clear removes it (any garbage cell in the row retires
+    /// the whole row, because clearing requires the row to complete), and
+    /// the surviving garbage rows shift down with the stack, still counted.
+    /// The goal is evaluated after this lock's line clear, so the winning
+    /// lock's event batch emits `LineCleared` before `GoalReached`.
+    ///
+    /// A game that starts with zero garbage rows satisfies this on its first
+    /// lock; modes using this goal must start with
+    /// [`StartBoard::BuriedGarbage`] (or an equivalent hand-made garbage
+    /// board).
     GarbageCleared,
 }
 

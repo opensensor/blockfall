@@ -1061,4 +1061,480 @@ mod tests {
         };
         assert_eq!(run(12345), run(12345));
     }
+
+    // ------------------------------------------------------------------
+    // T3: Dig goal mechanics
+    // ------------------------------------------------------------------
+
+    /// The locked-in Dig rule set (plan §T3): garbage-clears goal, fixed
+    /// level 1, buried 10-row start board.
+    fn dig_config() -> ModeConfig {
+        ModeConfig {
+            start_level: 1,
+            levels_advance: false,
+            goal: Some(Goal::GarbageCleared),
+            start_board: Some(crate::mode::StartBoard::BuriedGarbage { rows: 10 }),
+            ..ModeConfig::default()
+        }
+    }
+
+    /// Dig well columns. The scripted driver drops O pieces here; the dump
+    /// policy must keep every other cell out of these columns so each O
+    /// falls to the band bottom.
+    const DIG_WELL: [usize; 2] = [4, 5];
+    /// Dumps must never occupy rows `0..SPAWN_CLEAR_ROWS` (spawn/rotation/
+    /// move corridor for the next piece).
+    const SPAWN_CLEAR_ROWS: usize = 3;
+    /// Hard budget for the scripted Dig clear ("~2000 steps").
+    const DIG_ACTION_BUDGET: usize = 2000;
+
+    /// Hand-made Dig endgame: the bottom 10 rows are a full garbage band
+    /// except for the 2-wide well at columns 4-5, so
+    /// `garbage_rows_left() == 10` — the same starting metric as
+    /// `StartBoard::BuriedGarbage { rows: 10 }` — while remaining clearable
+    /// by the scripted driver below in five O drops.
+    ///
+    /// Why not drive a real `BuriedGarbage` board: with exactly one hole per
+    /// row (T2's generator), every row's hole is only reachable while that
+    /// row is the band top, and each vertical-I dig leaves a 3-cell debris
+    /// column directly above the new band top — permanently blocking that
+    /// column for all deeper digs. Clearing the ten rows therefore needs a
+    /// hole sequence with no column reuse *and* somewhere legal to place
+    /// the ~25 non-I pieces the 7-bag deals meanwhile (nowhere: every
+    /// column is a future descent column). Such boards are only winnable by
+    /// an active dig solver (T10's job), not by any simple scripted driver;
+    /// `dig_goal_dig_config_tops_out_before_garbage_cleared` below exercises
+    /// the real buried board's terminal path instead.
+    fn paired_buried_board() -> Board {
+        let mut b = Board::new();
+        for r in (ROWS - 10)..ROWS {
+            for c in 0..COLS {
+                if !DIG_WELL.contains(&c) {
+                    b.set(r, c, Some(Piece::Garbage));
+                }
+            }
+        }
+        b
+    }
+
+    /// Dig game: full Dig config, then the paired board installed (the
+    /// test-friendlier hand-made-board path).
+    fn dig_game(seed: u64) -> Game {
+        let mut g = Game::with_config(seed, &dig_config());
+        g.board = paired_buried_board();
+        assert_eq!(g.garbage_rows_left(), 10);
+        assert_eq!(g.finished_reason(), None);
+        g
+    }
+
+    /// Rotate the active piece to `target` with one rotation action
+    /// (0 = already there). False if the rotation did not land on target.
+    fn rotate_active_to(g: &mut Game, target: Rotation) -> bool {
+        let Some(active) = g.snapshot().active else {
+            return false;
+        };
+        match (target.index() + 4 - active.rot.index()) % 4 {
+            0 => {}
+            1 => {
+                g.apply(Action::RotateCw);
+            }
+            2 => {
+                g.apply(Action::Rotate180);
+            }
+            _ => {
+                g.apply(Action::RotateCcw);
+            }
+        }
+        g.snapshot().active.map(|a| a.rot) == Some(target)
+    }
+
+    /// Walk the active piece to box column `col` one move at a time.
+    fn move_active_to(g: &mut Game, col: i32) -> bool {
+        for _ in 0..2 * COLS + 2 {
+            let Some(active) = g.snapshot().active else {
+                return false;
+            };
+            if active.col == col {
+                return true;
+            }
+            g.apply(if active.col < col {
+                Action::MoveRight
+            } else {
+                Action::MoveLeft
+            });
+        }
+        g.snapshot().active.map(|a| a.col) == Some(col)
+    }
+
+    /// Absolute cells of `ps`, or `None` if any cell is off the board.
+    fn cells_abs(ps: &PieceState) -> Option<Vec<(i32, i32)>> {
+        ps.cells()
+            .iter()
+            .copied()
+            .map(|(r, c)| {
+                if r < 0 || r >= ROWS as i32 || c < 0 || c >= COLS as i32 {
+                    None
+                } else {
+                    Some((r, c))
+                }
+            })
+            .collect()
+    }
+
+    /// Dump placement for a non-dig piece: the ghost landing must stay out
+    /// of the well columns and at or below row `SPAWN_CLEAR_ROWS`, choosing
+    /// the placement that keeps the tallest involved column as low as
+    /// possible (towers must never grow into the spawn corridor). Ties
+    /// break on leftmost box column — fully deterministic.
+    fn dump_placement(board: &Board, piece: Piece) -> Option<(Rotation, i32)> {
+        let mut heights = [ROWS; COLS];
+        for r in 0..ROWS {
+            for (c, top) in heights.iter_mut().enumerate() {
+                if board.get(r, c).is_some() {
+                    *top = (*top).min(r);
+                }
+            }
+        }
+        let mut best: Option<(usize, i32, Rotation)> = None;
+        for rot in [Rotation::Spawn, Rotation::Cw, Rotation::R180, Rotation::Ccw] {
+            for boxcol in -3i32..(COLS as i32 + 2) {
+                let ps = PieceState {
+                    piece,
+                    rot,
+                    row: 0,
+                    col: boxcol,
+                };
+                if board.collides(&ps) {
+                    continue;
+                }
+                let ghost = board::ghost_row(board, &ps);
+                let landed = PieceState { row: ghost, ..ps };
+                let Some(cells) = cells_abs(&landed) else {
+                    continue;
+                };
+                if !cells.iter().all(|&(r, c)| {
+                    r as usize >= SPAWN_CLEAR_ROWS && !DIG_WELL.contains(&(c as usize))
+                }) {
+                    continue;
+                }
+                let mut hh = heights;
+                for &(r, c) in &cells {
+                    hh[c as usize] = hh[c as usize].min(r as usize);
+                }
+                let cand = (hh.iter().copied().min().unwrap_or(ROWS), boxcol, rot);
+                if best.is_none_or(|b| cand.0 > b.0 || (cand.0 == b.0 && cand.1 < b.1)) {
+                    best = Some(cand);
+                }
+            }
+        }
+        best.map(|(_, col, rot)| (rot, col))
+    }
+
+    struct DigRun {
+        goal_reached: bool,
+        steps: usize,
+        events: Vec<GameEvent>,
+        snaps: Vec<GameSnapshot>,
+    }
+
+    /// Scripted Dig driver using only the public `Game` API: drop every O
+    /// into the well (retiring the bottom two garbage rows per drop), dump
+    /// everything else with the balanced dump policy, tick twice per piece.
+    /// Terminates when the game freezes (goal or top-out) or the action
+    /// budget is exceeded (driver failure, not a rules failure).
+    fn drive_dig(g: &mut Game) -> DigRun {
+        let mut events = Vec::new();
+        let mut snaps = Vec::new();
+        let mut steps = 0usize;
+        loop {
+            snaps.push(g.snapshot());
+            if g.finished_reason().is_some() {
+                return DigRun {
+                    goal_reached: g.finished_reason() == Some(FinishReason::GoalReached),
+                    steps,
+                    events,
+                    snaps,
+                };
+            }
+            assert!(
+                steps < DIG_ACTION_BUDGET,
+                "dig driver exceeded the step budget"
+            );
+            let snap = g.snapshot();
+            let active = snap.active.expect("a live game has an active piece");
+            if active.piece == Piece::O {
+                assert!(
+                    move_active_to(g, DIG_WELL[0] as i32),
+                    "O must always be walkable to the well"
+                );
+                let before = g.garbage_rows_left();
+                events.extend(g.apply(Action::HardDrop));
+                steps += 1;
+                assert_eq!(
+                    g.garbage_rows_left() + 2,
+                    before,
+                    "each well drop must retire exactly two garbage rows (step {steps})"
+                );
+            } else {
+                let (rot, boxcol) = dump_placement(&snap.board, active.piece)
+                    .expect("a balanced dump placement must exist");
+                assert!(rotate_active_to(g, rot), "dump rotation must land");
+                assert!(move_active_to(g, boxcol), "dump walk must land");
+                events.extend(g.apply(Action::HardDrop));
+                steps += 1;
+            }
+            for _ in 0..2 {
+                events.extend(g.tick());
+                steps += 1;
+            }
+        }
+    }
+
+    /// T3 AC1: the scripted Dig clear fires `GoalReached` exactly once,
+    /// freezes the game, and reports `FinishReason::GoalReached`.
+    #[test]
+    fn dig_goal_scripted_clear_fires_once_and_freezes() {
+        let mut g = dig_game(1);
+        let run = drive_dig(&mut g);
+        assert!(run.goal_reached, "scripted Dig clear must reach the goal");
+        assert!(
+            run.steps < 200,
+            "the scripted clear must terminate quickly, took {} steps",
+            run.steps
+        );
+
+        let goals: Vec<u64> = run
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::GoalReached { tick } => Some(*tick),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goals.len(), 1, "exactly one GoalReached, got {goals:?}");
+        assert_eq!(goals[0], g.tick_count());
+        assert!(
+            goals[0] > 0,
+            "the tick clock advances during a scripted run"
+        );
+        assert!(
+            !run.events.contains(&GameEvent::GameOver),
+            "a completed Dig must not emit GameOver"
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|e| matches!(e, GameEvent::LevelUp { .. })),
+            "levels_advance=false must never emit LevelUp"
+        );
+        assert_eq!(g.finished_reason(), Some(FinishReason::GoalReached));
+        assert_eq!(g.garbage_rows_left(), 0);
+        let frozen = g.snapshot();
+        assert!(!frozen.game_over, "a goal finish is not a top-out");
+        assert!(frozen.active.is_none());
+        assert_eq!(frozen.level, 1);
+        assert_eq!(frozen.lines, 10, "the paired band is exactly 10 rows");
+
+        // Frozen: every later call is a silent no-op (like game-over).
+        for _ in 0..100 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+            assert!(g.apply(Action::MoveLeft).is_empty());
+            assert!(g.apply(Action::Hold).is_empty());
+        }
+        assert_eq!(g.tick_count(), goals[0], "the tick clock stops when frozen");
+        assert_eq!(g.snapshot(), frozen);
+    }
+
+    /// T3 AC2: a block-out under the Dig config (before the garbage is
+    /// cleared) ends the game as `TopOut` and `GoalReached` never appears.
+    #[test]
+    fn dig_goal_dig_config_tops_out_before_garbage_cleared() {
+        // Real buried start board, garbage fully intact.
+        let mut g = Game::with_config(5, &dig_config());
+        assert_eq!(g.garbage_rows_left(), 10);
+        // Blocking stack under the O spawn columns (rows 3..11, stopping
+        // above the buried band at row 12): the hard drop locks the O on
+        // rows 1-2 and the next spawn collides (same pattern as
+        // `blockout_spawns_gameover_then_no_ops`).
+        for r in 3..12 {
+            g.board.set(r, 4, Some(Piece::Z));
+            g.board.set(r, 5, Some(Piece::Z));
+        }
+        g.active = Some(spawn_state(Piece::O));
+        let ev = g.apply(Action::HardDrop);
+        assert!(
+            ev.contains(&GameEvent::GameOver),
+            "expected GameOver: {ev:?}"
+        );
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+        assert!(g.snapshot().game_over);
+        // The goal never fires on the top-out path, and the garbage is
+        // untouched.
+        let mut all = ev;
+        for _ in 0..50 {
+            all.extend(g.tick());
+            all.extend(g.apply(Action::HardDrop));
+        }
+        assert!(
+            !all.iter()
+                .any(|e| matches!(e, GameEvent::GoalReached { .. })),
+            "GoalReached must never appear after a Dig top-out"
+        );
+        assert_eq!(g.garbage_rows_left(), 10);
+        assert_eq!(g.finished_reason(), Some(FinishReason::TopOut));
+    }
+
+    /// T3 AC3: same seed + same scripted action log for a full Dig run gives
+    /// identical event streams and snapshots (and diverges across seeds).
+    #[test]
+    fn dig_goal_replay_is_deterministic() {
+        let run = |seed: u64| {
+            let mut g = dig_game(seed);
+            let r = drive_dig(&mut g);
+            (r.goal_reached, r.events, r.snaps, g.snapshot())
+        };
+        let (a_goal, a_events, a_snaps, a_final) = run(1);
+        let (b_goal, b_events, b_snaps, b_final) = run(1);
+        assert!(a_goal && b_goal);
+        assert_eq!(a_events, b_events, "replay event streams diverged");
+        assert_eq!(a_snaps, b_snaps, "replay snapshots diverged");
+        assert_eq!(
+            bincode::serialize(&a_final).unwrap(),
+            bincode::serialize(&b_final).unwrap()
+        );
+        // A different seed deals a different bag ⇒ the dig log diverges.
+        let (c_goal, c_events, _, c_final) = run(2);
+        assert!(c_goal, "seed 2 must also complete the scripted Dig");
+        assert_ne!(a_final.next, c_final.next, "different seeds must diverge");
+        assert_ne!(a_events, c_events);
+    }
+
+    /// T3 AC4: the goal is evaluated *after* this lock's line clear — the
+    /// final lock's event batch carries `LineCleared` strictly before
+    /// `GoalReached`, and `GoalReached` ends the batch.
+    #[test]
+    fn dig_goal_fires_after_line_clear_in_the_same_batch() {
+        let config = ModeConfig {
+            goal: Some(Goal::GarbageCleared),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(8, &config);
+        g.board = Board::new();
+        for r in 20..ROWS {
+            for c in 0..COLS {
+                if !DIG_WELL.contains(&c) {
+                    g.board.set(r, c, Some(Piece::Garbage));
+                }
+            }
+        }
+        assert_eq!(g.garbage_rows_left(), 2);
+        g.active = Some(spawn_state(Piece::O));
+        let ev = g.apply(Action::HardDrop);
+        let cleared = ev
+            .iter()
+            .position(|e| *e == GameEvent::LineCleared { lines: 2 })
+            .expect("the well drop clears two rows");
+        let goal = ev
+            .iter()
+            .position(|e| matches!(e, GameEvent::GoalReached { .. }))
+            .expect("clearing the last garbage rows reaches the goal");
+        assert!(
+            cleared < goal,
+            "LineCleared must precede GoalReached: {ev:?}"
+        );
+        assert_eq!(goal, ev.len() - 1, "GoalReached ends the batch: {ev:?}");
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, GameEvent::GoalReached { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(g.finished_reason(), Some(FinishReason::GoalReached));
+    }
+
+    /// T3: retire semantics — a row counts as garbage while it holds at
+    /// least one `Piece::Garbage` cell (a lone garbage cell on an otherwise
+    /// empty row counts); completing the line that contains it retires it,
+    /// and the surviving garbage rows shift down with the stack, still
+    /// counted.
+    #[test]
+    fn garbage_rows_retire_on_clear_and_shift_with_the_stack() {
+        let mut g = Game::new(9);
+        g.board = Board::new();
+        // Row 19: a lone garbage cell — a garbage row despite nine empties.
+        g.board.set(19, 3, Some(Piece::Garbage));
+        // Row 20: nine garbage cells with column 9 open. Row 21: nine plain
+        // Z cells (not garbage) with column 9 open.
+        for c in 0..COLS - 1 {
+            g.board.set(20, c, Some(Piece::Garbage));
+            g.board.set(21, c, Some(Piece::Z));
+        }
+        assert_eq!(g.garbage_rows_left(), 2);
+        // A vertical I in column 9 drops to the floor and completes rows
+        // 20-21 at once; the garbage row retires with its line clear.
+        g.active = Some(state(Piece::I, Rotation::Ccw, 0, 8));
+        let ev = g.apply(Action::HardDrop);
+        assert!(ev.contains(&GameEvent::LineCleared { lines: 2 }), "{ev:?}");
+        assert_eq!(g.garbage_rows_left(), 1);
+        // The lone garbage cell shifted down two rows with the stack and is
+        // still counted (row 19 -> row 21).
+        assert_eq!(g.board.get(21, 3), Some(Piece::Garbage));
+        assert_eq!(g.board.get(19, 3), None);
+        assert_eq!(g.garbage_rows_left(), 1);
+    }
+
+    /// T3: the Sprint config (`Goal::Lines(40)`, fixed level 1) needs no
+    /// further core work — the goal fires once at exactly 40 lines, with
+    /// level pinned at 1 and no `LevelUp`, and freezes the game.
+    #[test]
+    fn sprint_config_completes_at_40_lines_fixed_level() {
+        let config = ModeConfig {
+            start_level: 1,
+            levels_advance: false,
+            goal: Some(Goal::Lines(40)),
+            ..ModeConfig::default()
+        };
+        let mut g = Game::with_config(7, &config);
+        let mut events = Vec::new();
+        for i in 0..10 {
+            g.board = Board::new();
+            for r in 18..=21 {
+                for c in 0..COLS - 1 {
+                    g.board.set(r, c, Some(Piece::Z));
+                }
+            }
+            g.active = Some(state(Piece::I, Rotation::Cw, 0, 7));
+            events.extend(g.apply(Action::HardDrop));
+            let lines = g.snapshot().lines;
+            assert_eq!(lines, 4 * (i + 1));
+            let goals = events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::GoalReached { .. }))
+                .count();
+            if i < 9 {
+                assert_eq!(goals, 0, "goal fired early at {lines} lines");
+            }
+        }
+        assert_eq!(g.snapshot().lines, 40);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::GoalReached { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(g.finished_reason(), Some(FinishReason::GoalReached));
+        assert_eq!(g.snapshot().level, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::LevelUp { .. })),
+            "fixed-level Sprint must never emit LevelUp"
+        );
+        for _ in 0..50 {
+            assert!(g.tick().is_empty());
+            assert!(g.apply(Action::HardDrop).is_empty());
+        }
+    }
 }
