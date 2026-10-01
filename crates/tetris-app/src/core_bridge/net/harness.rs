@@ -53,11 +53,13 @@
 //! # CI E2E (this module's `tests`)
 //!
 //! Two `MinimalPlugins` apps, one process, real UDP loopback: host seat
-//! `Bot`, guest seat `Bot`, a full Garbage match to a crowned winner, with
+//! `Bot`, guest seat `Bot`, full matches of every shipped rule (Garbage,
+//! Dig Duel, Switch across a swap — T22) to a crowned winner, with
 //! per-60-tick snapshot-hash streams recorded *independently of the lockstep
 //! windows* (a `FixedUpdate` recorder running after both step systems) and
 //! asserted equal throughout, final snapshots equal, no `Desync`/`Lost`
-//! events, clean `net_stop` teardown. The fork test arms the hook on the
+//! events, clean `net_stop` teardown. The same rule matrix also runs over
+//! the **real gateway relay** (G5 + T22). The fork test arms the hook on the
 //! guest and asserts the equality check **fires** (`Desync` + freeze +
 //! unequal streams).
 //!
@@ -776,19 +778,46 @@ mod tests {
         assert_eq!(session_status(host), NetStatus::InMatch);
     }
 
-    /// The CI end-to-end test: a full Garbage match between two Bots across
-    /// two apps and a real netcode UDP link, to a crowned winner, with the
-    /// per-60-tick hash streams equal throughout and equal final snapshots.
-    #[test]
-    fn e2e_bot_vs_bot_garbage_match_over_udp() {
-        let (mut host, mut guest) = connect_pair(12.0);
+    /// Count rows containing garbage on one mirrored side (Dig buried-board
+    /// probe, same recipe as the versus HUD's `DUG n/10` meter).
+    fn buried_rows(game: &tetris_core::game::GameSnapshot) -> usize {
+        (0..tetris_core::board::ROWS)
+            .filter(|&r| {
+                (0..tetris_core::board::COLS)
+                    .any(|c| game.board.get(r, c) == Some(tetris_core::piece::Piece::Garbage))
+            })
+            .count()
+    }
 
-        let seed = 0xE2E5_E2E0_0000_0001;
-        let rule = AttackRule::Garbage;
-        let delay = 4;
+    /// Shared core of the direct-UDP crown E2Es (T22: parameterized over the
+    /// rule so Garbage, Dig and Switch all ride the exact same assertions):
+    /// host starts `rule` on a connected pair, both seats are Bots, the match
+    /// runs to a crowned winner while the independently recorded per-60-tick
+    /// hash streams stay equal, final snapshots equal, clean `net_stop`
+    /// teardown with the port released.
+    ///
+    /// * `on_mirror` runs once against the guest right after its mirror
+    ///   materializes from the wire `MatchStart` (before the guest's seat is
+    ///   armed) — the Dig variants probe the mirrored buried boards there.
+    /// * `min_boundary_tick`: keep driving the post-crown hash exchange until
+    ///   both peers have recorded a boundary at/after this lockstep tick —
+    ///   the Switch variants use it to force comparisons **past** a swap
+    ///   boundary, not just up to the third one.
+    /// * `on_crowned` runs against both peers after the streams and final
+    ///   snapshots have been asserted equal (per-rule crowning evidence).
+    fn run_pair_crown_match(
+        rule: AttackRule,
+        speed: f64,
+        seed: u64,
+        min_boundary_tick: u64,
+        on_mirror: impl FnOnce(&App),
+        on_crowned: impl FnOnce(&App, &App),
+    ) {
+        let (mut host, mut guest) = connect_pair(speed);
+
         // Host arms its local seat first: setup_net_mirror preserves it.
         host.world_mut().non_send_mut::<VersusMatch>().p1 = Controller::Bot;
-        start_net_match_live(&mut host, rule, seed, delay);
+        start_net_match_live(&mut host, rule, seed, 4);
 
         // The guest mirror must materialize purely from the wire MatchStart.
         drive_until(
@@ -801,6 +830,7 @@ mod tests {
                     && g.world().non_send::<VersusMatch>().active
             },
         );
+        on_mirror(&guest);
         guest.world_mut().non_send_mut::<VersusMatch>().p2 = Controller::Bot;
 
         assert_eq!(
@@ -827,10 +857,10 @@ mod tests {
         );
         assert!(
             saw_desync.is_empty(),
-            "a clean match must never desync: {saw_desync:?}"
+            "a clean {rule:?} match must never desync: {saw_desync:?}"
         );
 
-        // Lockstep ran for real, and the loser really topped out.
+        // Lockstep ran for real.
         assert!(
             lockstep_tick(&host) > 120 && lockstep_tick(&guest) > 120,
             "match too short: host tick {}, guest tick {}",
@@ -839,22 +869,27 @@ mod tests {
         );
         let (hw, gw) = (crowned(&host), crowned(&guest));
         assert_eq!(hw, gw, "both peers must crown the same winner");
-        let dead = match hw {
-            Some(Side::Left) => versus_snapshot(&guest).right.game_over,
-            _ => versus_snapshot(&guest).left.game_over,
-        };
-        assert!(dead, "the loser's board is topped out");
 
         // Keep driving until both peers have recorded several hash
         // boundaries (the mirrors tick at equal rates, so the guest keeps a
         // constant lag instead of catching up — compare on the common
-        // prefix).
+        // prefix), and — for the Switch variants — until at least one
+        // compared boundary lands at/after `min_boundary_tick`.
         drive_until(
             &mut host,
             &mut guest,
             Duration::from_secs(30),
-            "hash streams >= 3 on both peers",
-            |h, g| stream(h).len() >= 3 && stream(g).len() >= 3,
+            "hash streams >= 3 with a late boundary on both peers",
+            |h, g| {
+                stream(h).len() >= 3
+                    && stream(g).len() >= 3
+                    && stream(h)
+                        .last()
+                        .is_some_and(|(t, _)| *t >= min_boundary_tick)
+                    && stream(g)
+                        .last()
+                        .is_some_and(|(t, _)| *t >= min_boundary_tick)
+            },
         );
         let (mut hs, gs) = (stream(&host), stream(&guest));
         let common = hs.len().min(gs.len());
@@ -866,18 +901,20 @@ mod tests {
         );
         assert_eq!(
             hs, common,
-            "per-{}-tick SnapshotHash streams diverged",
+            "per-{}-tick SnapshotHash streams diverged ({rule:?})",
             HASH_CHECK_PERIOD
         );
         assert_eq!(
             versus_snapshot(&host),
             versus_snapshot(&guest),
-            "final snapshots must be equal"
+            "final snapshots must be equal ({rule:?})"
         );
         assert_eq!(
             protocol::snapshot_hash(&versus_snapshot(&host)),
             protocol::snapshot_hash(&versus_snapshot(&guest)),
         );
+
+        on_crowned(&host, &guest);
 
         // Clean shutdown on both peers: Idle, no transport resources, port
         // released (a fresh socket can take it).
@@ -898,6 +935,146 @@ mod tests {
                 "net_stop must free the bound port {port}"
             );
         }
+    }
+
+    /// Assert the crowned winner's opponent actually topped out (the crowning
+    /// shape of the garbage-attack rules — Garbage, Race's early finish,
+    /// Switch).
+    fn assert_loser_dead(guest: &App, winner: Option<Side>) {
+        let snapshot = guest.world().non_send::<VersusMatch>().match_.snapshot();
+        let dead = match winner {
+            Some(Side::Left) => snapshot.right.game_over,
+            _ => snapshot.left.game_over,
+        };
+        assert!(dead, "the loser's board is topped out");
+    }
+
+    /// The CI end-to-end test: a full Garbage match between two Bots across
+    /// two apps and a real netcode UDP link, to a crowned winner, with the
+    /// per-60-tick hash streams equal throughout and equal final snapshots.
+    #[test]
+    fn e2e_bot_vs_bot_garbage_match_over_udp() {
+        run_pair_crown_match(
+            AttackRule::Garbage,
+            12.0,
+            0xE2E5_E2E0_0000_0001,
+            0,
+            |_| {},
+            |h, g| {
+                assert_loser_dead(g, crowned(h));
+            },
+        );
+    }
+
+    /// T22: an online Dig Duel across the same real UDP pair. The guest
+    /// mirror must carry the shared buried boards (identical garbage mask on
+    /// both sides straight off the wire `MatchStart`), the match crowns, and
+    /// every snapshot hash agrees.
+    #[test]
+    fn e2e_bot_vs_bot_dig_match_over_udp() {
+        run_pair_crown_match(
+            AttackRule::Dig,
+            12.0,
+            0xE2E5_E2E0_0000_00D1,
+            0,
+            |guest| {
+                // Fresh mirror, seats still unarmed and the bots unplayed:
+                // both sides still hold the exact seeded start boards.
+                let snapshot = guest.world().non_send::<VersusMatch>().match_.snapshot();
+                assert_eq!(
+                    snapshot.rule,
+                    AttackRule::Dig,
+                    "guest mirrored the Dig rule"
+                );
+                assert!(
+                    lockstep_tick(guest) < 30,
+                    "mirror probe must land pre-lock: tick {}",
+                    lockstep_tick(guest)
+                );
+                assert_eq!(
+                    buried_rows(&snapshot.left),
+                    tetris_core::versus::DIG_DUEL_GARBAGE_ROWS,
+                    "left side must carry the full 10-row buried board"
+                );
+                assert_eq!(
+                    buried_rows(&snapshot.right),
+                    tetris_core::versus::DIG_DUEL_GARBAGE_ROWS,
+                    "right side must carry the same 10-row buried board"
+                );
+                // Identical boards, not just identical counts: same holes in
+                // the same cells on both sides (shared side seed, T20).
+                for r in 0..tetris_core::board::ROWS {
+                    for c in 0..tetris_core::board::COLS {
+                        assert_eq!(
+                            snapshot.left.board.get(r, c).map(is_garbage),
+                            snapshot.right.board.get(r, c).map(is_garbage),
+                            "buried-board garbage mask diverges at ({r},{c})"
+                        );
+                    }
+                }
+            },
+            |h, g| {
+                let winner = crowned(h);
+                let snapshot = g.world().non_send::<VersusMatch>().match_.snapshot();
+                let winner_buried = match winner {
+                    Some(Side::Left) => buried_rows(&snapshot.left),
+                    _ => buried_rows(&snapshot.right),
+                };
+                let loser_dead = match winner {
+                    Some(Side::Left) => snapshot.right.game_over,
+                    _ => snapshot.left.game_over,
+                };
+                // Dig Duel crowns: the winner either finished digging (0
+                // buried rows left) or the loser topped out (T20 rule set).
+                assert!(
+                    winner_buried == 0 || loser_dead,
+                    "Dig crown without a cleared board or a top-out: winner buried {winner_buried}, loser dead {loser_dead}"
+                );
+            },
+        );
+    }
+
+    fn is_garbage(piece: tetris_core::piece::Piece) -> bool {
+        piece == tetris_core::piece::Piece::Garbage
+    }
+
+    /// T22 (the critical one): an online Switch match whose swap interval is
+    /// shortened so at least one full-state swap lands mid-match — the
+    /// per-60-tick hash streams must agree THROUGH the swap boundary (this
+    /// doubles as the headless swap input-freeze probe: the bots keep
+    /// firing inputs around the boundary ticks, and a single mismatch or
+    /// desync across it would fail the run).
+    #[test]
+    fn e2e_bot_vs_bot_switch_match_over_udp_crossing_a_swap() {
+        let interval = 240;
+        run_pair_crown_match(
+            AttackRule::Switch {
+                swap_interval_ticks: interval,
+                warning_ticks: 60,
+            },
+            12.0,
+            0xE2E5_E2E0_0000_0507,
+            u64::from(interval),
+            |_| {},
+            |h, g| {
+                let snapshot = versus_snapshot(h);
+                assert_eq!(
+                    snapshot.swaps_done,
+                    g.world()
+                        .non_send::<VersusMatch>()
+                        .match_
+                        .snapshot()
+                        .swaps_done
+                );
+                assert!(
+                    snapshot.swaps_done >= 1,
+                    "the Switch e2e must cross a swap boundary: match_ticks {}, swaps_done {}",
+                    snapshot.match_ticks,
+                    snapshot.swaps_done,
+                );
+                assert_loser_dead(g, crowned(h));
+            },
+        );
     }
 
     /// Non-vacuity proof for the E2E: with one off-wire action injected into
@@ -1195,11 +1372,20 @@ mod tests {
             .collect()
     }
 
-    /// The crown test: two bots play a full Garbage match with every packet
-    /// relayed by the real gateway, and the per-60-tick SnapshotHash streams
-    /// stay equal throughout — plus the `*D`-on-stop lifecycle at teardown.
-    #[test]
-    fn e2e_bot_vs_bot_garbage_match_through_gateway_relay() {
+    /// The crown test shared by the gateway relay E2Es (T22: rule-
+    /// parameterized so Garbage, Dig and Switch all ride the identical
+    /// flow): two bots play a full `rule` match with every packet relayed by
+    /// the real gateway, the per-60-tick SnapshotHash streams stay equal
+    /// throughout, the v0.3.1 non-vacuity tallies pin an active guest, and
+    /// the `*D`-on-stop lifecycle closes the room. `min_boundary_tick`
+    /// forces the compared stream window past the Switch rule's swap
+    /// boundary; `on_crowned` carries the per-rule crowning evidence.
+    fn relay_crown_match(
+        rule: AttackRule,
+        seed: u64,
+        min_boundary_tick: u64,
+        on_crowned: impl FnOnce(&App, &App),
+    ) {
         use crate::core_bridge::net::gateway::testutil::{
             raw_socket, recv_frame, spawn_real_gateway,
         };
@@ -1310,10 +1496,9 @@ mod tests {
         drain_events(&mut host);
         drain_events(&mut guest);
 
-        // Full Garbage match, bot-vs-bot — identical assertions to the
-        // direct-UDP crown test, with the relay as the only path.
-        let seed = 0xE2E5_E2E0_0000_00A5;
-        let rule = AttackRule::Garbage;
+        // Full match, bot-vs-bot — identical assertions to the direct-UDP
+        // crown test, with the relay as the only path. `rule`/`seed` are the
+        // T22 parameters.
         // At 4x, one sim tick = 4.17 ms real, so D = 20 covers ~83 ms real:
         // ample for the two 10 ms relay hops, yet assertive — a regression
         // toward the v0.3.1 100 ms poll starts clipping it. A late drop here
@@ -1365,23 +1550,31 @@ mod tests {
             lockstep_tick(&host),
             lockstep_tick(&guest),
         );
-        let (hw, gw) = (crowned(&host), crowned(&guest));
-        assert_eq!(hw, gw, "both relayed peers must crown the same winner");
-        let dead = match hw {
-            Some(Side::Left) => versus_snapshot(&guest).right.game_over,
-            _ => versus_snapshot(&guest).left.game_over,
-        };
-        assert!(dead, "the loser's board is topped out");
+        let (h_win, g_win) = (crowned(&host), crowned(&guest));
+        assert_eq!(
+            h_win, g_win,
+            "both relayed peers must crown the same winner"
+        );
 
         // Per-60-tick hash streams equal on their whole common prefix (>= 3
-        // boundaries), and the final snapshots match — same quantities the
-        // wire desync check exchanges.
+        // boundaries, and — for the Switch variants — at least one boundary
+        // at/after `min_boundary_tick`, i.e. THROUGH a swap), and the final
+        // snapshots match — same quantities the wire desync check exchanges.
         drive_until(
             &mut host,
             &mut guest,
             Duration::from_secs(30),
-            "hash streams >= 3 on both peers",
-            |h, g| stream(h).len() >= 3 && stream(g).len() >= 3,
+            "hash streams >= 3 with a late boundary on both peers (via relay)",
+            |h, g| {
+                stream(h).len() >= 3
+                    && stream(g).len() >= 3
+                    && stream(h)
+                        .last()
+                        .is_some_and(|(t, _)| *t >= min_boundary_tick)
+                    && stream(g)
+                        .last()
+                        .is_some_and(|(t, _)| *t >= min_boundary_tick)
+            },
         );
         let (mut hs, gs) = (stream(&host), stream(&guest));
         let common = hs.len().min(gs.len());
@@ -1393,7 +1586,7 @@ mod tests {
         );
         assert_eq!(
             hs, common,
-            "per-{}-tick SnapshotHash streams diverged over the relay",
+            "per-{}-tick SnapshotHash streams diverged over the relay ({rule:?})",
             HASH_CHECK_PERIOD
         );
         assert_eq!(
@@ -1401,6 +1594,8 @@ mod tests {
             versus_snapshot(&guest),
             "final snapshots must be equal over the relay"
         );
+
+        on_crowned(&host, &guest);
 
         // Non-vacuity (v0.3.1 field fix): hash-stream equality alone is
         // satisfied by a match where every guest input arrived late — the
@@ -1448,6 +1643,66 @@ mod tests {
         assert!(
             released,
             "net_stop must release the room (*D): lookups kept answering, or the room outlived its *D window"
+        );
+    }
+
+    /// The Garbage crown test over the real relay (unchanged premise: two
+    /// bots, every packet relayed, equal hash streams, loser topped out).
+    #[test]
+    fn e2e_bot_vs_bot_garbage_match_through_gateway_relay() {
+        relay_crown_match(AttackRule::Garbage, 0xE2E5_E2E0_0000_00A5, 0, |h, g| {
+            assert_loser_dead(g, crowned(h))
+        });
+    }
+
+    /// T22: the Dig Duel crown over the real relay (the same full
+    /// control-handshake + punch + virtual-port path as Garbage — only the
+    /// rule differs).
+    #[test]
+    fn e2e_bot_vs_bot_dig_match_through_gateway_relay() {
+        relay_crown_match(AttackRule::Dig, 0xE2E5_E2E0_0000_0D1A, 0, |h, g| {
+            let winner = crowned(h);
+            let snapshot = versus_snapshot(g);
+            let winner_buried = match winner {
+                Some(Side::Left) => buried_rows(&snapshot.left),
+                _ => buried_rows(&snapshot.right),
+            };
+            let loser_dead = match winner {
+                Some(Side::Left) => snapshot.right.game_over,
+                _ => snapshot.left.game_over,
+            };
+            assert!(
+                winner_buried == 0 || loser_dead,
+                "relayed Dig crown without a cleared board or a top-out: winner buried {winner_buried}, loser dead {loser_dead}"
+            );
+        });
+    }
+
+    /// T22: Switch over the real relay with a shortened swap interval — the
+    /// compared hash window is forced past the first swap boundary, so the
+    /// swapped state must agree through the relay exactly like every other
+    /// tick.
+    #[test]
+    fn e2e_bot_vs_bot_switch_match_through_gateway_relay() {
+        let interval = 240;
+        relay_crown_match(
+            AttackRule::Switch {
+                swap_interval_ticks: interval,
+                warning_ticks: 60,
+            },
+            0xE2E5_E2E0_0000_5A7C,
+            u64::from(interval),
+            |h, g| {
+                let snapshot = versus_snapshot(g);
+                assert!(
+                    snapshot.swaps_done >= 1,
+                    "the relayed Switch e2e must cross a swap boundary: match_ticks {}, swaps_done {}",
+                    snapshot.match_ticks,
+                    snapshot.swaps_done,
+                );
+                assert_eq!(snapshot.swaps_done, versus_snapshot(h).swaps_done);
+                assert_loser_dead(g, crowned(h));
+            },
         );
     }
 
@@ -1588,33 +1843,42 @@ mod tests {
     }
 
     // =========================================================================
-    // N7 — 20-match netplay soak (netplay-plan.md N7a).
+    // N7 — per-rule netplay soak (netplay-plan.md N7a, T22 four-rule
+    // extension for the Release 3 PRD gate).
     //
     // Chains [`SOAK_MATCHES`] matches over **one** connected pair on real
-    // UDP loopback: alternating Garbage / Race-to-40, a wide seed sweep,
-    // and rematches flowing through the wire `MatchStart` (N4's production
-    // rematch path — no CI test exercised it before this; the desktop
-    // harness's single rematch was the only live coverage). Per match the
-    // independently recorded per-60-tick hash streams are compared on
-    // every shared tick label (the same quantities the wire desync check
-    // exchanges), the final snapshots are compared, every drained
-    // `NetEvent` must be benign, and the host mirror's `GarbageSent`/
-    // `GarbageReceived` stream is tallied as load evidence for the
-    // `MAX_GARBAGE_PER_LAND` churn dimension.
+    // UDP loopback: 20 matches for EACH rule (Garbage, Race-to-40, Dig
+    // Duel, Switch), rotating per match, a wide seed sweep, and rematches
+    // flowing through the wire `MatchStart` (N4's production rematch path —
+    // no CI test exercised it before this; the desktop harness's single
+    // rematch was the only live coverage). Per match the independently
+    // recorded per-60-tick hash streams are compared on every shared tick
+    // label (the same quantities the wire desync check exchanges), the final
+    // snapshots are compared, every drained `NetEvent` must be benign, and
+    // the host mirror's `GarbageSent`/`GarbageReceived` stream is tallied as
+    // load evidence for the `MAX_GARBAGE_PER_LAND` churn dimension.
     //
-    // The Garbage matches carry the garbage-storm churn; the Race matches
-    // run to 40 lines — many thousands of lockstep ticks — which is the
-    // very-long / sustained-load dimension. (The Race rule is garbage-free
-    // by construction: versus.rs `settle` only lands garbage when
-    // `rule == AttackRule::Garbage`, so "churn" and "Race-to-40" are
-    // deliberately separate match shapes, both inside the 20.)
+    // Match-shape coverage: Garbage carries the garbage-storm churn, Race
+    // runs to 40 lines — many thousands of lockstep ticks — the very-long /
+    // sustained-load dimension; Dig exercises the shared buried start
+    // boards (seed-derived on both peers); Switch exercises the full-state
+    // swap boundaries. The Switch matches run with a **soak-shortened**
+    // swap interval (`SOAK_SWITCH_SWAP_INTERVAL_TICKS`, not the shipped
+    // 1 800-tick default) so every Switch match crosses at least one —
+    // usually several — swap boundaries with live inputs landing around
+    // them; the per-match assertion `swaps_done >= 1` makes that a gate.
+    // Zero snapshot-hash mismatches across the whole run is the PRD gate.
     //
     // `#[ignore]`d for the nightly job like `crates/tetris-core/tests/soak.rs`:
     // `cargo test -p tetris-app --release -- net::harness --ignored`.
     // =========================================================================
 
-    /// Matches the soak chains through one connection.
-    const SOAK_MATCHES: usize = 20;
+    /// Matches per rule: the PRD prefers a 20-match soak per rule, so the
+    /// chain runs `4 × SOAK_MATCHES_PER_RULE` matches in rule rotation.
+    const SOAK_MATCHES_PER_RULE: usize = 20;
+
+    /// Total matches the soak chains through one connection.
+    const SOAK_MATCHES: usize = SOAK_MATCHES_PER_RULE * 4;
 
     /// Input delay for every soak match (mid of the negotiated range).
     const SOAK_DELAY: u8 = 4;
@@ -1624,19 +1888,37 @@ mod tests {
     /// [`peer_app`].
     const SOAK_SPEED: f64 = 24.0;
 
+    /// Soak-only Switch swap interval (5 scripted locks at
+    /// [`SOAK_LOCK_COOLDOWN`] cadence). The production default stays
+    /// [`crate::screens_menu::SWITCH_SWAP_INTERVAL_TICKS`] = 1 800; the
+    /// interval is part of the wire `Switch` payload, so shortening it here
+    /// still swaps through the exact production `advance_match_clock` path —
+    /// it only makes every match cross ≥1 boundary inside soak time.
+    const SOAK_SWITCH_SWAP_INTERVAL_TICKS: u32 = 300;
+
+    /// Soak-only Switch warning lead (1 s), same shortening rationale.
+    const SOAK_SWITCH_WARNING_TICKS: u32 = 60;
+
     /// Host: a live match without crowning for this long fails the soak
     /// (generous: the 40-line Races run many thousands of ticks).
     const SOAK_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-    /// Match `i`'s rule: even = Garbage (garbage-storm churn), odd = Race
-    /// to 40 (the very long run).
+    /// Match `i`'s rule: `i % 4` rotation over all four shipped rules —
+    /// Garbage (garbage-storm churn), Race to 40 (the very long run), Dig
+    /// (shared buried boards, crown-on-clear/top-out), Switch (garbage plus
+    /// periodic full-state swap; interval shortened for soak coverage —
+    /// see [`SOAK_SWITCH_SWAP_INTERVAL_TICKS`]).
     fn soak_rule(i: usize) -> AttackRule {
-        if i.is_multiple_of(2) {
-            AttackRule::Garbage
-        } else {
-            AttackRule::Race {
+        match i % 4 {
+            0 => AttackRule::Garbage,
+            1 => AttackRule::Race {
                 target_lines: DEFAULT_RACE_LINES,
-            }
+            },
+            2 => AttackRule::Dig,
+            _ => AttackRule::Switch {
+                swap_interval_ticks: SOAK_SWITCH_SWAP_INTERVAL_TICKS,
+                warning_ticks: SOAK_SWITCH_WARNING_TICKS,
+            },
         }
     }
 
@@ -1796,18 +2078,40 @@ mod tests {
                     snapshot.finished
                 );
             }
-            // T19 placeholder: Dig/Switch have no win condition yet
-            // (behavior lands in T20/T21), so under the no-attack scaffold
-            // the only path to a crown is a top-out — the loser is dead.
-            // The soak itself only cycles Garbage/Race (see `soak_rule`).
-            AttackRule::Dig | AttackRule::Switch { .. } => {
+            // T20: Dig Duel crowns either on the first side whose buried
+            // board is fully dug (0 rows with garbage left) or on a top-out.
+            AttackRule::Dig => {
+                let dead = match winner {
+                    Some(Side::Left) => snapshot.right.game_over,
+                    _ => snapshot.left.game_over,
+                };
+                let winner_buried = match winner {
+                    Some(Side::Left) => buried_rows(&snapshot.left),
+                    _ => buried_rows(&snapshot.right),
+                };
+                assert!(
+                    dead || winner_buried == 0,
+                    "soak match {index}: Dig crowned with no cleared board and a live loser: winner buried {winner_buried}, loser dead {dead}"
+                );
+            }
+            // T21/T22: Switch crowns on a top-out (garbage attacks as usual)
+            // and the shortened soak interval must have put at least one
+            // full-state swap behind the final snapshot — the hash streams
+            // above compared the swapped state on every shared boundary.
+            AttackRule::Switch { .. } => {
                 let dead = match winner {
                     Some(Side::Left) => snapshot.right.game_over,
                     _ => snapshot.left.game_over,
                 };
                 assert!(
                     dead,
-                    "soak match {index}: {rule:?} placeholder crowned without a topped-out loser"
+                    "soak match {index}: Switch winner without a topped-out loser"
+                );
+                assert!(
+                    snapshot.swaps_done >= 1,
+                    "soak match {index}: Switch match never crossed a swap boundary (match_ticks {}, interval {})",
+                    snapshot.match_ticks,
+                    SOAK_SWITCH_SWAP_INTERVAL_TICKS,
                 );
             }
         }
@@ -1965,8 +2269,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "20-match netplay soak (netplay-plan.md N7); run: cargo test -p tetris-app --release -- net::harness --ignored"]
-    fn netplay_soak_20_matches() {
+    #[ignore = "per-rule netplay soak: 20 matches x 4 rules (netplay-plan.md N7 + T22); run: cargo test -p tetris-app --release -- net::harness --ignored"]
+    fn netplay_soak_20_matches_per_rule() {
         let (mut host, mut guest) = connect_pair(SOAK_SPEED);
         arm_soak_player(&mut host);
         arm_soak_player(&mut guest);
@@ -2008,8 +2312,23 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.rule, AttackRule::Race { .. }));
         let longest_race = race.map(|r| r.ticks).max().unwrap_or(0);
+        for (label, idx) in [("Garbage", 0usize), ("Race", 1), ("Dig", 2), ("Switch", 3)] {
+            let want = soak_rule(idx);
+            let group = results.iter().filter(|r| r.rule == want);
+            let count = group.clone().count();
+            let ticks: u64 = group.clone().map(|r| r.ticks).sum();
+            let boundaries: usize = group.clone().map(|r| r.shared_boundaries).sum();
+            let wall: Duration = group.map(|r| r.wall).sum();
+            println!(
+                "SOAK rule {label}: matches={count} ticks={ticks} hash-boundaries={boundaries} wall={wall:?}"
+            );
+            assert_eq!(
+                count, SOAK_MATCHES_PER_RULE,
+                "soak covered {label} only {count} times (PRD gate: {SOAK_MATCHES_PER_RULE})"
+            );
+        }
         println!(
-            "SOAK summary: {} matches, ticks={total_ticks}, hash boundaries compared={total_boundaries}, \
+            "SOAK summary: {} matches (20 x 4 rules), ticks={total_ticks}, hash boundaries compared={total_boundaries}, \
              garbage sent={sent} landed={landed} in {landed_events} landings, MAX_GARBAGE_PER_LAND cap hits={cap_hits}, \
              longest Race={longest_race} ticks",
             results.len(),
@@ -2019,7 +2338,7 @@ mod tests {
             cap_hits = churn.cap_hits,
         );
         assert!(
-            total_boundaries >= 40,
+            total_boundaries >= 80,
             "soak compared too few hash boundaries to count: {total_boundaries}"
         );
         assert!(

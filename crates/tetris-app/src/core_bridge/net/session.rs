@@ -1346,8 +1346,10 @@ mod tests {
         });
     }
 
-    #[test]
-    fn version_mismatch_kicks_through_the_host_system() {
+    /// Shared seam of the version-skew tests: a client that sends
+    /// [`NetMsg::Hello`] with `version` must be kicked — the host emits
+    /// [`NetEvent::VersionMismatch`] and stays `Listening`.
+    fn assert_kicks_wrong_version(version: &str) {
         // Single app, renet's local-client seam (no UDP): a connection
         // that sends a wrong-version Hello must produce VersionMismatch,
         // kick the peer, and leave the host Listening.
@@ -1363,7 +1365,7 @@ mod tests {
         local.send_message(
             DefaultChannel::ReliableOrdered,
             protocol::encode(&NetMsg::Hello {
-                version: "bogus-version".to_string(),
+                version: version.to_string(),
                 delay: 8,
             }),
         );
@@ -1387,13 +1389,32 @@ mod tests {
         }
         assert!(
             saw_mismatch,
-            "host must emit VersionMismatch for a bad Hello"
+            "host must emit VersionMismatch for a bad Hello ({version:?})"
         );
         assert_eq!(
             app.world().resource::<NetSession>().status,
             NetStatus::Listening,
             "kicked host keeps listening"
         );
+    }
+
+    #[test]
+    fn version_mismatch_kicks_through_the_host_system() {
+        assert_kicks_wrong_version("bogus-version");
+    }
+
+    /// T22 version-skew handshake: an old **0.1.0** build (pre-T19 wire)
+    /// hitting the 0.2.0 host is refused at the handshake — not a
+    /// structurally-malformed Hello, but the exact historical skew the
+    /// PROTOCOL_VERSION bump exists for (mixed desktop/Android builds).
+    #[test]
+    fn old_0_1_0_build_is_refused_by_the_0_2_0_host() {
+        assert_ne!(
+            protocol::PROTOCOL_VERSION,
+            "0.1.0",
+            "the current wire moved past 0.1.0 (T19 bump)"
+        );
+        assert_kicks_wrong_version("0.1.0");
     }
 
     // ---- In-process two-`App` loopback integration (real netcode UDP) ----

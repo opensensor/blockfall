@@ -77,7 +77,10 @@ use super::session::{
 };
 use super::upnp::{mapping_held, start_mapping, teardown_mapping, UpnpPlugin, UpnpState};
 use crate::core_bridge::{start_net_match, VersusMatch};
-use crate::screens_menu::{VersusFlow, VersusMenuButton, VersusRematchButton, VersusStage};
+use crate::screens_menu::{
+    VersusFlow, VersusMenuButton, VersusRematchButton, VersusStage, SWITCH_SWAP_INTERVAL_TICKS,
+    SWITCH_WARNING_TICKS,
+};
 use crate::settings_persist::NetProfile;
 use crate::state::{AppState, RebindingCapture};
 
@@ -707,6 +710,8 @@ struct ClickFlags {
     back: bool,
     garbage: bool,
     race: bool,
+    dig: bool,
+    switch: bool,
     submit: bool,
     mode: bool,
     error_back: bool,
@@ -748,6 +753,12 @@ pub struct OnlineRuleGarbageButton;
 /// Host rule pick "Race" (acts only on `Ready`).
 #[derive(Component)]
 pub struct OnlineRuleRaceButton;
+/// Host rule pick "Dig" Duel (T22; acts only on `Ready`).
+#[derive(Component)]
+pub struct OnlineRuleDigButton;
+/// Host rule pick "Switch" (T22; acts only on `Ready`).
+#[derive(Component)]
+pub struct OnlineRuleSwitchButton;
 /// Join panel submit button (Enter also submits).
 #[derive(Component)]
 pub struct OnlineSubmitButton;
@@ -1165,6 +1176,9 @@ pub fn online_click_system(world: &mut World) {
     // latch — exclusive world queries have no `Changed` ticks).
     let mut fresh: Vec<ClickFlags> = Vec::new();
     {
+        // (the rule markers ride one nested tuple: bevy 0.19 caps tuple
+        // `QueryData` at 15 elements and this query is one past that budget
+        // with the T22 Dig/Switch buttons).
         let mut query = world.query::<(
             Entity,
             &Interaction,
@@ -1172,8 +1186,6 @@ pub fn online_click_system(world: &mut World) {
             Has<OnlineHostButton>,
             Has<OnlineJoinButton>,
             Has<OnlineBackButton>,
-            Has<OnlineRuleGarbageButton>,
-            Has<OnlineRuleRaceButton>,
             Has<OnlineSubmitButton>,
             Has<JoinModeButton>,
             Has<NetErrorBackButton>,
@@ -1181,6 +1193,12 @@ pub fn online_click_system(world: &mut World) {
             Has<LeaveNoButton>,
             Has<VersusRematchButton>,
             Has<VersusMenuButton>,
+            (
+                Has<OnlineRuleGarbageButton>,
+                Has<OnlineRuleRaceButton>,
+                Has<OnlineRuleDigButton>,
+                Has<OnlineRuleSwitchButton>,
+            ),
         )>();
         let mut currently_pressed = Vec::new();
         for (
@@ -1190,8 +1208,6 @@ pub fn online_click_system(world: &mut World) {
             host,
             join,
             back,
-            garbage,
-            race,
             submit,
             mode,
             error_back,
@@ -1199,6 +1215,7 @@ pub fn online_click_system(world: &mut World) {
             no,
             rematch,
             menu,
+            (garbage, race, dig, switch),
         ) in query.iter(world)
         {
             if *interaction != Interaction::Pressed {
@@ -1211,6 +1228,8 @@ pub fn online_click_system(world: &mut World) {
                 || back
                 || garbage
                 || race
+                || dig
+                || switch
                 || submit
                 || mode
                 || error_back
@@ -1227,6 +1246,8 @@ pub fn online_click_system(world: &mut World) {
                     back,
                     garbage,
                     race,
+                    dig,
+                    switch,
                     submit,
                     mode,
                     error_back,
@@ -1343,6 +1364,16 @@ pub fn online_click_system(world: &mut World) {
                 world,
                 AttackRule::Race {
                     target_lines: DEFAULT_RACE_LINES,
+                },
+            );
+        } else if flags.dig {
+            host_start(world, AttackRule::Dig);
+        } else if flags.switch {
+            host_start(
+                world,
+                AttackRule::Switch {
+                    swap_interval_ticks: SWITCH_SWAP_INTERVAL_TICKS,
+                    warning_ticks: SWITCH_WARNING_TICKS,
                 },
             );
         } else if flags.submit {
@@ -1708,6 +1739,11 @@ fn build_online_ui(mut commands: Commands) {
             ));
             online_button(root, "Garbage", OnlineRuleGarbageButton);
             online_button(root, "Race", OnlineRuleRaceButton);
+            // T22: Dig Duel + Switch. All four rules ride the panel's
+            // existing full-screen flex column (percent-sized, no absolute
+            // coordinates) — portrait-safe stacking.
+            online_button(root, "Dig", OnlineRuleDigButton);
+            online_button(root, "Switch", OnlineRuleSwitchButton);
             online_button(root, "Back", OnlineBackButton);
         },
     );
@@ -2620,6 +2656,124 @@ mod tests {
         );
         assert_eq!(app_state(&app), AppState::Playing, "match takes the screen");
         assert_eq!(vis_of::<OnlineHostRoot>(&mut app), Visibility::Hidden);
+    }
+
+    /// T22: the host rule picker offers all four rules — Garbage, Race, Dig
+    /// and Switch — each starting the mirror with exactly the rule that then
+    /// travels on `MatchStart` (the guest mirroring is pinned by the wire
+    /// e2e suites; there is no guest-side picker because Race never had one
+    /// either: the guest mirrors whatever the host starts).
+    #[test]
+    fn host_rule_picker_covers_all_four_rules() {
+        use crate::screens_menu::{SWITCH_SWAP_INTERVAL_TICKS, SWITCH_WARNING_TICKS};
+        type ButtonProbe = fn(&World, Entity) -> bool;
+        let cases: [(&str, ButtonProbe, AttackRule); 4] = [
+            (
+                "Garbage",
+                |world, e| world.get::<OnlineRuleGarbageButton>(e).is_some(),
+                AttackRule::Garbage,
+            ),
+            (
+                "Race",
+                |world, e| world.get::<OnlineRuleRaceButton>(e).is_some(),
+                AttackRule::Race {
+                    target_lines: DEFAULT_RACE_LINES,
+                },
+            ),
+            (
+                "Dig",
+                |world, e| world.get::<OnlineRuleDigButton>(e).is_some(),
+                AttackRule::Dig,
+            ),
+            (
+                "Switch",
+                |world, e| world.get::<OnlineRuleSwitchButton>(e).is_some(),
+                AttackRule::Switch {
+                    swap_interval_ticks: SWITCH_SWAP_INTERVAL_TICKS,
+                    warning_ticks: SWITCH_WARNING_TICKS,
+                },
+            ),
+        ];
+        for (label, is_btn, expected) in cases {
+            let mut app = online_app();
+            enter_online(&mut app);
+            {
+                let mut session = app.world_mut().resource_mut::<NetSession>();
+                session.role = NetRole::Host;
+                session.status = NetStatus::Listening;
+            }
+            app.update();
+            click_button(&mut app, host_root, is_btn);
+            assert_eq!(
+                status(&app),
+                NetStatus::Listening,
+                "{label}: no match before a challenger is Ready"
+            );
+            app.world_mut().resource_mut::<NetSession>().status = NetStatus::Ready;
+            app.update();
+            click_button(&mut app, host_root, is_btn);
+            assert_eq!(
+                status(&app),
+                NetStatus::InMatch,
+                "{label}: pick starts the match"
+            );
+            {
+                let versus = app.world().non_send::<VersusMatch>();
+                assert!(versus.active, "{label}: mirror match live");
+                assert_eq!(
+                    versus.rule, expected,
+                    "{label}: mirror carries the picked rule"
+                );
+                assert_eq!(versus.p2, Controller::Net, "{label}: right side forced Net");
+            }
+            assert_eq!(
+                flow(&app).stage,
+                OnlineStage::Closed,
+                "{label}: flow closed on start"
+            );
+            assert_eq!(
+                app_state(&app),
+                AppState::Playing,
+                "{label}: match takes the screen"
+            );
+        }
+    }
+
+    /// T22 portrait-safety: the four rule buttons live inside the existing
+    /// Host panel (full-screen flex column, percentage-sized) — no absolute
+    /// coordinates, so the stack reflows on tall portrait viewports.
+    #[test]
+    fn rule_picker_buttons_stack_inside_the_portrait_safe_host_panel() {
+        let mut app = online_app();
+        enter_online(&mut app);
+        app.world_mut().resource_mut::<OnlineFlow>().stage = OnlineStage::Host;
+        app.update();
+        let world = app.world_mut();
+        let root = world
+            .query_filtered::<Entity, With<OnlineHostRoot>>()
+            .single(world)
+            .expect("host root");
+        let root_node = world.get::<Node>(root).expect("host root node");
+        assert_eq!(root_node.flex_direction, FlexDirection::Column);
+        assert_eq!(root_node.width, Val::Percent(100.0));
+        assert_eq!(root_node.height, Val::Percent(100.0));
+        let is_rule_button = |w: &World, e: Entity| -> bool {
+            w.get::<OnlineRuleGarbageButton>(e).is_some()
+                || w.get::<OnlineRuleRaceButton>(e).is_some()
+                || w.get::<OnlineRuleDigButton>(e).is_some()
+                || w.get::<OnlineRuleSwitchButton>(e).is_some()
+        };
+        let stacked = world
+            .query_filtered::<Entity, With<Button>>()
+            .iter(world)
+            .filter(|e| {
+                is_rule_button(world, *e)
+                    && under(world, *e, &|w: &World, e| {
+                        w.get::<OnlineHostRoot>(e).is_some()
+                    })
+            })
+            .count();
+        assert_eq!(stacked, 4, "four rule buttons stacked under the Host root");
     }
 
     #[test]
