@@ -470,7 +470,8 @@ T1 ──► T2 ──┬──────────────────�
   comparison against `ModeHudInfo`, using existing `bevy_kira_audio`
   WAV assets; if no fitting asset exists, reuse the most urgent existing cue).
 - **validation**: Headless HUD tests (fixture pattern `HudFixture` already
-  exists): label text formats ticks correctly (e.g. 10 235 → `2:43.91`);
+  exists): label text formats ticks correctly (e.g. 9 835 → `2:43.91`;
+  10 235 → `2:50.58` — 60 Hz truncation);
   marathon run shows no clock; ultra warning fired-once behavior.
 - **status**: Not Completed
 - **log**:
