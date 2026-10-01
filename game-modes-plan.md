@@ -687,9 +687,59 @@ T1 ──► T2 ──┬──────────────────�
   in core by T4.
 - **validation**: `cargo test --workspace` green; `TETRIS_BOT=sprint cargo run`
   (desktop) completes a Sprint run headless-ly and exits 0.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: `2d4a4b9`. **(a) Dig-aware solver:** ported T4's nub-down
+  heuristic verbatim into `core_bridge` (`bot_move_mode(snapshot,
+  dig_aware)` + `top_buried`/`dig_landing`/`dump_landing`/
+  `dig_score_landing`/`dig_landings` + hold-fish via a new `BotMove::hold`
+  one-shot the shared executor pushes as `Action::Hold`). Coexistence: the
+  legacy `bot_move` (weights/tie-breaks untouched) stays the *only* path for
+  `!dig_aware` **and** for `dig_aware` boards without a `Piece::Garbage`
+  cell, so Marathon/Sprint/Ultra decisions are bit-identical — pinned by
+  `dig_heuristic_is_inert_without_garbage_cells` (100+ sampled marathon
+  decisions, `bot_move_mode(snap,true) == bot_move(snap)`) and by the
+  unchanged versus path (`bot_side_drive` always calls with `dig_aware =
+  false`; `bot_drive_system` only opts in when
+  `active_mode.config.goal == GarbageCleared`). Unit proof of activation:
+  `dig_heuristic_targets_top_buried_hole_on_garbage_boards`.
+  **(b) Named modes:** `parse_bot_value` accepts
+  `1|marathon|sprint|ultra|dig` (case-insensitive; unknown ⇒ bot off +
+  warn); named bots start from Title via `start_mode_run` (TETRIS_SEED +
+  pre-roll honored). Exactly one machine line per terminal: `BOT mode_done
+  mode=sprint time_ticks=…` / `mode=dig time_ticks=…` (GoalReached,
+  `AppExit::Success`), `BOT mode_done mode=ultra score=… ticks=…` (TimeUp
+  OR TopOut — score stands), `BOT mode_abort mode=… ticks=…` for Sprint/Dig
+  top-out with **`AppExit::error()`** nonzero exit (Bevy 0.19 renamed
+  `AppExit::Failure` → `Error(NonZero<u8>)`; `AppExit::error()` is the
+  nonzero variant). Ultra paced at one hard drop per ~30 ticks
+  (`ULTRA_BOT_PACE_TICKS`, T4's proven cadence — free-run greedy tops out
+  before the clock). Lifecycle runs inside `bot_marathon_system` as a
+  **plain function, not a new registered system**: registering any
+  additional `Update` system perturbs the schedule enough to flip the
+  netplay UI fixtures' same-frame edge tests
+  (`esc_on_listening_clears_the_upnp_state` deterministically failed with a
+  4-system tuple; graph-shape-preserving branch passes 4/4).
+  **(c) `tests/bot_modes.rs`** (hidden-window-style MinimalPlugins +
+  `LogPlugin::custom_layer` info!-capture, env-mutex serialized, 1.7 s):
+  Sprint 31337 → `BOT mode_done mode=sprint time_ticks=522` observed, exit
+  Success; **all six T4 pins 9/28/30/31/35/36 win through the app wiring**
+  (probe seeds 1–40 through the *app*: 6/40 wins — exactly T4's core win
+  set, 0 stalls → gravity + step-executor + hold mechanics preserve the core
+  driver's outcomes); seed 5 pinned as the abort seed (34/40 seeds top out,
+  abort line + `AppExit::error` asserted); ultra survives past 1200 ticks
+  with ≤ 60 pieces (cadence proof) and no terminal line; `=1`/`=marathon`
+  boot-to-Title regression; unknown value inert + warns. RED evidence: all
+  7 tests failed pre-impl (named env values never started a mode; captured
+  logs stopped at `start_mode … (from TETRIS_SEED)` with no terminal line);
+  GREEN after. Verified: app 418/418, workspace all suites green, clippy
+  `--workspace --all-targets -- -D warnings` + fmt `--check` clean (HEAD-
+  pinned worktree + the two app files; shared-tree run incl. parallel T9
+  WIP also green). Deviation: `lib.rs` `mod` → `pub mod` for
+  `core_bridge`/`modes`/`records`/`state` (binary-only crate; required for
+  any `tests/` integration test to reach the bridge).
+- **files edited/created**: `crates/tetris-app/src/core_bridge/mod.rs`,
+  `crates/tetris-app/src/lib.rs` (visibility only),
+  `crates/tetris-app/tests/bot_modes.rs` (new)
 
 ### T11: RELEASE 1 GATE
 - **depends_on**: [T7, T8, T9, T10]
