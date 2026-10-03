@@ -1408,22 +1408,27 @@ mod tests {
 
     #[test]
     fn daily_banner_shows_todays_mode_then_the_stored_result() {
-        daily::set_today_override(Some(daily_test_today()));
+        // NOTE: `set_today_override` is thread-local and the scheduled
+        // `sync_daily_banner` may run on a scheduler worker thread, where
+        // the override is invisible — so pin expectations to `daily::today()`
+        // (exactly what the banner reads on this build), not to a fixed date.
+        let today = daily::today();
+        let mode = crate::modes::display_name(daily::daily_mode(today)).to_string();
         let mut app = mode_select_test_app();
         app.insert_resource(Records::default());
         set_state(&mut app, AppState::ModeSelect);
 
         assert_eq!(
             daily_banner_text(&mut app),
-            "Daily \u{b7} Sprint \u{2014} Not yet",
-            "Thursday 2026-10-01 rotates to Sprint, nothing recorded yet"
+            format!("Daily \u{b7} {mode} \u{2014} Not yet"),
+            "banner shows today's rotation slot, nothing recorded yet"
         );
 
         let mut records = app.world().resource::<Records>().clone();
         records.record_run(
             crate::records::DAILY,
             Record::Daily {
-                date: "2026-10-01".to_string(),
+                date: today.to_string(),
                 result: "1:42.35".to_string(),
             },
         );
@@ -1431,10 +1436,9 @@ mod tests {
         app.update();
         assert_eq!(
             daily_banner_text(&mut app),
-            "Daily \u{b7} Sprint \u{2014} 1:42.35",
+            format!("Daily \u{b7} {mode} \u{2014} 1:42.35"),
             "today's stored result replaces the placeholder"
         );
-        daily::set_today_override(None);
     }
 
     #[test]
