@@ -8,6 +8,7 @@
 
 #![allow(dead_code)] // stub items are consumed by later tasks (T10–T19)
 
+mod art;
 mod audio;
 // T10: the headless bot-mode CI gates (`tests/bot_modes.rs`) drive the real
 // bridge through these modules; widened from private to `pub` (crate is a

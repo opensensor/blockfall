@@ -49,6 +49,7 @@ use tetris_core::piece::Piece;
 use tetris_core::srs;
 use tetris_core::versus::Side;
 
+use crate::art::{self, ArtAssets};
 use crate::core_bridge::{GameCore, VersusMatch};
 
 /// Topmost drawn row: 2 rows of headroom above the board (`srs::MIN_ROT_ROW`)
@@ -118,8 +119,10 @@ pub const PIECE_COLORS: [Color; 7] = [
     }),
 ];
 
-/// Alpha applied to the active piece color when drawing the ghost.
-pub const GHOST_ALPHA: f32 = 0.3;
+/// Alpha applied to the active piece color when drawing the ghost outline
+/// (M5: the ghost is an outlined ring texture, so it reads at a higher alpha
+/// than the old solid 0.3 dim without competing with settled cells).
+pub const GHOST_ALPHA: f32 = 0.65;
 
 /// Neutral fill for incoming versus garbage cells (`Piece::Garbage`),
 /// deliberately outside the tetromino palette so garbage reads as garbage.
@@ -490,6 +493,56 @@ struct VersusCellPools {
     right: Vec<Entity>,
 }
 
+/// Z of the well backdrop: above the frame bars (`-0.1`), below every cell
+/// layer (board `0`).
+const BACKDROP_Z: f32 = -0.09;
+
+/// Marks the dark grid panel behind one drawn field (M5). No marker without
+/// [`ArtAssets`], so headless tests never see it.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldBackdrop {
+    /// Match side of the backed field; `None` for the solo field.
+    pub side: Option<Side>,
+}
+
+/// Pooled well backdrops (exactly one per visible field).
+#[derive(Resource, Default)]
+struct BackdropPools {
+    solo: Vec<Entity>,
+    versus_left: Vec<Entity>,
+    versus_right: Vec<Entity>,
+}
+
+/// Bring the one-entity well backdrop of a field in line with `layout`.
+/// `cells.len()`-sized panel exactly under the grid, so the generated grid
+/// texture lines up with cell borders at any window size.
+fn sync_backdrop(
+    commands: &mut Commands,
+    pool: &mut Vec<Entity>,
+    layout: &FieldLayout,
+    side: Option<Side>,
+    art: &ArtAssets,
+) {
+    let field_w = COLS as f32 * layout.cell;
+    let field_h = VISIBLE_ROWS as f32 * layout.cell;
+    let center = Vec2::new(
+        layout.origin.x + field_w * 0.5,
+        layout.origin.y - field_h * 0.5,
+    );
+    let sprite = Sprite {
+        image: art.well.clone(),
+        custom_size: Some(Vec2::new(field_w, field_h)),
+        ..default()
+    };
+    let transform = Transform::from_xyz(center.x, center.y, BACKDROP_Z);
+    let marker = FieldBackdrop { side };
+    if let Some(entity) = pool.first() {
+        commands.entity(*entity).insert((marker, sprite, transform));
+    } else {
+        pool.push(commands.spawn((marker, sprite, transform)).id());
+    }
+}
+
 /// Advance the per-cell lock-age table to `snapshot` (T24 **Invisible**).
 ///
 /// Ages are keyed by `(col, row)` and tied to presence continuity: a cell
@@ -549,6 +602,10 @@ fn advance_lock_ages(
 /// the prefix, despawn the surplus tail, spawn what is missing. With
 /// `fades` (T24 **Invisible**), [`CellKind::Board`] cells draw at
 /// [`lock_fade_alpha`] of their table entry; the other layers are untouched.
+/// With `art` (M5), every cell draws through a procedural texture — the
+/// beveled tile for board/active cells, the outlined ring for the ghost —
+/// tinted by the (unchanged) snapshot color; without it (headless tests)
+/// cells stay flat quads.
 fn sync_pool(
     commands: &mut Commands,
     pool: &mut Vec<Entity>,
@@ -556,6 +613,7 @@ fn sync_pool(
     layout: &FieldLayout,
     side: Option<VersusCellSide>,
     fades: Option<&[[u16; COLS]; ROWS]>,
+    art: Option<&ArtAssets>,
 ) {
     if pool.len() > cells.len() {
         let surplus = pool.split_off(cells.len());
@@ -575,11 +633,17 @@ fn sync_pool(
                 .unwrap_or(0);
             color = color.with_alpha(lock_fade_alpha(age));
         }
-        let sprite = Sprite {
+        let mut sprite = Sprite {
             color,
             custom_size: Some(Vec2::splat(layout.cell)),
             ..default()
         };
+        if let Some(art) = art {
+            sprite.image = match frame_cell.kind {
+                CellKind::Ghost => art.ghost.clone(),
+                _ => art.tile.clone(),
+            };
+        }
         let transform = Transform::from_xyz(center.x, center.y, frame_cell.z());
         let marker = PlayfieldCell {
             kind: frame_cell.kind,
@@ -644,12 +708,59 @@ fn sync_frame(
     }
 }
 
+/// Marks the full-window vignette sprite (M5): radial edge darkening behind
+/// everything, giving the pillar-box voids around the field some depth.
+#[derive(Component)]
+pub struct Vignette;
+
+/// Z of the vignette — behind the frame bars and the well backdrop.
+const VIGNETTE_Z: f32 = -10.0;
+
+/// Spawn the vignette once art is up (never headless) and keep it slightly
+/// oversized to the window so camera shake never reveals its edge.
+fn update_vignette(
+    mut commands: Commands,
+    art: Option<Res<ArtAssets>>,
+    windows: Query<&Window>,
+    mut sprites: Query<&mut Sprite, With<Vignette>>,
+) {
+    let Some(art) = art else { return };
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+    let size = window.resolution.size();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+    match sprites.iter_mut().next() {
+        Some(mut sprite) => {
+            sprite.custom_size = Some(Vec2::new(size.x * 1.04, size.y * 1.04));
+        }
+        None => {
+            commands.spawn((
+                Vignette,
+                Sprite {
+                    image: art.vignette.clone(),
+                    custom_size: Some(Vec2::new(size.x * 1.04, size.y * 1.04)),
+                    ..default()
+                },
+                Transform::from_xyz(0.0, 0.0, VIGNETTE_Z),
+            ));
+        }
+    }
+}
+
+/// Color the window clears to before the vignette: a deep blue-charcoal,
+/// clearly distinct from both the well panel and the settled stack.
+pub const WINDOW_BG: Color = Color::srgb(0.043, 0.05, 0.075);
+
 /// Full refresh of all cell sprites from the newest snapshot. The fixed-step
 /// sim has already run for this frame (`RunFixedMainLoop` precedes
 /// `Update`), so this always reads the latest state; per-frame redraw is
 /// fine at <= ~210 cells. With [`VersusMatch::active`] the solo pool is
 /// despawned and both match boards are drawn instead, one per half-viewport
 /// of [`versus_layouts`] (T26).
+#[allow(clippy::too_many_arguments)]
 fn render_playfield(
     mut commands: Commands,
     core: Option<NonSend<GameCore>>,
@@ -658,6 +769,8 @@ fn render_playfield(
     mut pool: ResMut<CellPool>,
     mut versus_pools: ResMut<VersusCellPools>,
     mut frames: ResMut<FramePools>,
+    mut backdrops: ResMut<BackdropPools>,
+    art: Option<Res<ArtAssets>>,
 ) {
     let Some(window) = windows.iter().next() else {
         return;
@@ -670,6 +783,7 @@ fn render_playfield(
     if let Some(versus) = versus.filter(|versus| versus.active) {
         clear_pool(&mut commands, &mut pool.entities);
         clear_pool(&mut commands, &mut frames.solo);
+        clear_pool(&mut commands, &mut backdrops.solo);
         let snapshot = versus.match_.snapshot();
         let [left, right] = versus_layouts(size.x, size.y);
         sync_frame(
@@ -684,6 +798,22 @@ fn render_playfield(
             &right,
             Some(VersusCellSide(Side::Right)),
         );
+        if let Some(art) = art.as_deref() {
+            sync_backdrop(
+                &mut commands,
+                &mut backdrops.versus_left,
+                &left,
+                Some(Side::Left),
+                art,
+            );
+            sync_backdrop(
+                &mut commands,
+                &mut backdrops.versus_right,
+                &right,
+                Some(Side::Right),
+                art,
+            );
+        }
         let cells = frame_cells(&snapshot.left);
         sync_pool(
             &mut commands,
@@ -692,6 +822,7 @@ fn render_playfield(
             &left,
             Some(VersusCellSide(Side::Left)),
             None,
+            art.as_deref(),
         );
         let cells = frame_cells(&snapshot.right);
         sync_pool(
@@ -701,6 +832,7 @@ fn render_playfield(
             &right,
             Some(VersusCellSide(Side::Right)),
             None,
+            art.as_deref(),
         );
         return;
     }
@@ -709,9 +841,14 @@ fn render_playfield(
     clear_pool(&mut commands, &mut versus_pools.right);
     clear_pool(&mut commands, &mut frames.versus_left);
     clear_pool(&mut commands, &mut frames.versus_right);
+    clear_pool(&mut commands, &mut backdrops.versus_left);
+    clear_pool(&mut commands, &mut backdrops.versus_right);
     let Some(core) = core else { return };
     let layout = FieldLayout::fit_window(size.x, size.y);
     sync_frame(&mut commands, &mut frames.solo, &layout, None);
+    if let Some(art) = art.as_deref() {
+        sync_backdrop(&mut commands, &mut backdrops.solo, &layout, None, art);
+    }
     let snapshot = core.game.snapshot();
     let mut cells = frame_cells(&snapshot);
     // T23 **No Ghost**: render-only suppression — the core keeps computing
@@ -749,6 +886,7 @@ fn render_playfield(
         &layout,
         None,
         invisible.then_some(&*lock_ages),
+        art.as_deref(),
     );
 }
 
@@ -758,10 +896,13 @@ pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<CellPool>()
+        app.insert_resource(ClearColor(WINDOW_BG))
+            .init_resource::<CellPool>()
             .init_resource::<VersusCellPools>()
             .init_resource::<FramePools>()
-            .add_systems(Update, render_playfield);
+            .init_resource::<BackdropPools>()
+            .add_systems(Startup, art::init_art_assets)
+            .add_systems(Update, (update_vignette, render_playfield).chain());
     }
 }
 

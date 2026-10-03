@@ -44,11 +44,12 @@ use tetris_core::game::GameSnapshot;
 use tetris_core::piece::{Piece, Rotation};
 use tetris_core::versus::{AttackRule, Side, DIG_DUEL_GARBAGE_ROWS};
 
+use crate::art::ArtAssets;
 use crate::core_bridge::{CoreEvent, GameCore, ModeHudInfo, VersusMatch};
 use crate::input::{Bind, BindSlot, KeyBindings};
 use crate::modes;
 use crate::records::{Record, Records};
-use crate::render::{self, GHOST_ALPHA, VISIBLE_ROWS};
+use crate::render::{self, VISIBLE_ROWS};
 use crate::screens_ladder::{ladder_badge_text, LadderOrigin};
 use crate::screens_menu::VersusFlow;
 use crate::state::Settings;
@@ -781,10 +782,15 @@ fn refresh_next_preview(
     }
 }
 
+/// Alpha of hold-preview cells while `hold_used` blocks the swap (M5: split
+/// out of `GHOST_ALPHA`, which now also drives the ghost *outline* and moved
+/// to a higher value with it).
+pub const HOLD_USED_ALPHA: f32 = 0.3;
+
 fn hold_cell_color(piece: Piece, used: bool) -> Color {
     let color = render::piece_color(piece);
     if used {
-        color.with_alpha(GHOST_ALPHA)
+        color.with_alpha(HOLD_USED_ALPHA)
     } else {
         color
     }
@@ -1462,6 +1468,23 @@ fn sync_solo_hud_visibility(
 /// (solo) plus the compact per-side versus panels (T26).
 pub struct HudPlugin;
 
+/// M5: dress every HUD mini-preview cell (next queue, hold, versus boxes)
+/// with the same beveled tile texture the playfield uses, so previews read
+/// as blocks rather than flat chips. Colors/sizes stay owned by the sync
+/// systems — this only ever swaps the texture, and runs headless-safe
+/// (without [`ArtAssets`] nothing happens).
+type MiniCellStyleQuery<'w, 's> =
+    Query<'w, 's, &'static mut Sprite, Or<(With<HudMiniCell>, With<VersusMiniCell>)>>;
+
+fn style_mini_cells(art: Option<Res<ArtAssets>>, mut cells: MiniCellStyleQuery) {
+    let Some(art) = art else { return };
+    for mut sprite in cells.iter_mut() {
+        if sprite.image.id() != art.tile.id() {
+            sprite.image = art.tile.clone();
+        }
+    }
+}
+
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HudFixture>()
@@ -1478,6 +1501,7 @@ impl Plugin for HudPlugin {
                     )
                         .chain(),
                     sync_versus_hud,
+                    style_mini_cells,
                     sync_solo_hud_visibility,
                 )
                     .chain(),
@@ -1731,7 +1755,7 @@ mod tests {
         assert!(hold.used);
         assert_eq!(colors.len(), 4);
         for color in &colors {
-            assert_eq!(color.to_srgba().alpha, GHOST_ALPHA, "dimmed preview");
+            assert_eq!(color.to_srgba().alpha, HOLD_USED_ALPHA, "dimmed preview");
             assert_eq!(
                 color.with_alpha(1.0),
                 render::piece_color(after_hold.hold.expect("hold piece")),

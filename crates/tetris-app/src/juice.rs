@@ -35,10 +35,12 @@
 
 use bevy::prelude::*;
 use bevy::render::view::window::screenshot::{save_to_disk, Screenshot};
+use bevy::window::Window;
 
 use tetris_core::event::GameEvent;
 
-use crate::core_bridge::{CoreEvent, SimPaused};
+use crate::core_bridge::{CoreEvent, SimPaused, VersusMatch};
+use crate::render;
 use crate::state::{EffectsQuality, Settings};
 
 /// One decaying effect channel: `amplitude` decays to exactly `0.0` over
@@ -71,10 +73,10 @@ impl EffectSlot {
 
     /// Trigger with `amplitude`/`duration` using **max-of** stacking: only a
     /// strictly stronger amplitude (re)starts the timer; concurrent triggers
-    /// never add up.
-    pub fn trigger(&mut self, amplitude: f32, duration: f32) {
+    /// never add up. Returns `true` when the slot (re)triggered.
+    pub fn trigger(&mut self, amplitude: f32, duration: f32) -> bool {
         if amplitude <= 0.0 || duration <= 0.0 {
-            return;
+            return false;
         }
         if !self.is_active() || amplitude > self.amplitude {
             *self = Self {
@@ -82,6 +84,9 @@ impl EffectSlot {
                 duration,
                 amplitude,
             };
+            true
+        } else {
+            false
         }
     }
 
@@ -214,6 +219,24 @@ pub fn effect_plan(event: &GameEvent, quality: EffectsQuality) -> EffectPlan {
     }
 }
 
+/// Flash tint per event kind (M5): a color-coded screen flash reads as
+/// game juice instead of a white "display glitch", and each hue carries the
+/// event's meaning (gold = perfect clear, violet = T-spin, red = game over).
+pub fn flash_color_for(event: &GameEvent) -> Color {
+    match event {
+        GameEvent::LineCleared { lines } => {
+            // Bigger clears trend from pale cyan toward bright ice.
+            let t = (*lines as f32 / 4.0).min(1.0);
+            Color::srgb(0.62 + 0.18 * t, 0.88 + 0.07 * t, 1.0)
+        }
+        GameEvent::TSpinDetected { .. } => Color::srgb(0.85, 0.55, 1.0),
+        GameEvent::PerfectClear => Color::srgb(1.0, 0.9, 0.55),
+        GameEvent::LevelUp { .. } => Color::srgb(0.7, 1.0, 0.78),
+        GameEvent::GameOver => Color::srgb(1.0, 0.42, 0.38),
+        _ => Color::WHITE,
+    }
+}
+
 /// Pure juice state: decaying effect channels + the last camera offset applied
 /// (delta application keeps the camera drift-free and composes with any
 /// external transform writes).
@@ -223,6 +246,8 @@ pub struct JuiceState {
     pub flash: EffectSlot,
     /// Camera shake channel (peak amplitude in world px).
     pub shake: EffectSlot,
+    /// Tint of the active flash ([`flash_color_for`], set on trigger).
+    pub flash_color: Color,
     /// Shake offset currently applied to the camera (rest = zero).
     pub shake_offset: Vec2,
 }
@@ -232,7 +257,9 @@ impl JuiceState {
     /// length in frames (caller merges into [`JuiceFreeze`]).
     pub fn trigger(&mut self, event: &GameEvent, quality: EffectsQuality) -> u32 {
         let plan = effect_plan(event, quality);
-        self.flash.trigger(plan.flash.0, plan.flash.1);
+        if self.flash.trigger(plan.flash.0, plan.flash.1) {
+            self.flash_color = flash_color_for(event);
+        }
         self.shake.trigger(plan.shake.0, plan.shake.1);
         plan.freeze_frames
     }
@@ -260,6 +287,7 @@ impl Default for JuiceState {
         Self {
             flash: EffectSlot::default(),
             shake: EffectSlot::default(),
+            flash_color: Color::WHITE,
             shake_offset: Vec2::ZERO,
         }
     }
@@ -328,8 +356,9 @@ fn juice_painter(
     state.tick(time.delta_secs());
 
     let alpha = state.flash.value();
+    let tinted = state.flash_color.with_alpha(alpha);
     for mut sprite in overlays.iter_mut() {
-        sprite.color.set_alpha(alpha);
+        sprite.color = tinted;
     }
 
     let new_offset = state.shake_offset();
@@ -343,8 +372,49 @@ fn juice_painter(
     }
 }
 
-/// Spawn the always-present (alpha-0) full-screen white flash overlay above
-/// every playfield layer (board 0 / ghost 1 / active 2, T11).
+/// M5: hug the flash to the playfield instead of the whole window — solo
+/// covers the well plus its frame, versus the shared playfield view (both
+/// halves). Keeps pillar-boxed desktop windows and the portrait HUD/touch
+/// strips out of the flash so it reads as the field reacting. Headless (no
+/// window) is a no-op; the overlay keeps its oversized resting rect there.
+fn shape_overlay(
+    windows: Query<&Window>,
+    versus: Option<NonSend<VersusMatch>>,
+    mut overlays: Query<(&mut Sprite, &mut Transform), With<JuiceOverlay>>,
+) {
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+    let size = window.resolution.size();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+    let (view_w, view_h, center_y) = render::playfield_view(size.x, size.y);
+    let active_versus = versus.is_some_and(|v| v.active);
+    let (w, h) = if active_versus {
+        (view_w, view_h)
+    } else {
+        let (cell, _, _) = render::letterbox(view_w, view_h);
+        let pad = 0.7 * cell;
+        (
+            tetris_core::board::COLS as f32 * cell + 2.0 * pad,
+            render::VISIBLE_ROWS as f32 * cell + 2.0 * pad,
+        )
+    };
+    for (mut sprite, mut transform) in overlays.iter_mut() {
+        if sprite.custom_size != Some(Vec2::new(w, h)) {
+            sprite.custom_size = Some(Vec2::new(w, h));
+        }
+        if transform.translation.y != center_y {
+            transform.translation.y = center_y;
+        }
+    }
+}
+
+/// Spawn the always-present (alpha-0) flash overlay above every playfield
+/// layer (board 0 / ghost 1 / active 2, T11). [`shape_overlay`] hugs it to
+/// the active field(s) every frame; the oversized rect is only its resting
+/// size for headless apps without a window.
 fn spawn_overlay(mut commands: Commands) {
     commands.spawn((
         JuiceOverlay,
@@ -371,7 +441,7 @@ impl Plugin for JuicePlugin {
             .add_systems(Startup, spawn_overlay)
             .add_systems(
                 Update,
-                (juice_from_events, freeze_gate, juice_painter).chain(),
+                (juice_from_events, freeze_gate, shape_overlay, juice_painter).chain(),
             )
             .add_systems(Update, apply_window_identity);
         if let Some(schedule) = parse_shot_schedule() {
