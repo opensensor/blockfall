@@ -3,6 +3,31 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.5.0] — 2026-10-03
+
+### Added
+
+- **Modernized default look (phase 1)** — all game art is now generated in
+  code at startup (`art.rs`, zero asset files): beveled top-lit tiles with
+  rounded corners (blocks read as blocks — adjacent same-color cells no
+  longer merge into blobs), an outlined ghost ring instead of a dimmed
+  silhouette, a dark playfield well panel with a faint cell grid, and a
+  radial edge vignette over a new deep-navy clear color. The HUD next,
+  hold and versus previews reuse the same beveled tile. Headless test apps
+  without the asset pass keep the old flat rendering.
+- **Event-colored screen flashes** — line clears flash cyan (scaling to
+  bright ice on tetrises), T-spins violet, perfect clears gold, level ups
+  mint and game overs red instead of raw white; the flash is clamped to the
+  playfield well (solo) or the shared versus view instead of the whole
+  window, so pillar-boxed voids and HUD strips stay clean.
+
+### Fixed
+
+- The Daily Challenge banner test pinned expectations to a hardcoded date
+  whose override never actually reached the banner (thread-local date
+  override vs. scheduler worker threads) — it silently depended on the
+  real calendar date and now derives from `daily::today()`.
+
 ## [0.4.0] — 2026-10-01
 
 ### Added
