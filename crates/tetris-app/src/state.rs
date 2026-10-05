@@ -18,6 +18,68 @@ pub enum EffectsQuality {
     High,
 }
 
+/// Selectable BGM soundtrack. The variant order is canonical (audio asset
+/// load order in `audio`); the settings screen cycles through it. Serde
+/// names stay lowercase for forward-compatible `settings.json` files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Soundtrack {
+    /// The original 120 BPM two-bar loop (default, ships in every release).
+    #[default]
+    Classic,
+    /// Driving 128 BPM arpeggio with off-beat hats.
+    Pulse,
+    /// Slow ambient pad with sparse bells (Zen-friendly).
+    Drift,
+    /// Pick per active mode (Zen → Drift, Ultra → Pulse, else Classic) —
+    /// resolved in `audio::Soundtrack::resolve`.
+    Auto,
+}
+
+impl Soundtrack {
+    /// All selectable soundtracks in cycle order (includes `Auto`).
+    pub const ALL: [Soundtrack; 4] = [
+        Soundtrack::Classic,
+        Soundtrack::Auto,
+        Soundtrack::Pulse,
+        Soundtrack::Drift,
+    ];
+
+    /// Display label for the settings screen.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Soundtrack::Classic => "Classic",
+            Soundtrack::Pulse => "Pulse",
+            Soundtrack::Drift => "Drift",
+            Soundtrack::Auto => "Auto",
+        }
+    }
+}
+
+/// Piece palette family. `Colorblind` swaps the Guideline reds/greens for
+/// the Okabe–Ito color-vision-safe set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorScheme {
+    /// Tetris Guideline palette (PRD default).
+    #[default]
+    Classic,
+    /// Okabe–Ito color-vision-safe palette.
+    Colorblind,
+}
+
+impl ColorScheme {
+    /// Display label for the settings screen.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ColorScheme::Classic => "Classic",
+            ColorScheme::Colorblind => "Colorblind",
+        }
+    }
+}
+
 /// User-configurable settings; persisted as JSON by `settings_persist` (T15)
 /// and edited by the settings screen (T16). Defaults are PRD §6.5/§6.3/§9.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Resource)]
@@ -38,6 +100,16 @@ pub struct Settings {
     pub soft_drop_multiplier: u8,
     /// Juice/effects quality tier.
     pub effects: EffectsQuality,
+    /// Selected BGM soundtrack (`#[serde(default)]`: files written before
+    /// this field existed keep their other settings and load Classic).
+    #[serde(default)]
+    pub soundtrack: Soundtrack,
+    /// Piece palette family (Classic vs Okabe–Ito colorblind-safe).
+    #[serde(default)]
+    pub color_scheme: ColorScheme,
+    /// Accessibility: suppress event color flashes (shake/freeze unaffected).
+    #[serde(default)]
+    pub reduce_flash: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +123,9 @@ impl Default for Settings {
             next_queue_size: 5,
             soft_drop_multiplier: 20,
             effects: EffectsQuality::default(),
+            soundtrack: Soundtrack::default(),
+            color_scheme: ColorScheme::default(),
+            reduce_flash: false,
         }
     }
 }

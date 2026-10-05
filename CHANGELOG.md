@@ -3,6 +3,55 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.6.0] — 2026-10-04
+
+### Added
+
+- **Soundtrack selection** — two new synthesized BGM loops join the classic
+  track (`bgm_pulse.wav`: driving 128 BPM arpeggio; `bgm_drift.wav`: slow
+  ambient pad), selectable in Settings under Music. Switching restarts the
+  loop live and persists across runs; `settings.json` files from earlier
+  builds keep all their settings and adopt Classic.
+- **Mode-select redesign** — rows are now rounded accent cards with a
+  colored mode glyph, dimmed description and right-pinned gold record;
+  hover highlights the card, Up/Down move a visible cursor, and Enter
+  starts the selected row (Bot Ladder keeps its ladder-screen routing).
+  The Daily banner is a gold card and the mutator toggles have a caption.
+- **Auto soundtracks** — a fourth choice picks per mode (Zen drifts, Ultra
+  pulses, everything else classic) and re-resolves live when the mode
+  changes; the cycle is Classic → Auto → Pulse → Drift.
+- **Combo pitch riser** — lock/clear/move SFX climb a semitone-ish step per
+  combo level (capped at +20%), giving audible feedback for streaks.
+- **Ultra final-10-s heartbeat** — an amber screen pulse once per remaining
+  second mirrors the audio warning, ending together with the clock.
+- **Per-run stats line on game over** — pieces-per-second, lines/min,
+  t-spins, tetrises and max combo, derived from the event stream.
+- **Daily share image** — game over after a daily run shows a "Save share
+  image" button (or press `S`) that writes `blockfall_daily_<date>.png`
+  next to the game; the share line itself is now ASCII so the headline
+  renders in-game.
+- **Colorblind palette** — an Okabe–Ito-inspired piece set selectable in
+  Settings (Colors row); it applies to playfield, previews, hold, queue and
+  versus HUD.
+- **Reduce flash** — settings toggle that suppresses screen flashes (event
+  flashes and the Ultra heartbeat) while keeping shake and freeze frames.
+- **Menu card restyle** — title/pause/game-over buttons are now rounded
+  cards with a visible border that lights up on hover and press.
+
+### Fixed
+
+- **Ultra ended after 2 minutes** — the advertised six-minute clock was
+  encoded as 7 200 ticks, which is 120 s at 60 Hz; the budget is now
+  21 600 ticks (6 min), matching the mode card and README.
+- **Audio was silent in shipped builds** — `AudioPlugin` defaulted its
+  `AudioEnabled` guard to `false` and no production path ever set it `true`,
+  so BGM/SFX never played (the documented production default). The guard now
+  defaults to enabled whenever the Kira stack is wired; headless tests stay
+  guarded.
+- **Daily banner showed tofu** — its `·`/`—` separators are missing from
+  the bundled font subset and rendered as boxes; the banner and the daily
+  share line (now shown as the game-over headline) are ASCII throughout.
+
 ## [0.5.0] — 2026-10-03
 
 ### Added

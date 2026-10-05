@@ -1201,7 +1201,7 @@ fn core_bridge_system(
 /// Field notes for later tasks:
 /// - `clock_ticks`: `Game::tick_count()` — 0 during a pre-roll (core frozen),
 ///   first playable frame is 1.
-/// - `clock_limit`: `ModeConfig::clock_ticks` (Ultra 7 200; `None` counts up).
+/// - `clock_limit`: `ModeConfig::clock_ticks` (Ultra 21 600 = 6 min; `None` counts up).
 /// - `show_hud`: the mode has a goal, a clock *or* a garbage feed —
 ///   Marathon stays `false` and renders neither clock nor goal row.
 /// - `feed_pending` / `feed_next_row_in`: Survival feed queue (T13) — rows
@@ -1806,9 +1806,19 @@ mod tests {
         let mut app = test_app(0x53);
         start_mode(&mut app, ModeId::Ultra);
         assert_eq!(countdown(&app), 0, "Ultra has no pre-roll");
+        // A do-nothing board tops out around 7.3k ticks, well before the real
+        // 6-minute (21 600-tick) budget would fire — shrink the clock for this
+        // test so it exercises the TimeUp mechanism itself.
+        app.world_mut().non_send_mut::<GameCore>().game = Game::with_config(
+            0x53,
+            &tetris_core::mode::ModeConfig {
+                clock_ticks: Some(600),
+                ..modes::mode_config(ModeId::Ultra)
+            },
+        );
 
         let mut saw_timeup = false;
-        for _ in 0..7300 {
+        for _ in 0..700 {
             fixed_step(&mut app);
             if drained(&mut app)
                 .iter()
@@ -1826,7 +1836,7 @@ mod tests {
         );
         let core = app.world().non_send::<GameCore>();
         assert_eq!(core.game.finished_reason(), Some(FinishReason::TimeUp));
-        assert_eq!(core.game.tick_count(), 7200);
+        assert_eq!(core.game.tick_count(), 600);
     }
 
     #[test]

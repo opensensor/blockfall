@@ -28,6 +28,7 @@ mod screens_modes;
 mod screens_settings;
 mod settings_persist;
 pub mod state;
+mod stats;
 mod touch;
 
 use bevy::{
@@ -47,6 +48,7 @@ use screens_modes::ModeSelectPlugin;
 use screens_settings::SettingsScreenPlugin;
 use settings_persist::SettingsPersistPlugin;
 use state::{AppState, RebindingCapture, Settings};
+use stats::RunStatsPlugin;
 use touch::TouchPlugin;
 
 /// App entry point on every platform: `main()` for the desktop binary,
@@ -72,6 +74,7 @@ pub fn main() {
             RenderPlugin,
             InputPlugin,
             HudPlugin,
+            RunStatsPlugin,
             MenuScreensPlugin,
             ModeSelectPlugin,
             BotLadderPlugin,

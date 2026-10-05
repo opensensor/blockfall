@@ -199,7 +199,7 @@ pub struct ModeConfig {
     pub goal: Option<Goal>,
     /// Optional logical-tick budget; `tick()` emits
     /// `GameEvent::TimeUp { tick }` and freezes once `ticks >= n`
-    /// (Ultra: `Some(7200)`). `None` = no clock.
+    /// (Ultra: `Some(21_600)` = 6 min). `None` = no clock.
     pub clock_ticks: Option<u64>,
     /// Optional non-empty initial playfield.
     pub start_board: Option<StartBoard>,

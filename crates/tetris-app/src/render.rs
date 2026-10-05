@@ -44,6 +44,8 @@ use bevy::prelude::*;
 use bevy::window::Window;
 
 use tetris_core::board::{COLS, ROWS};
+
+use crate::state::Settings;
 use tetris_core::game::GameSnapshot;
 use tetris_core::piece::Piece;
 use tetris_core::srs;
@@ -70,6 +72,19 @@ pub const PIECE_RGB: [(f32, f32, f32); 7] = [
     (0.2, 0.7, 0.25),   // S  green
     (0.65, 0.3, 0.8),   // T  purple
     (0.85, 0.2, 0.2),   // Z  red
+];
+
+/// Okabe–Ito color-vision-safe channels per piece, [`Piece::ALL`] order —
+/// the [`crate::state::ColorScheme::Colorblind`] alternative to the
+/// Guideline palette above (distinguishable under protan/deutan/tritan).
+pub const PIECE_RGB_COLORBLIND: [(f32, f32, f32); 7] = [
+    (0.34, 0.71, 0.91), // I  sky blue
+    (0.23, 0.30, 0.75), // J  deep blue
+    (0.90, 0.47, 0.00), // L  orange
+    (1.00, 0.77, 0.00), // O  yellow
+    (0.00, 0.63, 0.50), // S  bluish green
+    (0.58, 0.34, 0.71), // T  reddish purple
+    (0.84, 0.25, 0.15), // Z  vermillion
 ];
 
 /// Piece palette as full-alpha [`Color`]s, indexed by [`Piece::ALL`] order
@@ -160,11 +175,24 @@ pub fn lock_fade_alpha(age: u16) -> f32 {
 
 /// Solid fill color for cells locked/spawned as `piece`.
 pub fn piece_color(piece: Piece) -> Color {
+    piece_color_in(crate::state::ColorScheme::Classic, piece)
+}
+
+/// [`piece_color`] under an explicit palette [`crate::state::ColorScheme`]
+/// (Okabe–Ito set for `Colorblind`).
+pub fn piece_color_in(scheme: crate::state::ColorScheme, piece: Piece) -> Color {
     if piece == Piece::Garbage {
         return GARBAGE_CELL_COLOR;
     }
     let idx = Piece::ALL.iter().position(|p| *p == piece).unwrap_or(0);
-    PIECE_COLORS[idx]
+    match scheme {
+        crate::state::ColorScheme::Classic => PIECE_COLORS[idx],
+        crate::state::ColorScheme::Colorblind => Color::srgb(
+            PIECE_RGB_COLORBLIND[idx].0,
+            PIECE_RGB_COLORBLIND[idx].1,
+            PIECE_RGB_COLORBLIND[idx].2,
+        ),
+    }
 }
 
 /// Which layer of the playfield a drawn cell belongs to.
@@ -195,9 +223,14 @@ pub struct SnapshotCell {
 impl SnapshotCell {
     /// Fill color: piece color at full alpha, dimmed for the ghost.
     pub fn color(&self) -> Color {
+        self.color_in(crate::state::ColorScheme::Classic)
+    }
+
+    /// [`color`](Self::color) under an explicit palette scheme.
+    pub fn color_in(&self, scheme: crate::state::ColorScheme) -> Color {
         match self.kind {
-            CellKind::Ghost => piece_color(self.piece).with_alpha(GHOST_ALPHA),
-            _ => piece_color(self.piece),
+            CellKind::Ghost => piece_color_in(scheme, self.piece).with_alpha(GHOST_ALPHA),
+            _ => piece_color_in(scheme, self.piece),
         }
     }
 
@@ -606,6 +639,7 @@ fn advance_lock_ages(
 /// beveled tile for board/active cells, the outlined ring for the ghost —
 /// tinted by the (unchanged) snapshot color; without it (headless tests)
 /// cells stay flat quads.
+#[allow(clippy::too_many_arguments)]
 fn sync_pool(
     commands: &mut Commands,
     pool: &mut Vec<Entity>,
@@ -614,6 +648,7 @@ fn sync_pool(
     side: Option<VersusCellSide>,
     fades: Option<&[[u16; COLS]; ROWS]>,
     art: Option<&ArtAssets>,
+    scheme: crate::state::ColorScheme,
 ) {
     if pool.len() > cells.len() {
         let surplus = pool.split_off(cells.len());
@@ -624,7 +659,7 @@ fn sync_pool(
 
     for (index, frame_cell) in cells.iter().enumerate() {
         let center = layout.cell_center(frame_cell.row, frame_cell.col);
-        let mut color = frame_cell.color();
+        let mut color = frame_cell.color_in(scheme);
         if let (Some(ages), CellKind::Board) = (fades, frame_cell.kind) {
             let age = ages
                 .get(frame_cell.row as usize)
@@ -771,7 +806,13 @@ fn render_playfield(
     mut frames: ResMut<FramePools>,
     mut backdrops: ResMut<BackdropPools>,
     art: Option<Res<ArtAssets>>,
+    settings: Option<Res<Settings>>,
 ) {
+    // Palette scheme (accessibility); headless test apps without Settings
+    // render the classic Guideline palette.
+    let scheme = settings
+        .as_deref()
+        .map_or(crate::state::ColorScheme::Classic, |s| s.color_scheme);
     let Some(window) = windows.iter().next() else {
         return;
     };
@@ -823,6 +864,7 @@ fn render_playfield(
             Some(VersusCellSide(Side::Left)),
             None,
             art.as_deref(),
+            scheme,
         );
         let cells = frame_cells(&snapshot.right);
         sync_pool(
@@ -833,6 +875,7 @@ fn render_playfield(
             Some(VersusCellSide(Side::Right)),
             None,
             art.as_deref(),
+            scheme,
         );
         return;
     }
@@ -887,6 +930,7 @@ fn render_playfield(
         None,
         invisible.then_some(&*lock_ages),
         art.as_deref(),
+        scheme,
     );
 }
 

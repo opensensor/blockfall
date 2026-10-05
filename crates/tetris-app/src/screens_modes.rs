@@ -219,9 +219,57 @@ pub struct ModeRecordLabel {
     pub id: ModeId,
 }
 
+/// Keyboard/hover cursor into the shipped row list (visual selection).
+/// Reset to 0 whenever the screen is entered (or the ladder closes over it);
+/// Up/Down move it, hover adopts the hovered row, Enter starts what it
+/// points at. Mouse presses still start their own row directly.
+#[derive(Debug, Default, PartialEq, Eq, Resource)]
+pub struct ModeSelection {
+    /// Index into [`shipped_modes`].
+    pub index: usize,
+}
+
 // ---------------------------------------------------------------------------
 // UI construction
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Card palette
+// ---------------------------------------------------------------------------
+
+/// Base row card background.
+const ROW_BG: Color = Color::srgb(0.15, 0.15, 0.19);
+/// Hovered (keyboard- or mouse-highlighted) row background.
+const ROW_BG_HOVER: Color = Color::srgb(0.21, 0.22, 0.28);
+/// Selected row background (keyboard cursor / hovered-and-selected).
+const ROW_BG_SELECTED: Color = Color::srgb(0.18, 0.22, 0.31);
+/// Resting card border — a faint frame so cards read as cards.
+const ROW_BORDER: Color = Color::srgba(0.32, 0.32, 0.40, 0.45);
+/// Dimmed description text.
+const DESC_COLOR: Color = Color::srgb(0.62, 0.63, 0.70);
+/// Mutator section caption.
+const MUTATOR_CAPTION: Color = Color::srgb(0.55, 0.56, 0.64);
+/// Daily banner card (gold family, matching the record accent).
+const DAILY_BG: Color = Color::srgb(0.25, 0.21, 0.12);
+const DAILY_BORDER: Color = Color::srgba(0.78, 0.65, 0.30, 0.85);
+
+/// Per-mode accent colour: the card border when selected and the leading
+/// glyph. Exhaustive, so new catalogue modes must pick an accent.
+#[must_use]
+pub fn mode_accent(id: ModeId) -> Color {
+    match id {
+        ModeId::Marathon => Color::srgb(0.35, 0.75, 1.0),
+        ModeId::Sprint => Color::srgb(1.0, 0.58, 0.30),
+        ModeId::Ultra => Color::srgb(0.75, 0.55, 1.0),
+        ModeId::Dig => Color::srgb(0.55, 0.85, 0.45),
+        ModeId::Survival => Color::srgb(1.0, 0.45, 0.45),
+        ModeId::Zen => Color::srgb(0.45, 0.90, 0.80),
+        ModeId::BotLadder => Color::srgb(1.0, 0.85, 0.40),
+        ModeId::Daily => Color::srgb(1.0, 0.78, 0.35),
+        ModeId::DigDuel => Color::srgb(0.95, 0.50, 0.80),
+        ModeId::Switch => Color::srgb(0.60, 0.85, 0.95),
+    }
+}
 
 /// Landscape row metrics: (row min-height, name, description, record px).
 const ROW_H: f32 = 92.0;
@@ -272,30 +320,70 @@ fn spawn_mode_rows_sized(
 ) {
     for id in ids {
         let record = record_line(records.record_for(mode_key(*id)));
+        let accent = mode_accent(*id);
+        let glyph = display_name(*id)
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string();
         parent
             .spawn((
                 Button,
                 ModeRowButton { id: *id },
-                BackgroundColor(BUTTON_BG),
+                BackgroundColor(ROW_BG),
+                BorderColor::all(ROW_BORDER),
                 Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(14.0),
                     width: Val::Percent(100.0),
                     min_height: Val::Px(row_h),
-                    flex_direction: FlexDirection::Column,
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Start,
-                    row_gap: Val::Px(2.0),
-                    padding: UiRect::axes(Val::Px(16.0), Val::Px(10.0)),
+                    padding: UiRect::axes(Val::Px(18.0), Val::Px(10.0)),
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
                     ..default()
                 },
             ))
             .with_children(|row| {
-                row.spawn(label_node(display_name(*id).to_string(), name_px));
-                row.spawn(label_node(description(*id).to_string(), desc_px));
+                // Leading accent glyph (mode initial) — purely decorative,
+                // the row button owns every click.
+                row.spawn((
+                    Text::new(glyph),
+                    TextFont::from_font_size(name_px + 8.0),
+                    TextColor(accent),
+                    Pickable::IGNORE,
+                ));
+                // Name + dimmed description stacked.
+                row.spawn((
+                    Node {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        ..default()
+                    },
+                    Pickable::IGNORE,
+                ))
+                .with_children(|col| {
+                    col.spawn(label_node(display_name(*id).to_string(), name_px));
+                    col.spawn((
+                        Text::new(description(*id).to_string()),
+                        TextFont::from_font_size(desc_px),
+                        TextColor(DESC_COLOR),
+                        Pickable::IGNORE,
+                    ));
+                });
+                // Record pinned to the trailing edge (auto left margin).
                 row.spawn((
                     ModeRecordLabel { id: *id },
                     Text::new(record),
                     TextFont::from_font_size(rec_px),
                     TextColor(RECORD_COLOR),
+                    Node {
+                        margin: UiRect::axes(Val::Auto, Val::Px(0.0)),
+                        ..default()
+                    },
                     Pickable::IGNORE,
                 ));
             });
@@ -347,19 +435,22 @@ fn build_mode_select_ui(
         .with_children(|root| {
             root.spawn(label_node("SELECT MODE".to_string(), 40.0));
             // Daily Challenge banner (T17): shows today's rotation slot and
-            // status (`Daily · Dig — Not yet` / `— 1:42.35`); a press starts
+            // status (`Daily - Dig: Not yet` / `: 1:42.35`); a press starts
             // TODAY'S mode with TODAY'S seed (daily::start_daily), so it is
             // its own marker component — never a catalogue ModeRowButton.
             root.spawn((
                 Button,
                 DailyRowButton,
-                BackgroundColor(BUTTON_BG),
+                BackgroundColor(DAILY_BG),
+                BorderColor::all(DAILY_BORDER),
                 Node {
                     width: Val::Px(560.0),
                     max_width: Val::Percent(94.0),
                     min_height: Val::Px(52.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
                     ..default()
                 },
                 Text::new(daily::banner_text(
@@ -367,6 +458,15 @@ fn build_mode_select_ui(
                 )),
                 TextFont::from_font_size(18.0),
                 TextColor(RECORD_COLOR),
+            ));
+            // Small section caption so the toggle cluster below reads as a
+            // group instead of stray buttons (ASCII only: the bundled font
+            // subset carries no dash glyphs beyond the basics).
+            root.spawn((
+                Text::new("mutators (apply to the next run)".to_string()),
+                TextFont::from_font_size(12.0),
+                TextColor(MUTATOR_CAPTION),
+                Pickable::IGNORE,
             ));
             // Mutator toggles (T23): the session's selection on GameCore
             // (never persisted), snapshotted into the run by the shared
@@ -570,6 +670,7 @@ struct ModeSelectClickParams<'w, 's> {
     freeze: Res<'w, JuiceFreeze>,
     records: Option<ResMut<'w, Records>>,
     flow: ResMut<'w, VersusFlow>,
+    selection: ResMut<'w, ModeSelection>,
 }
 
 fn mode_select_clicks(mut params: ModeSelectClickParams) {
@@ -577,6 +678,16 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
         return;
     }
     for (_entity, interaction, row, back, daily_row, toggle) in params.buttons.iter() {
+        if *interaction == Interaction::Hovered {
+            // Hover adopts the keyboard cursor (single visible selection for
+            // mouse and keys); a hover never triggers a press.
+            if let Some(row) = row {
+                if let Some(index) = shipped_modes().iter().position(|m| *m == row.id) {
+                    params.selection.index = index;
+                }
+            }
+            continue;
+        }
         if *interaction != Interaction::Pressed {
             continue;
         }
@@ -630,8 +741,9 @@ fn mode_select_clicks(mut params: ModeSelectClickParams) {
 }
 
 /// Keyboard: Escape walks back to the Title (mirroring the versus submenus;
-/// the pause chord is inert on this screen) and Enter activates the first
-/// row. No focus system is invented — the list's only keyboard contract.
+/// the pause chord is inert on this screen); Up/Down move the [`ModeSelection`]
+/// cursor; Enter starts the selected row. No focus system is invented — the
+/// list's only keyboard contract.
 #[derive(SystemParam)]
 struct ModeSelectKeyParams<'w> {
     keys: Option<Res<'w, ButtonInput<KeyCode>>>,
@@ -643,6 +755,7 @@ struct ModeSelectKeyParams<'w> {
     countdown: ResMut<'w, Countdown>,
     records: Option<ResMut<'w, Records>>,
     flow: ResMut<'w, VersusFlow>,
+    selection: ResMut<'w, ModeSelection>,
 }
 
 fn mode_select_key_system(mut params: ModeSelectKeyParams) {
@@ -659,17 +772,29 @@ fn mode_select_key_system(mut params: ModeSelectKeyParams) {
         }
         return;
     }
-    if keys.just_pressed(KeyCode::Escape) {
+    let modes = shipped_modes();
+    if keys.just_pressed(KeyCode::ArrowDown) {
+        if !modes.is_empty() {
+            params.selection.index = (params.selection.index + 1).min(modes.len() - 1);
+        }
+    } else if keys.just_pressed(KeyCode::ArrowUp) {
+        params.selection.index = params.selection.index.saturating_sub(1);
+    } else if keys.just_pressed(KeyCode::Escape) {
         goto_title(&mut params.state, &mut params.sim, &params.freeze);
     } else if keys.just_pressed(KeyCode::Enter) {
-        let Some(first) = shipped_modes().first().copied() else {
+        let Some(id) = modes.get(params.selection.index).or(modes.first()).copied() else {
             return;
         };
-        // T17: Enter starts the first row as a plain run — never a daily
+        if id == ModeId::BotLadder {
+            // Mirror the row-click routing: the ladder is not a solo run.
+            crate::screens_ladder::open_ladder(&mut params.state, &mut params.flow);
+            return;
+        }
+        // T17: Enter starts the selected row as a plain run — never a daily
         // attempt.
         params.flow.daily = DailyAttempt::Idle;
         start_mode_row(
-            first,
+            id,
             params.core.as_mut(),
             params.countdown.as_mut(),
             &mut params.state,
@@ -735,6 +860,61 @@ fn mode_scroll_system(
     }
 }
 
+/// Park the keyboard cursor at the first row when the list is entered (and
+/// when the ladder screen closes back over it — `VersusFlow` is written on
+/// other occasions too, hence the state guard; a row press flips the state
+/// to `Playing` before this system runs, so it never resets mid-transition).
+fn reset_mode_selection(
+    state: Res<AppState>,
+    flow: Res<VersusFlow>,
+    mut selection: ResMut<ModeSelection>,
+) {
+    let entered = state.is_changed() && *state == AppState::ModeSelect;
+    let ladder_closed =
+        flow.is_changed() && flow.ladder == LadderOrigin::Closed && *state == AppState::ModeSelect;
+    if entered || ladder_closed {
+        selection.index = 0;
+    }
+}
+
+/// Card visuals from the cursor + hover state: selected → accent border and
+/// a highlighted background, hovered-only → lighter card, rest → faint frame.
+/// Rows without an `Interaction` component (headless apps, no picking plugin)
+/// simply never report hover.
+fn sync_mode_row_styles(
+    selection: Res<ModeSelection>,
+    mut rows: Query<(
+        &ModeRowButton,
+        Option<&Interaction>,
+        &mut BackgroundColor,
+        &mut BorderColor,
+    )>,
+) {
+    let modes = shipped_modes();
+    for (row, interaction, mut bg, mut border) in rows.iter_mut() {
+        let hovered = interaction.is_some_and(|i| !matches!(i, Interaction::None));
+        let selected = modes.get(selection.index) == Some(&row.id);
+        let accent = mode_accent(row.id);
+        let want_bg = if selected {
+            ROW_BG_SELECTED
+        } else if hovered {
+            ROW_BG_HOVER
+        } else {
+            ROW_BG
+        };
+        let want_border = if selected { accent } else { ROW_BORDER };
+        if bg.0 != want_bg {
+            bg.0 = want_bg;
+        }
+        if border.top != want_border {
+            border.top = want_border;
+            border.right = want_border;
+            border.bottom = want_border;
+            border.left = want_border;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -754,6 +934,7 @@ impl Plugin for ModeSelectPlugin {
             .init_resource::<JuiceFreeze>()
             .init_resource::<RebindingCapture>()
             .init_resource::<Records>()
+            .init_resource::<ModeSelection>()
             // T16: the ladder flow marker lives on the title flow resource;
             // the row routing and the list-hiding gate read it (defensive
             // init — no-op when MenuScreensPlugin already registered it).
@@ -772,9 +953,11 @@ impl Plugin for ModeSelectPlugin {
         }
         app.add_systems(Startup, build_mode_select_ui).add_systems(
             Update,
-            // Input first (a press transitions the same frame), then the
-            // scroll pass, then the visibility/label syncs observing it.
+            // Cursor reset first (entry frame), input next (a press
+            // transitions the same frame), then the scroll pass, then the
+            // visibility/label/style syncs observing it.
             (
+                reset_mode_selection,
                 mode_select_key_system,
                 mode_select_clicks,
                 sync_mutator_toggle_labels,
@@ -782,6 +965,7 @@ impl Plugin for ModeSelectPlugin {
                 sync_mode_select_visibility,
                 sync_mode_record_labels,
                 sync_daily_banner,
+                sync_mode_row_styles,
             )
                 .chain(),
         );
@@ -816,6 +1000,10 @@ mod tests {
             }),
             ..default()
         });
+        // The fixed-step input systems (T12) validate `Res<Settings>`; the
+        // ladder flow is the first path here that runs them, so mirror the
+        // defensive init used by the input/ladder test fixtures.
+        app.init_resource::<crate::state::Settings>();
         app.add_plugins((
             crate::core_bridge::CoreBridgePlugin,
             crate::hud::HudPlugin,
@@ -1139,6 +1327,72 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_move_the_cursor_and_enter_starts_the_selected_row() {
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+        assert_eq!(app.world().resource::<ModeSelection>().index, 0);
+
+        press_key(&mut app, KeyCode::ArrowDown);
+        assert_eq!(app.world().resource::<ModeSelection>().index, 1);
+        press_key(&mut app, KeyCode::ArrowUp);
+        assert_eq!(
+            app.world().resource::<ModeSelection>().index,
+            0,
+            "ArrowUp clamps at the first row"
+        );
+
+        // Down past the end parks on the last row (no wrap).
+        for _ in 0..40 {
+            press_key(&mut app, KeyCode::ArrowDown);
+        }
+        assert_eq!(
+            app.world().resource::<ModeSelection>().index,
+            shipped_modes().len() - 1,
+            "cursor clamps at the last row"
+        );
+        // The last shipped row is Bot Ladder: Enter mirrors the row click and
+        // opens the ladder screen (never starts a solo run).
+        press_key(&mut app, KeyCode::Enter);
+        assert_eq!(app_state(&app), AppState::ModeSelect);
+        assert_ne!(
+            app.world().resource::<VersusFlow>().ladder,
+            LadderOrigin::Closed,
+            "Enter on the Bot Ladder row opens the ladder"
+        );
+
+        // A plain row further up still starts its run through the cursor.
+        // (Closing the ladder resets the cursor to the first row, so this
+        // moves down exactly one.)
+        press_key(&mut app, KeyCode::Escape);
+        press_key(&mut app, KeyCode::ArrowDown);
+        press_key(&mut app, KeyCode::Enter);
+        assert_eq!(app_state(&app), AppState::Playing);
+        assert_eq!(
+            app.world().non_send::<GameCore>().active_mode.id,
+            *shipped_modes().get(1).expect("two shipped rows"),
+            "Enter starts the cursor's row"
+        );
+    }
+
+    #[test]
+    fn re_entering_the_list_parks_the_cursor_on_the_first_row() {
+        let mut app = mode_select_test_app();
+        app.insert_resource(Records::default());
+        set_state(&mut app, AppState::ModeSelect);
+        press_key(&mut app, KeyCode::ArrowDown);
+        assert_eq!(app.world().resource::<ModeSelection>().index, 1);
+        press_key(&mut app, KeyCode::Escape);
+        assert_eq!(app_state(&app), AppState::Title);
+        set_state(&mut app, AppState::ModeSelect);
+        assert_eq!(
+            app.world().resource::<ModeSelection>().index,
+            0,
+            "entry resets the cursor"
+        );
+    }
+
+    #[test]
     fn scroll_clamp_math_is_pure() {
         // viewport 200, content 500 => max scroll 300.
         assert_eq!(clamp_scroll(0.0, 1000.0, 200.0, 500.0), 300.0);
@@ -1420,7 +1674,7 @@ mod tests {
 
         assert_eq!(
             daily_banner_text(&mut app),
-            format!("Daily \u{b7} {mode} \u{2014} Not yet"),
+            format!("Daily - {mode}: Not yet"),
             "banner shows today's rotation slot, nothing recorded yet"
         );
 
@@ -1436,7 +1690,7 @@ mod tests {
         app.update();
         assert_eq!(
             daily_banner_text(&mut app),
-            format!("Daily \u{b7} {mode} \u{2014} 1:42.35"),
+            format!("Daily - {mode}: 1:42.35"),
             "today's stored result replaces the placeholder"
         );
     }

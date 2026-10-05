@@ -694,6 +694,7 @@ fn spawn_next_preview(
     index: usize,
     center: Vec2,
     s: f32,
+    scheme: crate::state::ColorScheme,
 ) -> Entity {
     let root = commands
         .spawn((
@@ -706,7 +707,7 @@ fn spawn_next_preview(
             .spawn((
                 HudMiniCell,
                 Sprite {
-                    color: render::piece_color(piece),
+                    color: render::piece_color_in(scheme, piece),
                     custom_size: Some(Vec2::splat(s)),
                     ..default()
                 },
@@ -755,6 +756,7 @@ struct MiniLayout {
     s: f32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_next_preview(
     preview: &mut NextPreview,
     transform: &mut Transform,
@@ -763,13 +765,14 @@ fn refresh_next_preview(
     index: usize,
     layout: &MiniLayout,
     cells: &mut CellsQuery,
+    scheme: crate::state::ColorScheme,
 ) {
     transform.translation = layout.center.extend(0.5);
     let relaid = preview.piece != piece;
     preview.piece = piece;
     preview.index = index;
     let offsets = mini_offsets(piece, layout.s);
-    let color = render::piece_color(piece);
+    let color = render::piece_color_in(scheme, piece);
     for (i, child) in cell_entities.iter().enumerate() {
         if let Ok((mut sprite, mut sprite_transform)) = cells.get_mut(*child) {
             sprite.color = color;
@@ -787,8 +790,8 @@ fn refresh_next_preview(
 /// to a higher value with it).
 pub const HOLD_USED_ALPHA: f32 = 0.3;
 
-fn hold_cell_color(piece: Piece, used: bool) -> Color {
-    let color = render::piece_color(piece);
+fn hold_cell_color(piece: Piece, used: bool, scheme: crate::state::ColorScheme) -> Color {
+    let color = render::piece_color_in(scheme, piece);
     if used {
         color.with_alpha(HOLD_USED_ALPHA)
     } else {
@@ -809,6 +812,9 @@ fn sync_hud_previews(
     mut cells: CellsQuery,
     versus: Option<NonSend<VersusMatch>>,
 ) {
+    let scheme = settings
+        .as_deref()
+        .map_or(crate::state::ColorScheme::Classic, |s| s.color_scheme);
     // Self-heal the versus hide every frame (see `sync_hud_texts`).
     let hud_wanted = if versus.is_some_and(|versus| versus.active) {
         Visibility::Hidden
@@ -860,6 +866,7 @@ fn sync_hud_previews(
             index,
             next_center(&anchor, index),
             mini,
+            scheme,
         );
         entities.next_roots.push(entity);
     }
@@ -879,6 +886,7 @@ fn sync_hud_previews(
             index,
             &layout,
             &mut cells,
+            scheme,
         );
     }
 
@@ -913,7 +921,7 @@ fn sync_hud_previews(
     }
     if changed {
         if let Some(piece) = snapshot.hold {
-            let color = hold_cell_color(piece, snapshot.hold_used);
+            let color = hold_cell_color(piece, snapshot.hold_used, scheme);
             let offsets = mini_offsets(piece, mini);
             for (i, child) in children.iter().take(wanted_cells).enumerate() {
                 if let Ok((mut sprite, mut sprite_transform)) = cells.get_mut(*child) {
@@ -1287,6 +1295,7 @@ type VersusMiniQuery<'w, 's> = Query<
 #[allow(clippy::too_many_arguments)]
 fn sync_versus_hud(
     versus: Option<NonSend<VersusMatch>>,
+    settings: Option<Res<Settings>>,
     fixture: Option<Res<VersusHudFixture>>,
     flow: Option<Res<VersusFlow>>,
     windows: Query<&Window>,
@@ -1372,6 +1381,9 @@ fn sync_versus_hud(
         }
     }
 
+    let scheme = settings
+        .as_deref()
+        .map_or(crate::state::ColorScheme::Classic, |s| s.color_scheme);
     for (preview, mut visibility, mut transform, children) in previews.iter_mut() {
         let anchor = if preview.side == Side::Left {
             left
@@ -1405,7 +1417,7 @@ fn sync_versus_hud(
             *visibility = wanted;
         }
         let Some(piece) = piece else { continue };
-        let color = render::piece_color(piece);
+        let color = render::piece_color_in(scheme, piece);
         let offsets = mini_offsets(piece, s);
         for (index, child) in children.iter().enumerate() {
             if let Ok((mut sprite, mut cell_transform)) = minis.get_mut(child) {
@@ -2426,22 +2438,22 @@ mod tests {
     fn ultra_fixture_counts_down_to_the_tenth() {
         let mut app = hud_app(1);
         frame(&mut app, &[]);
-        ultra_fixture(&mut app, 6_600);
+        ultra_fixture(&mut app, modes::ULTRA_CLOCK_TICKS - 600);
         assert_eq!(
             text_of(&mut app, HudTextSlot::Clock),
             Some("TIME\n0:10.00".to_string()),
-            "6 600 elapsed of 7 200 → 10 s remaining"
+            "21 000 elapsed of 21 600 → 10 s remaining"
         );
         assert_eq!(
             text_of(&mut app, HudTextSlot::Goal),
             None,
             "Ultra shows no goal row (score already shown)"
         );
-        ultra_fixture(&mut app, 7_199);
+        ultra_fixture(&mut app, modes::ULTRA_CLOCK_TICKS - 1);
         assert_eq!(
             text_of(&mut app, HudTextSlot::Clock),
             Some("TIME\n0:00.01".to_string()),
-            "7 199 elapsed → 1 tick remaining, truncated"
+            "21 599 elapsed → 1 tick remaining, truncated"
         );
     }
 

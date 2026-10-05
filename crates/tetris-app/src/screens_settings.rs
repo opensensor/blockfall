@@ -232,6 +232,32 @@ pub fn cycle_next_queue_size(size: &mut u8) {
     };
 }
 
+/// Soundtrack cycles through [`Soundtrack::ALL`] (Classic → Auto → Pulse →
+/// Drift → Classic). `audio::start_bgm` restarts the loop the same frame.
+pub fn cycle_soundtrack(track: &mut crate::state::Soundtrack) {
+    use crate::state::Soundtrack;
+    *track = match track {
+        Soundtrack::Classic => Soundtrack::Auto,
+        Soundtrack::Auto => Soundtrack::Pulse,
+        Soundtrack::Pulse => Soundtrack::Drift,
+        Soundtrack::Drift => Soundtrack::Classic,
+    };
+}
+
+/// Color scheme toggles Classic ↔ Colorblind (Okabe–Ito palette).
+pub fn cycle_color_scheme(scheme: &mut crate::state::ColorScheme) {
+    use crate::state::ColorScheme;
+    *scheme = match scheme {
+        ColorScheme::Classic => ColorScheme::Colorblind,
+        ColorScheme::Colorblind => ColorScheme::Classic,
+    };
+}
+
+/// Flip the reduced-flash accessibility flag.
+pub fn toggle_reduce_flash(on: &mut bool) {
+    *on = !*on;
+}
+
 /// Screen-local resource: which state [`handle_back`] restores. Defaults to
 /// [`AppState::Title`] (PRD §7.1); [`track_settings_entry`] records the
 /// screen the user arrived from (Pause keeps returning to Pause).
@@ -406,11 +432,32 @@ pub struct EffectsButton;
 #[derive(Component)]
 pub struct QueueButton;
 
+/// Button cycling [`Settings::soundtrack`] (Classic → Auto → Pulse → Drift).
+#[derive(Component)]
+pub struct SoundtrackButton;
+
+/// Button toggling [`Settings::color_scheme`] (Classic ↔ Colorblind).
+#[derive(Component)]
+pub struct SchemeButton;
+
+/// Button toggling [`Settings::reduce_flash`].
+#[derive(Component)]
+pub struct FlashButton;
+
 #[derive(Component)]
 struct EffectsText;
 
 #[derive(Component)]
 struct QueueText;
+
+#[derive(Component)]
+struct SoundtrackText;
+
+#[derive(Component)]
+struct SchemeText;
+
+#[derive(Component)]
+struct FlashText;
 
 /// Which slider currently owns the pointer (drag focus).
 #[derive(Debug, Default, Resource)]
@@ -473,6 +520,9 @@ type ClickQuery<'w, 's> = Query<
         Option<&'static ResetSlot>,
         Has<EffectsButton>,
         Has<QueueButton>,
+        Has<SoundtrackButton>,
+        Has<SchemeButton>,
+        Has<FlashButton>,
         Has<ResetAllButton>,
         Has<BackButton>,
     ),
@@ -494,7 +544,19 @@ fn button_clicks(mut params: ClickParams) {
     if *params.app_state != AppState::Settings {
         return;
     }
-    for (_entity, interaction, row, reset, effects, queue, reset_all, back) in params.buttons.iter()
+    for (
+        _entity,
+        interaction,
+        row,
+        reset,
+        effects,
+        queue,
+        soundtrack,
+        scheme,
+        flash,
+        reset_all,
+        back,
+    ) in params.buttons.iter()
     {
         if *interaction != Interaction::Pressed {
             continue;
@@ -507,6 +569,12 @@ fn button_clicks(mut params: ClickParams) {
             cycle_effects(&mut params.settings.effects);
         } else if queue {
             cycle_next_queue_size(&mut params.settings.next_queue_size);
+        } else if soundtrack {
+            cycle_soundtrack(&mut params.settings.soundtrack);
+        } else if scheme {
+            cycle_color_scheme(&mut params.settings.color_scheme);
+        } else if flash {
+            toggle_reduce_flash(&mut params.settings.reduce_flash);
         } else if reset_all {
             reset_all_bindings(&mut params.bindings);
         } else if back {
@@ -627,6 +695,9 @@ type LabelQuery<'w, 's> = Query<
         Option<&'static ValueText>,
         Has<EffectsText>,
         Has<QueueText>,
+        Has<SoundtrackText>,
+        Has<SchemeText>,
+        Has<FlashText>,
     ),
 >;
 
@@ -656,7 +727,9 @@ fn sync_labels(params: SyncParams) {
         mut texts,
         mut fills,
     } = params;
-    for (mut text, bind_value, value_text, effects, queue) in texts.iter_mut() {
+    for (mut text, bind_value, value_text, effects, queue, soundtrack, scheme, flash) in
+        texts.iter_mut()
+    {
         if let Some(bind_value) = bind_value {
             *text = if capture.capturing && target.slot == Some(bind_value.slot) {
                 Text::new(CAPTURE_HINT)
@@ -669,6 +742,12 @@ fn sync_labels(params: SyncParams) {
             *text = Text::new(effects_name(settings.effects));
         } else if queue {
             *text = Text::new(settings.next_queue_size.to_string());
+        } else if soundtrack {
+            *text = Text::new(settings.soundtrack.label());
+        } else if scheme {
+            *text = Text::new(settings.color_scheme.label());
+        } else if flash {
+            *text = Text::new(if settings.reduce_flash { "On" } else { "Off" });
         }
     }
     for (mut node, fill) in fills.iter_mut() {
@@ -842,6 +921,28 @@ fn build_settings_ui(mut commands: Commands, settings: Res<Settings>, bindings: 
             add_slider(root, "Master", &settings, SliderKey::MasterVolume);
             add_slider(root, "SFX", &settings, SliderKey::SfxVolume);
             add_slider(root, "Music", &settings, SliderKey::MusicVolume);
+            add_cycle_row(
+                root,
+                "Soundtrack",
+                SoundtrackButton,
+                SoundtrackText,
+                settings.soundtrack.label().to_string(),
+            );
+            section_header(root, "Accessibility");
+            add_cycle_row(
+                root,
+                "Colors",
+                SchemeButton,
+                SchemeText,
+                settings.color_scheme.label().to_string(),
+            );
+            add_cycle_row(
+                root,
+                "Reduce flash",
+                FlashButton,
+                FlashText,
+                if settings.reduce_flash { "On" } else { "Off" }.to_string(),
+            );
             section_header(root, "Timing");
             add_slider(root, "DAS", &settings, SliderKey::Das);
             add_slider(root, "ARR", &settings, SliderKey::Arr);
@@ -1394,6 +1495,70 @@ mod tests {
         assert_eq!(app.world().resource::<Settings>().next_queue_size, 6);
         click_button(&mut app, |world, e| world.get::<QueueButton>(e).is_some());
         assert_eq!(app.world().resource::<Settings>().next_queue_size, 1);
+    }
+
+    #[test]
+    fn cycle_soundtrack_wraps_all_variants() {
+        use crate::state::Soundtrack;
+        let mut track = Soundtrack::Classic;
+        for want in [
+            Soundtrack::Auto,
+            Soundtrack::Pulse,
+            Soundtrack::Drift,
+            Soundtrack::Classic,
+        ] {
+            cycle_soundtrack(&mut track);
+            assert_eq!(track, want);
+        }
+    }
+
+    #[test]
+    fn cycle_color_scheme_toggles_both_ways() {
+        use crate::state::ColorScheme;
+        let mut scheme = ColorScheme::Classic;
+        cycle_color_scheme(&mut scheme);
+        assert_eq!(scheme, ColorScheme::Colorblind);
+        cycle_color_scheme(&mut scheme);
+        assert_eq!(scheme, ColorScheme::Classic);
+        let mut on = false;
+        toggle_reduce_flash(&mut on);
+        assert!(on);
+        toggle_reduce_flash(&mut on);
+        assert!(!on);
+    }
+
+    #[test]
+    fn soundtrack_button_cycles_settings() {
+        use crate::state::Soundtrack;
+        let mut app = settings_test_app();
+        set_state(&mut app, AppState::Settings);
+        for want in [
+            Soundtrack::Auto,
+            Soundtrack::Pulse,
+            Soundtrack::Drift,
+            Soundtrack::Classic,
+        ] {
+            click_button(&mut app, |world, e| {
+                world.get::<SoundtrackButton>(e).is_some()
+            });
+            assert_eq!(app.world().resource::<Settings>().soundtrack, want);
+        }
+    }
+
+    #[test]
+    fn accessibility_buttons_toggle_settings() {
+        use crate::state::ColorScheme;
+        let mut app = settings_test_app();
+        set_state(&mut app, AppState::Settings);
+        click_button(&mut app, |world, e| world.get::<SchemeButton>(e).is_some());
+        assert_eq!(
+            app.world().resource::<Settings>().color_scheme,
+            ColorScheme::Colorblind
+        );
+        click_button(&mut app, |world, e| world.get::<FlashButton>(e).is_some());
+        assert!(app.world().resource::<Settings>().reduce_flash);
+        click_button(&mut app, |world, e| world.get::<FlashButton>(e).is_some());
+        assert!(!app.world().resource::<Settings>().reduce_flash);
     }
 
     #[test]

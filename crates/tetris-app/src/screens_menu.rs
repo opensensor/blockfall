@@ -72,6 +72,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
+use bevy::render::view::window::screenshot::{save_to_disk, Screenshot};
 
 use tetris_core::versus::{AttackRule, Side, DEFAULT_RACE_LINES};
 
@@ -93,6 +94,7 @@ use crate::screens_ladder::{rung_cooldown, LadderOrigin};
 use crate::screens_modes::{open_mode_select, record_line};
 use crate::settings_persist::PersistedBestScore;
 use crate::state::{AppState, CaptureOrder, RebindingCapture};
+use crate::stats::{self, RunStats};
 use tetris_core::game::GameSnapshot;
 use tetris_core::mode::FinishReason;
 
@@ -472,6 +474,21 @@ pub struct TitleRoot;
 #[derive(Component)]
 pub struct PauseRoot;
 
+/// Per-run stats line on the game-over screen (PPS / lines-min / t-spins /
+/// tetrises / max combo), fed from [`RunStats`] + `GameCore::steps`.
+#[derive(Component)]
+struct StatsExtraText;
+
+/// Hint under a daily game-over headline: `S` (desktop) or the button below
+/// writes the share image next to the game.
+#[derive(Component)]
+struct ShareHintText;
+
+/// Button saving the daily share image (only shown while a daily result
+/// headline is on screen).
+#[derive(Component)]
+pub struct ShareShotButton;
+
 /// Root of the game-over screen; visible only in [`AppState::GameOver`].
 #[derive(Component)]
 pub struct GameOverRoot;
@@ -765,6 +782,7 @@ type MenuClickQuery<'w, 's> = Query<
         Has<OpenSettingsButton>,
         Has<QuitToTitleButton>,
         Has<QuitButton>,
+        Has<ShareShotButton>,
     ),
     (With<Button>, Changed<Interaction>),
 >;
@@ -785,6 +803,8 @@ struct MenuClickParams<'w, 's> {
     winner: Option<ResMut<'w, VersusWinner>>,
     records: Option<ResMut<'w, Records>>,
     exits: MessageWriter<'w, AppExit>,
+    result: Res<'w, TerminalResult>,
+    commands: Commands<'w, 's>,
 }
 
 fn menu_button_clicks(mut params: MenuClickParams) {
@@ -794,7 +814,7 @@ fn menu_button_clicks(mut params: MenuClickParams) {
     ) {
         return;
     }
-    for (_entity, interaction, start, again, resume, restart, settings, to_title, quit) in
+    for (_entity, interaction, start, again, resume, restart, settings, to_title, quit, share) in
         params.buttons.iter()
     {
         if *interaction != Interaction::Pressed {
@@ -888,12 +908,46 @@ fn menu_button_clicks(mut params: MenuClickParams) {
                     // list (the mode you just played is one row away), not
                     // past it to the title.
                     open_mode_select(&mut params.state, &mut params.sim, &params.freeze);
+                } else if share {
+                    spawn_share_shot(&mut params.commands, &params.result);
                 } else if quit {
                     quit_now();
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Writes the daily share image next to the game. No-op unless a daily
+/// result headline is on screen — Bevy 0.19 has no clipboard, so the PNG
+/// *is* the shareable artifact (name: `blockfall_daily_<date>.png`).
+pub(crate) fn spawn_share_shot(commands: &mut Commands, result: &TerminalResult) {
+    if result.daily_share.is_none() {
+        return;
+    }
+    let name = format!("blockfall_daily_{}.png", daily::today());
+    let path = std::env::current_dir()
+        .map(|dir| dir.join(name))
+        .unwrap_or_else(|_| std::path::PathBuf::from("blockfall_daily.png"));
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+}
+
+/// `S` on the game-over screen saves the daily share image — desktop twin of
+/// [`ShareShotButton`] for players who never leave the keyboard.
+fn share_shot_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<AppState>,
+    result: Res<TerminalResult>,
+    mut commands: Commands,
+) {
+    if *state != AppState::GameOver || result.daily_share.is_none() {
+        return;
+    }
+    if keys.just_pressed(KeyCode::KeyS) {
+        spawn_share_shot(&mut commands, &result);
     }
 }
 
@@ -1236,16 +1290,34 @@ type StatsLabels<'w, 's> = Query<
         Without<BestText>,
         Without<RecordText>,
         Without<ResultText>,
+        Without<StatsExtraText>,
     ),
 >;
 
 /// Best-score label query.
-type BestLabels<'w, 's> =
-    Query<'w, 's, &'static mut Text, (With<BestText>, Without<RecordText>, Without<ResultText>)>;
+type BestLabels<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Text,
+    (
+        With<BestText>,
+        Without<RecordText>,
+        Without<ResultText>,
+        Without<StatsExtraText>,
+    ),
+>;
 
 /// Record-highlight label query.
-type RecordLabels<'w, 's> =
-    Query<'w, 's, &'static mut Text, (With<RecordText>, Without<ResultText>)>;
+type RecordLabels<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Text,
+    (
+        With<RecordText>,
+        Without<ResultText>,
+        Without<StatsExtraText>,
+    ),
+>;
 
 /// Mode-headline label query (text + layout slot, T9 — `Display::None`
 /// keeps Marathon's screen pixel-identical to today's when empty).
@@ -1258,6 +1330,34 @@ type ResultLabels<'w, 's> = Query<
         Without<StatsText>,
         Without<BestText>,
         Without<RecordText>,
+        Without<StatsExtraText>,
+        Without<ShareShotButton>,
+        Without<ShareHintText>,
+    ),
+>;
+
+/// Per-run stats line label (game over).
+type ExtraLabels<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Text,
+    (
+        With<StatsExtraText>,
+        Without<StatsText>,
+        Without<BestText>,
+        Without<RecordText>,
+        Without<ResultText>,
+    ),
+>;
+
+/// Share-card widgets (button + hint), layout-toggled as a pair.
+type ShareUi<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Node,
+    (
+        Or<(With<ShareShotButton>, With<ShareHintText>)>,
+        Without<ResultText>,
     ),
 >;
 
@@ -1278,6 +1378,9 @@ struct ScreenTextParams<'w, 's> {
     best_labels: BestLabels<'w, 's>,
     record_labels: RecordLabels<'w, 's>,
     result_labels: ResultLabels<'w, 's>,
+    run_stats: Option<Res<'w, RunStats>>,
+    extra_labels: ExtraLabels<'w, 's>,
+    share_ui: ShareUi<'w, 's>,
 }
 
 fn sync_screen_texts(params: ScreenTextParams) {
@@ -1291,6 +1394,9 @@ fn sync_screen_texts(params: ScreenTextParams) {
         mut best_labels,
         mut record_labels,
         mut result_labels,
+        run_stats,
+        mut extra_labels,
+        mut share_ui,
     } = params;
     if !state.is_changed() && !best.is_changed() && !result.is_changed() {
         return;
@@ -1334,6 +1440,24 @@ fn sync_screen_texts(params: ScreenTextParams) {
         String::new()
     };
     let headline_shown = !headline.is_empty();
+    let steps = core.as_deref().map(|core| core.steps);
+    let extra = match (game_over, run_stats.as_deref(), steps) {
+        (true, Some(stats), Some(steps)) => stats::format_run_stats(stats, steps),
+        _ => String::new(),
+    };
+    for mut text in extra_labels.iter_mut() {
+        *text = Text::new(extra.clone());
+    }
+    let share_wanted = if game_over && result.daily_share.is_some() {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in share_ui.iter_mut() {
+        if node.display != share_wanted {
+            node.display = share_wanted;
+        }
+    }
     for (mut text, mut node) in result_labels.iter_mut() {
         *text = Text::new(headline.clone());
         let wanted = if headline_shown {
@@ -1364,6 +1488,41 @@ fn startup_goto_title_system(mut state: ResMut<AppState>) {
 // ---------------------------------------------------------------------------
 // Startup UI construction
 // ---------------------------------------------------------------------------
+
+/// Marker for the shared rounded-card button style added by `menu_button`:
+/// hover/press tinting driven by [`sync_menu_card_styles`].
+#[derive(Component)]
+pub struct MenuCard;
+
+/// Resting card border (a visible frame on the dim/panel backgrounds).
+const CARD_BORDER: Color = Color::srgba(0.32, 0.32, 0.40, 0.55);
+/// Hovered/pressed card background and border.
+const CARD_BG_HOVER: Color = Color::srgb(0.30, 0.31, 0.38);
+const CARD_BORDER_HOVER: Color = Color::srgb(0.55, 0.62, 0.78);
+
+/// Restyle [`MenuCard`] buttons from their picking state (title, pause,
+/// game-over and every submenu use `menu_button`, so this styles them all;
+/// mode rows and mutator toggles own their own look). Headless apps without
+/// a picking plugin never report interaction and stay in the resting style.
+fn sync_menu_card_styles(
+    mut cards: Query<(&Interaction, &mut BackgroundColor, &mut BorderColor), With<MenuCard>>,
+) {
+    for (interaction, mut bg, mut border) in cards.iter_mut() {
+        let (bg_want, border_want) = match interaction {
+            Interaction::Pressed | Interaction::Hovered => (CARD_BG_HOVER, CARD_BORDER_HOVER),
+            Interaction::None => (BUTTON_BG, CARD_BORDER),
+        };
+        if bg.0 != bg_want {
+            bg.0 = bg_want;
+        }
+        if border.top != border_want {
+            border.top = border_want;
+            border.right = border_want;
+            border.bottom = border_want;
+            border.left = border_want;
+        }
+    }
+}
 
 pub(crate) fn label_node(text: String, size: f32) -> (Text, TextFont, TextColor, Pickable) {
     (
@@ -1435,10 +1594,14 @@ pub(crate) fn menu_button(parent: &mut ChildSpawnerCommands, text: &str, marker:
         .spawn((
             Button,
             marker,
+            MenuCard,
             BackgroundColor(BUTTON_BG),
+            BorderColor::all(CARD_BORDER),
             Node {
                 width: Val::Px(220.0),
                 height: Val::Px(36.0),
+                border: UiRect::all(Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(9.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 ..default()
@@ -1569,6 +1732,39 @@ fn build_menu_ui(mut commands: Commands, bindings: Res<KeyBindings>) {
             TextFont::from_font_size(26.0),
             TextColor(RECORD_COLOR),
         ));
+        root.spawn((StatsExtraText, label_node(String::new(), 16.0)));
+        // Daily share card: shown only under a daily result headline.
+        root.spawn((
+            Button,
+            ShareShotButton,
+            MenuCard,
+            BackgroundColor(BUTTON_BG),
+            BorderColor::all(CARD_BORDER),
+            Node {
+                display: Display::None,
+                width: Val::Px(220.0),
+                height: Val::Px(36.0),
+                border: UiRect::all(Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(9.0)),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_children(|button| {
+            button.spawn(label_node("Save share image".to_string(), 18.0));
+        });
+        root.spawn((
+            ShareHintText,
+            Node {
+                display: Display::None,
+                ..default()
+            },
+            label_node(
+                "...or press S - writes a PNG next to the game".to_string(),
+                13.0,
+            ),
+        ));
         menu_button(root, "Play again", PlayAgainButton);
         menu_button(root, "Menu", QuitToTitleButton);
         #[cfg(not(target_os = "android"))]
@@ -1640,6 +1836,8 @@ impl Plugin for MenuScreensPlugin {
                 sync_root_visibility,
                 sync_screen_texts,
                 sync_versus_winner_text,
+                sync_menu_card_styles,
+                share_shot_key,
             )
                 .chain(),
         );
@@ -3861,8 +4059,8 @@ mod tests {
         );
         assert_eq!(
             text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
-            format!("Blockfall Daily 2026-10-01 \u{b7} Sprint \u{b7} {time}"),
-            "the headline is the exact share line (U+00B7 separators)"
+            format!("Blockfall Daily 2026-10-01 - Sprint - {time}"),
+            "the headline is the exact share line (ASCII separators)"
         );
         assert_eq!(
             flow_daily(&app),
@@ -3894,7 +4092,7 @@ mod tests {
         );
         assert_eq!(
             text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
-            format!("Blockfall Daily 2026-10-01 \u{b7} Sprint \u{b7} {time}"),
+            format!("Blockfall Daily 2026-10-01 - Sprint - {time}"),
             "the share line keeps quoting the stored first result"
         );
         daily::set_today_override(None);
@@ -3921,7 +4119,7 @@ mod tests {
         );
         assert_eq!(
             text_of(&mut app, |world, e| world.get::<ResultText>(e).is_some()),
-            format!("Blockfall Daily 2026-10-01 \u{b7} Ultra \u{b7} {score}")
+            format!("Blockfall Daily 2026-10-01 - Ultra - {score}")
         );
         daily::set_today_override(None);
     }

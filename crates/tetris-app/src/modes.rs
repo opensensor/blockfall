@@ -25,7 +25,7 @@ const TICKS_PER_SECOND: u64 = 60;
 pub const PRE_ROLL_TICKS: u32 = 180;
 
 /// Ultra score-attack clock budget (6 minutes at 60 Hz).
-pub const ULTRA_CLOCK_TICKS: u64 = 7200;
+pub const ULTRA_CLOCK_TICKS: u64 = 21_600;
 
 /// Sprint win condition: lines to clear.
 pub const SPRINT_GOAL_LINES: u32 = 40;
@@ -324,7 +324,7 @@ mod tests {
         assert!(!sprint.levels_advance, "Sprint gravity fixed at level 1");
 
         let ultra = mode_config(ModeId::Ultra);
-        assert_eq!(ultra.clock_ticks, Some(7200));
+        assert_eq!(ultra.clock_ticks, Some(21_600));
         assert!(ultra.levels_advance, "Ultra uses marathon progression");
         assert_eq!(ultra.goal, None);
 

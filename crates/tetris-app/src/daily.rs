@@ -30,8 +30,9 @@
 //! any completed run once today's date is stored, and a new day replaces the
 //! stored entry. The display string is `1:42.35` for the time modes (Sprint,
 //! Dig) and the plain score for Ultra, per the share line:
-//! `Blockfall Daily 2026-10-01 · Dig · 1:42.35` (U+00B7 separators). Bevy
-//! 0.19 has no clipboard, so the line is display-only text (owner decision).
+//! `Blockfall Daily 2026-10-01 - Dig - 1:42.35` — ASCII throughout: it is
+//! rendered in-game from the bundled font subset (lacks U+00B7) and shown
+//! verbatim on the game-over headline.
 
 use std::cell::Cell;
 use std::fmt;
@@ -224,13 +225,13 @@ pub fn daily_result_string(
     }
 }
 
-/// The share line, exact format: `Blockfall Daily 2026-10-01 · Dig · 1:42.35`
-/// — date `YYYY-MM-DD`, U+00B7 middle-dot separators. Display-only text
-/// (Bevy 0.19 has no clipboard — owner decision).
+/// The share line, exact format: `Blockfall Daily 2026-10-01 - Dig - 1:42.35`
+/// — date `YYYY-MM-DD`, ASCII separators (renders in-game from the bundled
+/// font subset; shown as the game-over headline next to the share button).
 #[must_use]
 pub fn share_line(date: CivilDate, mode: ModeId, result: &str) -> String {
     format!(
-        "Blockfall Daily {} \u{b7} {} \u{b7} {}",
+        "Blockfall Daily {} - {} - {}",
         date,
         display_name(mode),
         result
@@ -333,9 +334,11 @@ pub fn finish_daily_attempt(
     Some((share_line(date, mode, &shown), wrote))
 }
 
-/// One-line banner text for the mode-select screen: `Daily · Dig — Not yet`
-/// before the first completion, `Daily · Dig — 1:42.35` (the stored result)
+/// One-line banner text for the mode-select screen: `Daily - Dig: Not yet`
+/// before the first completion, `Daily - Dig: 1:42.35` (the stored result)
 /// once today's run is done. Stale records (another date) read "Not yet".
+/// ASCII only on purpose: the bundled font subset lacks U+00B7/U+2014
+/// (the share line above is ASCII for the same reason).
 #[must_use]
 pub fn banner_text(record: Option<&Record>) -> String {
     let date = today();
@@ -346,10 +349,7 @@ pub fn banner_text(record: Option<&Record>) -> String {
         }) if *stored == date.to_string() => result.as_str(),
         _ => "Not yet",
     };
-    format!(
-        "Daily \u{b7} {} \u{2014} {status}",
-        display_name(daily_mode(date))
-    )
+    format!("Daily - {}: {status}", display_name(daily_mode(date)))
 }
 
 #[cfg(test)]
@@ -476,11 +476,11 @@ mod tests {
         assert_eq!(format_time_ticks(6_141), "1:42.35");
         assert_eq!(
             share_line(date(2026, 10, 1), ModeId::Dig, "1:42.35"),
-            "Blockfall Daily 2026-10-01 \u{b7} Dig \u{b7} 1:42.35"
+            "Blockfall Daily 2026-10-01 - Dig - 1:42.35"
         );
         assert_eq!(
             share_line(date(2026, 9, 1), ModeId::Ultra, "12 345"),
-            "Blockfall Daily 2026-09-01 \u{b7} Ultra \u{b7} 12 345"
+            "Blockfall Daily 2026-09-01 - Ultra - 12 345"
         );
     }
 
@@ -532,10 +532,7 @@ mod tests {
         )
         .expect("goal finish earns a result");
         assert!(wrote);
-        assert_eq!(
-            line,
-            "Blockfall Daily 2026-09-28 \u{b7} Sprint \u{b7} 1:42.35"
-        );
+        assert_eq!(line, "Blockfall Daily 2026-09-28 - Sprint - 1:42.35");
         assert_eq!(
             records.record_for(DAILY),
             Some(&Record::Daily {
@@ -588,7 +585,7 @@ mod tests {
         )
         .expect("Ultra TimeUp earns a result");
         assert!(wrote3, "a new day may replace the stored day");
-        assert_eq!(line3, "Blockfall Daily 2026-09-29 \u{b7} Ultra \u{b7} 4242");
+        assert_eq!(line3, "Blockfall Daily 2026-09-29 - Ultra - 4242");
         assert_eq!(
             records.record_for(DAILY),
             Some(&Record::Daily {
@@ -611,24 +608,18 @@ mod tests {
     #[test]
     fn banner_text_shows_mode_then_stored_result() {
         set_today_override(Some(date(2026, 10, 1))); // Thursday → Sprint
-        assert_eq!(banner_text(None), "Daily \u{b7} Sprint \u{2014} Not yet");
+        assert_eq!(banner_text(None), "Daily - Sprint: Not yet");
         let done = Record::Daily {
             date: "2026-10-01".to_string(),
             result: "1:42.35".to_string(),
         };
-        assert_eq!(
-            banner_text(Some(&done)),
-            "Daily \u{b7} Sprint \u{2014} 1:42.35"
-        );
+        assert_eq!(banner_text(Some(&done)), "Daily - Sprint: 1:42.35");
         // A record from another date is stale → "Not yet".
         let stale = Record::Daily {
             date: "2026-09-30".to_string(),
             result: "2:00.00".to_string(),
         };
-        assert_eq!(
-            banner_text(Some(&stale)),
-            "Daily \u{b7} Sprint \u{2014} Not yet"
-        );
+        assert_eq!(banner_text(Some(&stale)), "Daily - Sprint: Not yet");
         set_today_override(None);
     }
 }

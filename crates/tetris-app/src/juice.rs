@@ -39,9 +39,10 @@ use bevy::window::Window;
 
 use tetris_core::event::GameEvent;
 
-use crate::core_bridge::{CoreEvent, SimPaused, VersusMatch};
+use crate::core_bridge::{CoreEvent, ModeHudInfo, SimPaused, VersusMatch};
+use crate::modes::ModeId;
 use crate::render;
-use crate::state::{EffectsQuality, Settings};
+use crate::state::{AppState, EffectsQuality, Settings};
 
 /// One decaying effect channel: `amplitude` decays to exactly `0.0` over
 /// `duration` seconds once triggered.
@@ -256,8 +257,20 @@ impl JuiceState {
     /// Apply `event`'s plan for `quality`; returns the requested freeze
     /// length in frames (caller merges into [`JuiceFreeze`]).
     pub fn trigger(&mut self, event: &GameEvent, quality: EffectsQuality) -> u32 {
+        self.trigger_with(event, quality, false)
+    }
+
+    /// [`trigger`](Self::trigger) with the reduced-flash accessibility gate:
+    /// `reduce_flash` drops the flash channel but keeps shake/freeze.
+    pub fn trigger_with(
+        &mut self,
+        event: &GameEvent,
+        quality: EffectsQuality,
+        reduce_flash: bool,
+    ) -> u32 {
         let plan = effect_plan(event, quality);
-        if self.flash.trigger(plan.flash.0, plan.flash.1) {
+        let flash = if reduce_flash { (0.0, 0.0) } else { plan.flash };
+        if self.flash.trigger(flash.0, flash.1) {
             self.flash_color = flash_color_for(event);
         }
         self.shake.trigger(plan.shake.0, plan.shake.1);
@@ -317,7 +330,7 @@ fn juice_from_events(
     mut freeze: ResMut<JuiceFreeze>,
 ) {
     for event in events.read() {
-        let frames = state.trigger(&event.0, settings.effects);
+        let frames = state.trigger_with(&event.0, settings.effects, settings.reduce_flash);
         freeze.frames_remaining = freeze.frames_remaining.max(frames);
     }
 }
@@ -411,6 +424,42 @@ fn shape_overlay(
     }
 }
 
+/// Warning amber for the Ultra last-10-s heartbeat — the visual twin of the
+/// audio layer's inaudible `ULTRA_WARNING_LABEL` placeholder edge.
+pub const ULTRA_WARNING_COLOR: Color = Color::srgb(1.0, 0.65, 0.3);
+
+/// Visual heartbeat for the Ultra final 10 s: one amber flash per remaining
+/// whole second (a countdown pulse). Inert outside the window, while not
+/// playing, or when `reduce_flash` is on; the pulse decays through the
+/// normal painter and never fights event flashes (trigger takes max).
+fn ultra_warning_pulse(
+    state: Res<AppState>,
+    settings: Res<Settings>,
+    hud: Option<Res<ModeHudInfo>>,
+    mut juice: ResMut<JuiceState>,
+    mut last_second: Local<Option<u64>>,
+) {
+    let window = crate::audio::ULTRA_WARNING_TICKS;
+    let remaining = hud
+        .as_deref()
+        .filter(|hud| hud.mode_id == ModeId::Ultra)
+        .map_or(u64::MAX, |hud| {
+            hud.clock_limit
+                .unwrap_or_default()
+                .saturating_sub(hud.clock_ticks)
+        });
+    if *state != AppState::Playing || settings.reduce_flash || remaining > window {
+        *last_second = None;
+        return;
+    }
+    let second = remaining / 60;
+    if *last_second != Some(second) {
+        *last_second = Some(second);
+        juice.flash_color = ULTRA_WARNING_COLOR;
+        juice.flash.trigger(0.14, 0.25);
+    }
+}
+
 /// Spawn the always-present (alpha-0) flash overlay above every playfield
 /// layer (board 0 / ghost 1 / active 2, T11). [`shape_overlay`] hugs it to
 /// the active field(s) every frame; the oversized rect is only its resting
@@ -441,7 +490,14 @@ impl Plugin for JuicePlugin {
             .add_systems(Startup, spawn_overlay)
             .add_systems(
                 Update,
-                (juice_from_events, freeze_gate, shape_overlay, juice_painter).chain(),
+                (
+                    juice_from_events,
+                    ultra_warning_pulse,
+                    freeze_gate,
+                    shape_overlay,
+                    juice_painter,
+                )
+                    .chain(),
             )
             .add_systems(Update, apply_window_identity);
         if let Some(schedule) = parse_shot_schedule() {
@@ -607,6 +663,21 @@ mod tests {
         }
         assert_eq!(slot.value(), 0.0, "fully settled after duration");
         assert_eq!(slot, EffectSlot::default(), "slot reset, no drift");
+    }
+
+    #[test]
+    fn reduce_flash_drops_only_the_flash_channel() {
+        let mut state = JuiceState::default();
+        let frames = state.trigger_with(
+            &GameEvent::LineCleared { lines: 4 },
+            EffectsQuality::High,
+            true,
+        );
+        assert_eq!(state.flash.amplitude, 0.0, "flash suppressed");
+        assert!(state.shake.amplitude > 0.0, "shake survives");
+        assert!(frames > 0, "freeze survives");
+        state.trigger(&GameEvent::LineCleared { lines: 4 }, EffectsQuality::High);
+        assert!(state.flash.amplitude > 0.0, "default path still flashes");
     }
 
     #[test]

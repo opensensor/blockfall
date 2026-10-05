@@ -695,6 +695,9 @@ mod tests {
             next_queue_size: 6,
             soft_drop_multiplier: 30,
             effects: EffectsQuality::High,
+            soundtrack: crate::state::Soundtrack::Pulse,
+            color_scheme: crate::state::ColorScheme::Colorblind,
+            reduce_flash: true,
         };
         let mut bindings = KeyBindings::default();
         bindings.set_slot(
@@ -713,6 +716,38 @@ mod tests {
 
         save_to(dir.path(), &settings, &bindings, best).expect("save edited");
         assert_eq!(load_from(dir.path()), (settings, bindings, best));
+    }
+
+    #[test]
+    fn settings_files_pre_soundtrack_load_with_classic_default() {
+        // A `settings.json` written before the soundtrack field existed must
+        // keep every other setting and adopt the default track (`serde`
+        // field default), rather than failing to parse into defaults.
+        let dir = TempDir::new("legacy-soundtrack");
+        let settings = Settings {
+            das_ms: 120,
+            ..Settings::default()
+        };
+        save_to(
+            dir.path(),
+            &settings,
+            &KeyBindings::default(),
+            PersistedBestScore::default(),
+        )
+        .expect("save");
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap())
+                .unwrap();
+        let mut legacy_settings = raw["settings"].as_object().unwrap().clone();
+        assert!(legacy_settings.remove("soundtrack").is_some());
+        let legacy = serde_json::json!({
+            "settings": legacy_settings,
+            "bindings": raw["bindings"],
+        });
+        fs::write(dir.path().join(SETTINGS_FILE), legacy.to_string()).unwrap();
+        let (loaded, _, _) = load_from(dir.path());
+        assert_eq!(loaded.soundtrack, crate::state::Soundtrack::Classic);
+        assert_eq!(loaded.das_ms, 120);
     }
 
     #[test]

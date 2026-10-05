@@ -80,6 +80,16 @@ def note(freq, dur):
     return out
 
 
+def mix(layers):
+    """Element-wise sum of tracks, zero-padded to the longest one."""
+    n = max(len(t) for t in layers)
+    return [sum(t[i] if i < len(t) else 0.0 for t in layers) for i in range(n)]
+
+
+def amp(gain, samples):
+    return [gain * s for s in samples]
+
+
 def main():
     random.seed(18)
     write("sfx/move.wav", tone(660, 0.06, 40.0))
@@ -100,7 +110,7 @@ def main():
     write("sfx/hold.wav", tone(523, 0.07, 35.0))
     write("sfx/game-over.wav", sweep(440, 110, 0.30, 4.0))
 
-    # BGM: 8 eighth notes of 0.25 s at 120 BPM = exactly 2.000 s.
+    # BGM "Classic": 8 eighth notes of 0.25 s at 120 BPM = exactly 2.000 s.
     bass = [110, 110, 165, 110, 147, 147, 110, 98]
     lead = [440, 523, 659, 523, 587, 494, 440, 392]
     bars = []
@@ -110,6 +120,38 @@ def main():
         mel = half + [0.0] * (len(bar) - len(half))
         bars.append([0.75 * bar[i] + 0.30 * mel[i] for i in range(len(bar))])
     write("bgm_loop.wav", [s for bar in bars for s in bar])
+
+    # BGM "Pulse": driving 16th-note arpeggio at 128 BPM. Beat = 0.46875 s,
+    # one 4-beat bar = 1.875 s (two bars loop). Bass eighths, arp sixteenths,
+    # and a soft noise hat on the off-beats; every segment is whole-period.
+    beat = 0.46875
+    pulse_bass = [110, 110, 131, 110, 147, 110, 165, 147]
+    arp = [220, 262, 330, 440, 330, 262, 220, 196, 294, 262, 220, 196, 165, 196, 220, 262]
+    sixteenth = beat / 4
+    bars = []
+    for b, l in zip(pulse_bass, arp):
+        bar = note(b, beat / 2)
+        mel = note(l, sixteenth)
+        mel += [0.0] * (len(bar) - len(mel))
+        hat = noise(0.03, 90.0, 0.55)
+        hat = [0.0] * int(SR * sixteenth * 1.5) + [0.30 * s for s in hat]
+        hat += [0.0] * (len(bar) - len(hat))
+        bars.append([0.70 * bar[i] + 0.34 * mel[i] + hat[i] for i in range(len(bar))])
+    write("bgm_pulse.wav", [s for bar in bars for s in bar])
+
+    # BGM "Drift": slow ambient pad at 60 BPM. One bar = 4 s, two bars loop;
+    # sustained whole-period tones (A2/C3/E3 → G2/C3/D3) under sparse bells.
+    pads = [
+        mix([note(110.0, 4.0), amp(0.45, note(220.0, 4.0)), amp(0.30, note(329.6, 4.0))]),
+        mix([note(98.0, 4.0), amp(0.45, note(196.0, 4.0)), amp(0.30, note(293.7, 4.0))]),
+    ]
+    bells = note(880.0, 1.0) + [0.0] * int(SR * 3.0)
+    bell2 = [0.0] * int(SR * 2.0) + note(659.3, 1.0) + [0.0] * int(SR * 1.0)
+    bars = [
+        mix([pads[0], amp(0.22, bells)]),
+        mix([pads[1], amp(0.22, bell2)]),
+    ]
+    write("bgm_drift.wav", [s for bar in bars for s in bar])
 
 
 if __name__ == "__main__":

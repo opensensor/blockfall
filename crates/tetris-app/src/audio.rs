@@ -21,13 +21,55 @@ use tetris_core::event::GameEvent;
 
 use crate::core_bridge::{CoreEvent, ModeHudInfo, SimPaused};
 use crate::modes::ModeId;
-use crate::state::{AppState, Settings};
+use crate::state::{AppState, Settings, Soundtrack};
 
 /// Linear-gain multiplier applied to BGM while ducked (paused / frozen).
 pub const DUCK_GAIN: f32 = 0.25;
 
-/// Asset path of the looping BGM track, relative to the app `assets/` root.
-pub const BGM_PATH: &str = "bgm_loop.wav";
+impl Soundtrack {
+    /// Concrete (loadable) tracks in canonical order — excludes [`Self::Auto`].
+    pub const CONCRETE: [Soundtrack; 3] =
+        [Soundtrack::Classic, Soundtrack::Pulse, Soundtrack::Drift];
+
+    /// Asset path of this soundtrack's seamless loop, relative to the app
+    /// `assets/` root; `None` for [`Self::Auto`] (a selection, not a track).
+    #[must_use]
+    pub const fn asset_path(self) -> Option<&'static str> {
+        match self {
+            Soundtrack::Classic => Some("bgm_loop.wav"),
+            Soundtrack::Pulse => Some("bgm_pulse.wav"),
+            Soundtrack::Drift => Some("bgm_drift.wav"),
+            Soundtrack::Auto => None,
+        }
+    }
+
+    /// Track actually played for a selection given the active mode: `Auto`
+    /// picks the ambient pad for Zen (PRD "relax"), the driving arpeggio for
+    /// score-attack (Ultra), and the classic loop everywhere else.
+    #[must_use]
+    pub const fn resolve(self, mode: Option<ModeId>) -> Soundtrack {
+        if matches!(self, Soundtrack::Auto) {
+            return match mode {
+                Some(ModeId::Zen) => Soundtrack::Drift,
+                Some(ModeId::Ultra) => Soundtrack::Pulse,
+                _ => Soundtrack::Classic,
+            };
+        }
+        self
+    }
+}
+
+/// Playback-rate multiplier for a one-shot cue at the given combo count —
+/// the classic Tetris riser: clears and the combo tick climb in pitch with
+/// the streak (capped a minor third + tone above base).
+#[must_use]
+pub fn sfx_playback_rate(sfx: Sfx, combo: u32) -> f32 {
+    let rising = matches!(sfx, Sfx::LineClear | Sfx::Tetris | Sfx::TSpin | Sfx::Move);
+    if !rising {
+        return 1.0;
+    }
+    (1.0 + 0.05 * combo as f32).min(1.2)
+}
 
 /// Headless guard. The plugin inserts `AudioEnabled(true)` in production;
 /// tests insert `false` *before* [`AudioPlugin`] so the Kira playback systems
@@ -175,6 +217,9 @@ pub struct SfxDirector {
     pub music_volume: f32,
     /// `true` while BGM is ducked (`SimPaused` or `AppState != Playing`).
     pub ducked: bool,
+    /// Current combo streak (updated from `ComboChanged` events); drives the
+    /// pitch riser in [`sfx_playback_rate`].
+    pub combo: u32,
     /// Effective SFX channel gain: `master * sfx`.
     pub sfx_gain: f32,
     /// Effective music channel gain: `master * music * (ducked ? DUCK_GAIN : 1)`.
@@ -193,6 +238,7 @@ impl Default for SfxDirector {
             sfx_volume: 0.0,
             music_volume: 0.0,
             ducked: false,
+            combo: 0,
             sfx_gain: 0.0,
             music_gain: 0.0,
             bgm_started: false,
@@ -210,6 +256,9 @@ impl SfxDirector {
     /// Count one play for `event`'s label and enqueue its cue. Returns the
     /// mapping, or `None` for silent events (which are not counted).
     pub fn handle_event(&mut self, event: &GameEvent) -> Option<EventSfx> {
+        if let GameEvent::ComboChanged { n } = event {
+            self.combo = *n;
+        }
         let mapped = sfx_for_event(event)?;
         *self.plays.entry(mapped.label).or_insert(0) += 1;
         self.pending_sfx.push_back(mapped.sfx);
@@ -255,7 +304,7 @@ pub struct MusicTrack;
 
 #[derive(Resource)]
 struct AudioAssets {
-    bgm: Handle<AudioSource>,
+    bgm: HashMap<Soundtrack, Handle<AudioSource>>,
     cues: HashMap<Sfx, Handle<AudioSource>>,
 }
 
@@ -366,10 +415,15 @@ fn load_audio_assets(asset_server: Res<AssetServer>, mut commands: Commands) {
         .into_iter()
         .map(|cue| (cue, asset_server.load(cue.asset_path())))
         .collect();
-    commands.insert_resource(AudioAssets {
-        bgm: asset_server.load(BGM_PATH),
-        cues,
-    });
+    let bgm = Soundtrack::CONCRETE
+        .into_iter()
+        .filter_map(|track| {
+            track
+                .asset_path()
+                .map(|path| (track, asset_server.load(path)))
+        })
+        .collect();
+    commands.insert_resource(AudioAssets { bgm, cues });
 }
 
 fn play_pending_sfx(
@@ -382,9 +436,15 @@ fn play_pending_sfx(
     if !enabled.0 {
         return;
     }
+    let combo = director.combo;
     for cue in cues {
         if let Some(handle) = assets.cues.get(&cue) {
-            track.play(handle.clone());
+            let rate = sfx_playback_rate(cue, combo);
+            if (rate - 1.0).abs() < f32::EPSILON {
+                track.play(handle.clone());
+            } else {
+                track.play(handle.clone()).with_playback_rate(rate as f64);
+            }
         }
     }
 }
@@ -408,17 +468,37 @@ fn apply_volumes(
     music_track.set_volume(gain_to_db(target.1));
 }
 
+/// Start the selected BGM loop, restart it live when [`Settings::soundtrack`]
+/// changes (the music channel carries nothing else, so `stop` is safe). The
+/// current track is owned by the `Local` — while audio is guarded off nothing
+/// plays and `bgm_started` stays `false` (headless test contract).
 fn start_bgm(
     mut director: ResMut<SfxDirector>,
+    settings: Res<Settings>,
+    hud: Option<Res<ModeHudInfo>>,
     music_track: Res<AudioChannel<MusicTrack>>,
     assets: Res<AudioAssets>,
     enabled: Res<AudioEnabled>,
+    mut current: Local<Option<Soundtrack>>,
 ) {
-    if director.bgm_started || !enabled.0 {
+    if !enabled.0 {
         return;
     }
+    let wanted = settings
+        .soundtrack
+        .resolve(hud.as_deref().map(|hud| hud.mode_id));
+    if *current == Some(wanted) {
+        return;
+    }
+    let Some(handle) = assets.bgm.get(&wanted) else {
+        return;
+    };
+    if current.is_some() {
+        music_track.stop();
+    }
+    music_track.play(handle.clone()).looped();
+    *current = Some(wanted);
     director.bgm_started = true;
-    music_track.play(assets.bgm.clone()).looped();
 }
 
 /// Maps core `GameEvent`s to SFX and manages BGM with ducking.
@@ -426,15 +506,20 @@ pub struct AudioPlugin;
 
 impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
+        let kira_wired = app.is_plugin_added::<AssetPlugin>();
         if app.world().get_resource::<AudioEnabled>().is_none() {
-            app.insert_resource(AudioEnabled(false));
+            // The shipped binary wires `DefaultPlugins` (⇒ `AssetPlugin`), so
+            // audio is live there by default; headless apps without
+            // `AssetPlugin` stay guarded, and any test can opt out of cpal by
+            // inserting `AudioEnabled(false)` *before* this plugin.
+            app.insert_resource(AudioEnabled(kira_wired));
         }
         app.init_resource::<SfxDirector>();
         add_logic_systems(app);
 
         // The Kira stack needs `AssetServer`; smoke-test apps without
         // `AssetPlugin` keep the pure-logic director and never touch cpal.
-        if app.is_plugin_added::<AssetPlugin>() {
+        if kira_wired {
             app.add_plugins(bevy_kira_audio::AudioPlugin)
                 .add_audio_channel::<SfxTrack>()
                 .add_audio_channel::<MusicTrack>()
@@ -768,7 +853,7 @@ mod tests {
     #[test]
     fn ultra_warning_fires_exactly_once_on_the_last_ten_seconds() {
         let mut app = logic_app();
-        app.insert_resource(ultra_hud(6_599));
+        app.insert_resource(ultra_hud(ULTRA_CLOCK_TICKS - 601));
         app.update();
         assert_eq!(
             warning_plays(&app),
@@ -776,13 +861,18 @@ mod tests {
             "601 ticks remaining is not yet the window"
         );
 
-        // Crossing: remaining 601 → 600 (clock_ticks reaches 6 600).
-        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(6_600);
+        // Crossing: remaining 601 → 600 (clock_ticks reaches limit - 600).
+        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(ULTRA_CLOCK_TICKS - 600);
         app.update();
         assert_eq!(warning_plays(&app), 1, "edge into the last 10 s fires once");
 
         // Staying inside the window never re-fires.
-        for ticks in [6_601, 6_900, 7_199, ULTRA_CLOCK_TICKS] {
+        for ticks in [
+            ULTRA_CLOCK_TICKS - 599,
+            ULTRA_CLOCK_TICKS - 300,
+            ULTRA_CLOCK_TICKS - 1,
+            ULTRA_CLOCK_TICKS,
+        ] {
             *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(ticks);
             app.update();
         }
@@ -791,7 +881,7 @@ mod tests {
         // A fresh run (remaining jumps back above the window) re-arms.
         *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(0);
         app.update();
-        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(6_600);
+        *app.world_mut().resource_mut::<ModeHudInfo>() = ultra_hud(ULTRA_CLOCK_TICKS - 600);
         app.update();
         assert_eq!(warning_plays(&app), 2, "restart re-arms the warning edge");
     }
