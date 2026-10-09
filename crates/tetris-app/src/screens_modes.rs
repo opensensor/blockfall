@@ -25,12 +25,14 @@
 //! [`VersusFlow`](crate::screens_menu::VersusFlow) — the list hides behind
 //! it) instead of starting a solo run.
 //!
-//! ## Mutator toggles (T23)
+//! ## Mutator switches (T23)
 //!
-//! Above the row list, four [`MutatorToggleButton`]s (spawned from
-//! [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order,
-//! compact + wrap-friendly for portrait) flip bits of the session-scoped
-//! pending selection on `GameCore::selected_mutators`. A row press snapshots
+//! Above the row list, five [`MutatorToggleButton`] rows (spawned from
+//! [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order — each
+//! shows the mutator label plus a small pill switch, knob parked left on a
+//! dark track when off and slid right on green when on) flip bits of the
+//! session-scoped pending selection on `GameCore::selected_mutators`. A row
+//! press snapshots
 //! that selection into the run (`GameCore::start_mode` →
 //! `ActiveMode::mutators`), so the toggles never affect a live run, and
 //! the selection persists across screen navigation within the session
@@ -67,7 +69,7 @@ use crate::records::{Record, Records};
 use crate::render;
 use crate::screens_ladder::LadderOrigin;
 use crate::screens_menu::{
-    goto_title, label_node, menu_button, release_sim, VersusFlow, BUTTON_BG, PANEL_BG, RECORD_COLOR,
+    goto_title, label_node, menu_button, release_sim, VersusFlow, PANEL_BG, RECORD_COLOR,
 };
 use crate::state::{AppState, RebindingCapture};
 
@@ -182,29 +184,37 @@ pub struct ModeBackButton;
 #[derive(Component)]
 pub struct DailyRowButton;
 
-/// One mutator toggle on the mode list (T23). A press flips exactly one bit
-/// of [`GameCore::selected_mutators`](crate::core_bridge::GameCore); the
+/// One mutator switch row on the mode list (T23). A press flips exactly one
+/// bit of [`GameCore::selected_mutators`](crate::core_bridge::GameCore); the
 /// next started run snapshots the selection
-/// (`GameCore::start_mode` → `ActiveMode::mutators`), so toggling never
-/// affects a live run. The buttons are spawned from
+/// (`GameCore::start_mode` → `ActiveMode::mutators`), so the switches never
+/// affect a live run. The rows are spawned from
 /// [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order;
-/// [`sync_mutator_toggle_labels`] keeps their ON/OFF text on the selection
-/// (which persists across screen navigation within the session, never
-/// across app restarts).
+/// [`sync_mutator_toggle_switches`] keeps the pill's knob side, track color
+/// and label brightness on the selection (which persists across screen
+/// navigation within the session, never across app restarts).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MutatorToggleButton {
     /// The single mutator bit this button toggles.
     pub bit: crate::mutators::Mutators,
 }
 
-/// Toggle button text: `NO HOLD OFF` / `20G ON`.
-#[must_use]
-pub fn mutator_toggle_text(
+/// The pill switch inside one [`MutatorToggleButton`] row. The sync system
+/// flips `justify_content` (knob side) and the track color on this node;
+/// the knob is its child, so one node edit slides it.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct MutatorSwitchPill {
+    /// The single mutator bit this pill reports.
     bit: crate::mutators::Mutators,
-    selected: crate::mutators::Mutators,
-) -> String {
-    let state = if selected.contains(bit) { "ON" } else { "OFF" };
-    format!("{} {state}", bit.label())
+}
+
+/// The label text child of one [`MutatorToggleButton`] row (a real child so
+/// text and the pill never occupy the same content box); the sync system
+/// recolors it per state.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct MutatorSwitchLabel {
+    /// The single mutator bit this label reports.
+    bit: crate::mutators::Mutators,
 }
 
 /// The overflow-scrolling viewport around the row list
@@ -249,6 +259,14 @@ const ROW_BORDER: Color = Color::srgba(0.32, 0.32, 0.40, 0.45);
 const DESC_COLOR: Color = Color::srgb(0.62, 0.63, 0.70);
 /// Mutator section caption.
 const MUTATOR_CAPTION: Color = Color::srgb(0.55, 0.56, 0.64);
+/// Switch track when OFF: a dark inset, distinct from the panel.
+const MUT_TRACK_OFF: Color = Color::srgb(0.13, 0.13, 0.17);
+/// Switch track when ON: a quiet green.
+const MUT_TRACK_ON: Color = Color::srgb(0.32, 0.62, 0.40);
+/// Switch track frame, constant in both states.
+const MUT_TRACK_BORDER: Color = Color::srgba(0.55, 0.56, 0.64, 0.9);
+/// Switch knob.
+const MUT_KNOB_COLOR: Color = Color::srgb(0.82, 0.83, 0.88);
 /// Daily banner card (gold family, matching the record accent).
 const DAILY_BG: Color = Color::srgb(0.25, 0.21, 0.12);
 const DAILY_BORDER: Color = Color::srgba(0.78, 0.65, 0.30, 0.85);
@@ -286,12 +304,18 @@ const ROW_REC_PX_PORTRAIT: f32 = 16.0;
 /// Pixels one mouse-wheel notch scrolls.
 const WHEEL_STEP: f32 = 90.0;
 
-/// Mutator toggle metrics (T23): compact but thumb-friendly; portrait gets
-/// the taller label targets.
-const MUT_TOGGLE_H: f32 = 44.0;
-const MUT_TOGGLE_H_PORTRAIT: f32 = 52.0;
+/// Mutator switch row metrics (T23): the whole label + pill row is the
+/// button; portrait only enlarges the label and the tap target.
+const MUT_ROW_H: f32 = 34.0;
+const MUT_ROW_H_PORTRAIT: f32 = 40.0;
 const MUT_TOGGLE_PX: f32 = 14.0;
 const MUT_TOGGLE_PX_PORTRAIT: f32 = 16.0;
+
+/// Switch pill (track) size and the knob riding it: content 40 x 16 with
+/// travel 24 px.
+const MUT_PILL_W: f32 = 48.0;
+const MUT_PILL_H: f32 = 24.0;
+const MUT_KNOB: f32 = 16.0;
 
 /// Spawn one row per mode in `ids` under `parent` (landscape metrics — the
 /// public entry the tests drive; `build_mode_select_ui` uses the sized
@@ -468,17 +492,17 @@ fn build_mode_select_ui(
                 TextColor(MUTATOR_CAPTION),
                 Pickable::IGNORE,
             ));
-            // Mutator toggles (T23): the session's selection on GameCore
+            // Mutator switches (T23): the session's selection on GameCore
             // (never persisted), snapshotted into the run by the shared
-            // start path. Fixed order from `Mutators::SELECTABLE`, wrapping
-            // on portrait widths; INVISIBLE stays reserved for T24.
+            // start path. Fixed order from `Mutators::SELECTABLE` (five
+            // rows), wrapping on portrait widths.
             root.spawn((
                 Node {
                     display: Display::Flex,
                     flex_direction: FlexDirection::Row,
                     flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(8.0),
-                    row_gap: Val::Px(6.0),
+                    row_gap: Val::Px(4.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     ..default()
@@ -487,28 +511,70 @@ fn build_mode_select_ui(
             ))
             .with_children(|row| {
                 for bit in crate::mutators::Mutators::SELECTABLE {
+                    let on = selected_mutators.contains(bit);
                     row.spawn((
                         Button,
                         MutatorToggleButton { bit },
-                        BackgroundColor(BUTTON_BG),
                         Node {
-                            min_height: Val::Px(if portrait {
-                                MUT_TOGGLE_H_PORTRAIT
-                            } else {
-                                MUT_TOGGLE_H
-                            }),
-                            padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
-                            justify_content: JustifyContent::Center,
+                            display: Display::Flex,
+                            flex_direction: FlexDirection::Row,
                             align_items: AlignItems::Center,
+                            column_gap: Val::Px(8.0),
+                            min_height: Val::Px(if portrait {
+                                MUT_ROW_H_PORTRAIT
+                            } else {
+                                MUT_ROW_H
+                            }),
+                            padding: UiRect::axes(Val::Px(6.0), Val::Px(4.0)),
                             ..default()
                         },
-                        Text::new(mutator_toggle_text(bit, selected_mutators)),
-                        TextFont::from_font_size(if portrait {
-                            MUT_TOGGLE_PX_PORTRAIT
-                        } else {
-                            MUT_TOGGLE_PX
-                        }),
-                    ));
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            MutatorSwitchLabel { bit },
+                            Text::new(bit.label()),
+                            TextFont::from_font_size(if portrait {
+                                MUT_TOGGLE_PX_PORTRAIT
+                            } else {
+                                MUT_TOGGLE_PX
+                            }),
+                            TextColor(if on { Color::WHITE } else { DESC_COLOR }),
+                            Pickable::IGNORE,
+                        ));
+                        btn.spawn((
+                            MutatorSwitchPill { bit },
+                            Pickable::IGNORE,
+                            BackgroundColor(if on { MUT_TRACK_ON } else { MUT_TRACK_OFF }),
+                            BorderColor::all(MUT_TRACK_BORDER),
+                            Node {
+                                width: Val::Px(MUT_PILL_W),
+                                height: Val::Px(MUT_PILL_H),
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                justify_content: if on {
+                                    JustifyContent::FlexEnd
+                                } else {
+                                    JustifyContent::FlexStart
+                                },
+                                padding: UiRect::all(Val::Px(3.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(MUT_PILL_H / 2.0)),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|pill| {
+                            pill.spawn((
+                                Pickable::IGNORE,
+                                BackgroundColor(MUT_KNOB_COLOR),
+                                Node {
+                                    width: Val::Px(MUT_KNOB),
+                                    height: Val::Px(MUT_KNOB),
+                                    border_radius: BorderRadius::all(Val::Px(MUT_KNOB / 2.0)),
+                                    ..default()
+                                },
+                            ));
+                        });
+                    });
                 }
             });
             // Native scroll viewport: clips its overflow and takes
@@ -623,24 +689,45 @@ fn sync_daily_banner(
     }
 }
 
-/// Keep the four mutator toggle labels (T23) on the pending selection while
-/// the list is open (also after a revisit, since the selection persists
-/// across navigation within the session). Writes only on an actual text
-/// change; runs after [`mode_select_clicks`] in the chain, so a press
-/// updates its own label the same frame.
-fn sync_mutator_toggle_labels(
+/// Keep the five mutator switches (T23) on the pending selection while the
+/// list is open (also after a revisit, since the selection persists
+/// across navigation within the session). Slides the knob (pill
+/// `justify_content`), recolors the track and re-brightens the label,
+/// writing only on an actual change; runs after [`mode_select_clicks`] in
+/// the chain, so a press updates its own switch the same frame.
+fn sync_mutator_toggle_switches(
     state: Res<AppState>,
     core: Option<NonSend<GameCore>>,
-    mut toggles: Query<(&MutatorToggleButton, &mut Text)>,
+    mut toggles: Query<(&MutatorSwitchLabel, &mut TextColor)>,
+    mut pills: Query<(&MutatorSwitchPill, &mut Node, &mut BackgroundColor)>,
 ) {
     if *state != AppState::ModeSelect {
         return;
     }
     let selected = core.map(|core| core.selected_mutators).unwrap_or_default();
-    for (toggle, mut text) in &mut toggles {
-        let want = mutator_toggle_text(toggle.bit, selected);
-        if text.0 != want {
-            *text = Text::new(want);
+    for (label, mut text_color) in &mut toggles {
+        let want = if selected.contains(label.bit) {
+            Color::WHITE
+        } else {
+            DESC_COLOR
+        };
+        if text_color.0 != want {
+            text_color.0 = want;
+        }
+    }
+    for (pill, mut node, mut bg) in &mut pills {
+        let on = selected.contains(pill.bit);
+        let want_justify = if on {
+            JustifyContent::FlexEnd
+        } else {
+            JustifyContent::FlexStart
+        };
+        let want_track = if on { MUT_TRACK_ON } else { MUT_TRACK_OFF };
+        if node.justify_content != want_justify {
+            node.justify_content = want_justify;
+        }
+        if bg.0 != want_track {
+            bg.0 = want_track;
         }
     }
 }
@@ -960,7 +1047,7 @@ impl Plugin for ModeSelectPlugin {
                 reset_mode_selection,
                 mode_select_key_system,
                 mode_select_clicks,
-                sync_mutator_toggle_labels,
+                sync_mutator_toggle_switches,
                 mode_scroll_system,
                 sync_mode_select_visibility,
                 sync_mode_record_labels,
@@ -1763,7 +1850,7 @@ mod tests {
         );
     }
 
-    // ---- T23: mutator toggles ----
+    // ---- T23: mutator switches ----
 
     use crate::mutators::Mutators;
 
@@ -1792,28 +1879,54 @@ mod tests {
     fn mutator_text(app: &mut App, bit: Mutators) -> String {
         text_of(app, |world, e| {
             world
-                .get::<MutatorToggleButton>(e)
-                .is_some_and(|t| t.bit == bit)
+                .get::<MutatorSwitchLabel>(e)
+                .is_some_and(|l| l.bit == bit)
         })
     }
 
+    /// One switch's visual state: (track color, knob side).
+    fn mutator_pill(app: &mut App, bit: Mutators) -> (Color, JustifyContent) {
+        let world = app.world_mut();
+        let mut pills = world.query::<(&MutatorSwitchPill, &BackgroundColor, &Node)>();
+        let (_, bg, node) = pills
+            .iter(world)
+            .find(|(p, _, _)| p.bit == bit)
+            .expect("switch pill exists");
+        (bg.0, node.justify_content)
+    }
+
+    fn mutator_on(app: &mut App, bit: Mutators) -> bool {
+        let (track, _) = mutator_pill(app, bit);
+        track == MUT_TRACK_ON
+    }
+
+    fn mutator_knob(app: &mut App, bit: Mutators) -> JustifyContent {
+        let (_, knob) = mutator_pill(app, bit);
+        knob
+    }
+
     #[test]
-    fn mutator_toggles_render_in_fixed_order_off_by_default() {
+    fn mutator_switches_render_in_fixed_order_off_by_default() {
         let mut app = mode_select_test_app();
         set_state(&mut app, AppState::ModeSelect);
         assert_eq!(
             toggle_bits(&mut app),
             Mutators::SELECTABLE.to_vec(),
-            "toggles spawn from SELECTABLE in fixed left-to-right order"
+            "switches spawn from SELECTABLE in fixed left-to-right order"
         );
         for bit in Mutators::SELECTABLE {
             assert_eq!(
                 mutator_text(&mut app, bit),
-                mutator_toggle_text(bit, Mutators::empty()),
-                "{bit:?} starts OFF"
+                bit.label().to_string(),
+                "{bit:?} shows only the mutator label"
+            );
+            assert!(!mutator_on(&mut app, bit), "{bit:?} starts OFF");
+            assert_eq!(
+                mutator_knob(&mut app, bit),
+                JustifyContent::FlexStart,
+                "{bit:?} knob parked left while OFF"
             );
         }
-        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD OFF");
     }
 
     #[test]
@@ -1824,19 +1937,29 @@ mod tests {
         click_mutator(&mut app, Mutators::NO_HOLD);
         assert_eq!(app_state(&app), AppState::ModeSelect, "no run started");
         assert_eq!(selected_mutators(&app), Mutators::NO_HOLD);
-        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD ON");
-        assert_eq!(mutator_text(&mut app, Mutators::TWENTY_G), "20G OFF");
+        assert!(mutator_on(&mut app, Mutators::NO_HOLD), "switch flips ON");
+        assert_eq!(
+            mutator_knob(&mut app, Mutators::NO_HOLD),
+            JustifyContent::FlexEnd,
+            "knob slides right while ON"
+        );
+        assert!(!mutator_on(&mut app, Mutators::TWENTY_G));
 
         click_mutator(&mut app, Mutators::TWENTY_G);
         assert_eq!(
             selected_mutators(&app),
             Mutators::NO_HOLD | Mutators::TWENTY_G
         );
-        assert_eq!(mutator_text(&mut app, Mutators::TWENTY_G), "20G ON");
+        assert!(mutator_on(&mut app, Mutators::TWENTY_G));
 
         click_mutator(&mut app, Mutators::NO_HOLD);
         assert_eq!(selected_mutators(&app), Mutators::TWENTY_G);
-        assert_eq!(mutator_text(&mut app, Mutators::NO_HOLD), "NO HOLD OFF");
+        assert_eq!(
+            mutator_knob(&mut app, Mutators::NO_HOLD),
+            JustifyContent::FlexStart,
+            "knob slides back left while OFF"
+        );
+        assert!(!mutator_on(&mut app, Mutators::NO_HOLD));
     }
 
     #[test]
@@ -1870,7 +1993,11 @@ mod tests {
             Mutators::NO_GHOST,
             "selection persists"
         );
-        assert_eq!(mutator_text(&mut app, Mutators::NO_GHOST), "NO GHOST ON");
+        assert!(mutator_on(&mut app, Mutators::NO_GHOST), "switch is ON");
+        assert_eq!(
+            mutator_knob(&mut app, Mutators::NO_GHOST),
+            JustifyContent::FlexEnd
+        );
     }
 
     #[test]
