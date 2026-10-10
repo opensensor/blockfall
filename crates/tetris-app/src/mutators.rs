@@ -9,6 +9,7 @@
 //! | `2`   | [`Mutators::NO_GHOST`] | render skips ghost cells (`render::render_playfield`); the core keeps computing `ghost_row` |
 //! | `4`   | [`Mutators::ONE_PREVIEW`] | HUD next queue forces a single preview (`hud::sync_hud_previews`) |
 //! | `8`   | [`Mutators::TWENTY_G`] | `start_level = 20` override in `GameCore::start_mode` (R1 config, plan R7) |
+//! | `16`  | [`Mutators::HORROR`] | night render: the active piece is a downward flashlight — everything outside its widening beam dims to a dark silhouette and the well grid mutes under night-shade quads (`render::render_playfield` light factor) |
 //! | `128` | [`Mutators::INVISIBLE`] | locked cells fade out in the render (`render::render_playfield` per-cell lock ages, T24) |
 //!
 //! ## Lifecycle
@@ -38,6 +39,14 @@ impl Mutators {
     pub const ONE_PREVIEW: Self = Self(4);
     /// The run starts at level 20 (20G gravity cap).
     pub const TWENTY_G: Self = Self(8);
+    /// Night render (`render::render_playfield`): the active piece is a
+    /// flashlight — a halo around it plus a shaft of light cast downward,
+    /// widening with depth and dimmed off the edges, sweeping with the
+    /// piece; everything the beam misses is a dark silhouette and the well
+    /// grid only shows where the beam lights it. Active piece always fully
+    /// lit; the ghost light follows its own beam position. Render-only:
+    /// the snapshot, replay and all HUD elements are untouched.
+    pub const HORROR: Self = Self(16);
     /// Locked cells fade out in the render (grace then linear fade over 60
     /// fixed steps, see `render::lock_fade_alpha`); active piece and ghost
     /// untouched. Wired in T24.
@@ -45,12 +54,13 @@ impl Mutators {
 
     /// The mutators the mode-select screen exposes as toggles, in fixed
     /// left-to-right UI order (deterministic layout order).
-    pub const SELECTABLE: [Self; 5] = [
+    pub const SELECTABLE: [Self; 6] = [
         Self::NO_HOLD,
         Self::NO_GHOST,
         Self::ONE_PREVIEW,
         Self::TWENTY_G,
         Self::INVISIBLE,
+        Self::HORROR,
     ];
 
     /// No mutators (clean run).
@@ -91,6 +101,7 @@ impl Mutators {
             Self::ONE_PREVIEW => "1 PREVIEW",
             Self::TWENTY_G => "20G",
             Self::INVISIBLE => "INVISIBLE",
+            Self::HORROR => "HORROR",
             _ => "?",
         }
     }
@@ -114,6 +125,7 @@ mod tests {
         assert_eq!(Mutators::NO_GHOST.bits(), 2);
         assert_eq!(Mutators::ONE_PREVIEW.bits(), 4);
         assert_eq!(Mutators::TWENTY_G.bits(), 8);
+        assert_eq!(Mutators::HORROR.bits(), 16);
         assert_eq!(Mutators::INVISIBLE.bits(), 128);
         let all = Mutators::SELECTABLE
             .into_iter()
@@ -122,7 +134,7 @@ mod tests {
             assert_eq!(all & m.bits(), m.bits(), "{m:?} is a distinct single bit");
         }
         // INVISIBLE uses the sign-free top bit, clear of everything else.
-        assert_eq!(all, 1 | 2 | 4 | 8 | 128);
+        assert_eq!(all, 1 | 2 | 4 | 8 | 16 | 128);
     }
 
     #[test]
@@ -146,11 +158,13 @@ mod tests {
         assert!(m.is_empty());
     }
 
-    /// T24 landed: INVISIBLE is selectable (the fade is rendered), last in
-    /// the fixed left-to-right toggle order.
+    /// T24 landed: INVISIBLE is selectable (the fade is rendered); the
+    /// Horror night render joined after it, still last in the fixed
+    /// left-to-right toggle order.
     #[test]
-    fn invisible_is_selectable_last() {
+    fn selectable_runs_in_fixed_left_to_right_order() {
         assert!(Mutators::SELECTABLE.contains(&Mutators::INVISIBLE));
+        assert!(Mutators::SELECTABLE.contains(&Mutators::HORROR));
         assert_eq!(
             Mutators::SELECTABLE,
             [
@@ -159,14 +173,16 @@ mod tests {
                 Mutators::ONE_PREVIEW,
                 Mutators::TWENTY_G,
                 Mutators::INVISIBLE,
+                Mutators::HORROR,
             ],
             "fixed left-to-right UI order"
         );
-        // A set that carries the bit still behaves as a bitset.
-        let m = Mutators(Mutators::NO_GHOST.bits() | Mutators::INVISIBLE.bits());
-        assert!(m.contains(Mutators::INVISIBLE));
+        // A set that carries the bits still behaves as a bitset.
+        let m = Mutators(Mutators::NO_GHOST.bits() | Mutators::HORROR.bits());
+        assert!(m.contains(Mutators::HORROR));
         assert!(m.contains(Mutators::NO_GHOST));
         assert!(!m.contains(Mutators::NO_HOLD));
+        assert!(!m.contains(Mutators::INVISIBLE));
     }
 
     #[test]

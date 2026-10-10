@@ -3,6 +3,20 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased]
+
+### Added
+
+- **Horror mutator** — night render: the active piece is a downward-casting
+  flashlight. A halo hugs the piece and a shaft of light falls from it,
+  widening with depth, dimmed off the beam edges and losing throw toward
+  the well floor (vintage lamp falloff); the beam sweeps as the piece moves
+  side to side. The well grid is muted under night-shade quads and only
+  reveals itself where the beam (or a line-clear flash) lights it. The
+  ghost dims by its own beam position and the active piece stays fully
+  lit. Render-only — snapshot, replay and records untouched — and composes
+  with Invisible.
+
 ## [0.6.0] — 2026-10-04
 
 ### Added

@@ -27,7 +27,7 @@
 //!
 //! ## Mutator switches (T23)
 //!
-//! Above the row list, five [`MutatorToggleButton`] rows (spawned from
+//! Above the row list, six [`MutatorToggleButton`] rows (spawned from
 //! [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order — each
 //! shows the mutator label plus a small pill switch, knob parked left on a
 //! dark track when off and slid right on green when on) flip bits of the
@@ -494,7 +494,7 @@ fn build_mode_select_ui(
             ));
             // Mutator switches (T23): the session's selection on GameCore
             // (never persisted), snapshotted into the run by the shared
-            // start path. Fixed order from `Mutators::SELECTABLE` (five
+            // start path. Fixed order from `Mutators::SELECTABLE` (six
             // rows), wrapping on portrait widths.
             root.spawn((
                 Node {
@@ -689,7 +689,7 @@ fn sync_daily_banner(
     }
 }
 
-/// Keep the five mutator switches (T23) on the pending selection while the
+/// Keep the six mutator switches (T23) on the pending selection while the
 /// list is open (also after a revisit, since the selection persists
 /// across navigation within the session). Slides the knob (pill
 /// `justify_content`), recolors the track and re-brightens the label,
