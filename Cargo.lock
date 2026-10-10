@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "netplay-gateway"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "nix"
@@ -5264,7 +5264,7 @@ dependencies = [
 
 [[package]]
 name = "tetris-app"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bevy",
  "bevy_kira_audio",
@@ -5280,7 +5280,7 @@ dependencies = [
 
 [[package]]
 name = "tetris-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "proptest",
