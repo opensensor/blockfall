@@ -3,7 +3,7 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [Unreleased]
+## [0.8.0] — 2026-10-11
 
 ### Added
 
