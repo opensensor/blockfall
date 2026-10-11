@@ -13,10 +13,12 @@
 //! - [`game`], [`event`] — deterministic facade and `GameEvent` contract (T8)
 //! - [`mode`] — per-mode rule configuration: goals, clocks, start boards (T2)
 //! - [`versus`] — deterministic 1v1 match wrapper over two games (T24)
+//! - [`cannons`] — CANNONS mutator: side batteries firing at the falling piece
 
 pub mod actions;
 pub mod bag;
 pub mod board;
+pub mod cannons;
 pub mod event;
 pub mod game;
 pub mod gravity;

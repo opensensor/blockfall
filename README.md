@@ -45,10 +45,13 @@ greedy bot playing seeded runs.
   Race, Dig Duel (race the same seeded garbage board) and Switch (boards
   swap on a timer)
 - **Mutators** — per-run toggles: No Hold, No Ghost, One Preview, 20G,
-  Invisible (locked cells fade out) and Horror (night render: the active
+  Invisible (locked cells fade out), Horror (night render: the active
   piece is a downward flashlight whose widening beam sweeps with it,
   everything else dims to a dark silhouette and the well grid only shows
-  in the light); mutated runs never write best records
+  in the light) and Cannons (three cannons per side of the well fire
+  cannonballs across the board on a seeded cadence, chipping cells out of
+  the falling piece — a ball never destroys a piece's last cell, it
+  sparks off instead); mutated runs never write best records
 - **Modern controls feel** — DAS/ARR, hard drop, lock delay, ghost piece, hold
 - **SRS rotation** with wall kicks, including basic T-spin detection
 - **7-bag randomizer** with seeded, reproducible runs (`TETRIS_SEED=<u64>`)

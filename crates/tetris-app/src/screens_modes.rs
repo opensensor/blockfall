@@ -27,7 +27,7 @@
 //!
 //! ## Mutator switches (T23)
 //!
-//! Above the row list, six [`MutatorToggleButton`] rows (spawned from
+//! Above the row list, seven [`MutatorToggleButton`] rows (spawned from
 //! [`Mutators::SELECTABLE`](crate::mutators::Mutators) in fixed order — each
 //! shows the mutator label plus a small pill switch, knob parked left on a
 //! dark track when off and slid right on green when on) flip bits of the
@@ -494,7 +494,7 @@ fn build_mode_select_ui(
             ));
             // Mutator switches (T23): the session's selection on GameCore
             // (never persisted), snapshotted into the run by the shared
-            // start path. Fixed order from `Mutators::SELECTABLE` (six
+            // start path. Fixed order from `Mutators::SELECTABLE` (seven
             // rows), wrapping on portrait widths.
             root.spawn((
                 Node {
@@ -689,7 +689,7 @@ fn sync_daily_banner(
     }
 }
 
-/// Keep the six mutator switches (T23) on the pending selection while the
+/// Keep the seven mutator switches (T23) on the pending selection while the
 /// list is open (also after a revisit, since the selection persists
 /// across navigation within the session). Slides the knob (pill
 /// `justify_content`), recolors the track and re-brightens the label,
@@ -1683,6 +1683,14 @@ mod tests {
         app.insert_resource(Records::default());
         set_state(&mut app, AppState::ModeSelect);
         app.update();
+
+        // The seven-switch cluster puts the Dig row below the viewport clip
+        // on a 411x731 phone, and clipped rows never catch a tap — scroll
+        // it into view the way a thumb would (a drag in the side margin,
+        // clear of every button, drives `mode_scroll_system`).
+        touch(&mut app, TouchPhase::Started, Vec2::new(5.0, 600.0));
+        touch(&mut app, TouchPhase::Moved, Vec2::new(5.0, 360.0));
+        touch(&mut app, TouchPhase::Ended, Vec2::new(5.0, 360.0));
 
         let dig = tap_target(&mut app, Some(ModeId::Dig));
         touch(&mut app, TouchPhase::Started, dig);

@@ -77,6 +77,14 @@ fn corner_filled(board: &Board, row: i32, col: i32) -> bool {
 /// not corners, so pre/post-merge is equivalent for this classifier), and
 /// the two history bits documented at the top of this module — see
 /// [`TSpinKind`] and the module docs for what T8 must maintain.
+///
+/// Mask note (cannon-ready): the classifier never reads `ps`'s cell
+/// geometry — only `piece`/`rot`/`row`/`col` — because the 3-corner rule is
+/// *board*-based (the diagonal corners of the bounding box, filled by
+/// settled cells/walls/floor). A chipped `alive` mask therefore cannot
+/// change a classification and is deliberately not consulted here; whether
+/// a chipped T should even be eligible for spin bonuses is a future
+/// gameplay decision, not this classifier's.
 pub fn detect_tspin(
     board: &Board,
     ps: &PieceState,
@@ -105,7 +113,7 @@ mod tests {
     use super::detect_tspin;
     use super::TSpinKind;
     use crate::board::{Board, COLS, ROWS};
-    use crate::piece::{Piece, PieceState, Rotation};
+    use crate::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
     fn ps(piece: Piece, rot: Rotation, row: i32, col: i32) -> PieceState {
         PieceState {
@@ -113,6 +121,7 @@ mod tests {
             rot,
             row,
             col,
+            alive: FULL_CELLS,
         }
     }
 

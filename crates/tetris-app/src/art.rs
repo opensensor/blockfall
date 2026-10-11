@@ -45,6 +45,12 @@ const WELL_CELL_PX: u32 = 64;
 /// Pixel edge of the generated vignette texture.
 const VIGNETTE_PX: u32 = 256;
 
+/// Long edge of the generated CANNONS barrel texture (128×64, faces right).
+const CANNON_PX: u32 = 128;
+
+/// Pixel edge of the generated CANNONS cannonball texture.
+const BALL_PX: u32 = 64;
+
 /// Generated art handles shared by the render, HUD and juice systems.
 /// Inserted by [`init_art_assets`] in `Startup`; consumers take
 /// `Option<Res<ArtAssets>>` so headless test apps (no `Startup`) keep the
@@ -59,6 +65,11 @@ pub struct ArtAssets {
     pub well: Handle<Image>,
     /// Radial vignette, stretched over the window.
     pub vignette: Handle<Image>,
+    /// CANNONS: side-battery barrel facing **right**; the left battery
+    /// mirrors it via `Sprite::flip_x`. Luminance texture, tinted iron.
+    pub cannon: Handle<Image>,
+    /// CANNONS: cannonball (shaded iron sphere). Tinted near-black.
+    pub ball: Handle<Image>,
 }
 
 /// Startup system: generate every procedural texture and publish them.
@@ -71,6 +82,8 @@ pub fn init_art_assets(mut commands: Commands, images: Option<ResMut<Assets<Imag
         ghost: images.add(ghost_image()),
         well: images.add(well_image()),
         vignette: images.add(vignette_image()),
+        cannon: images.add(cannon_image()),
+        ball: images.add(ball_image()),
     });
 }
 
@@ -268,6 +281,106 @@ pub fn vignette_image() -> Image {
         }
     }
     image(data, n, n)
+}
+
+/// CANNONS barrel (128×64, muzzle facing **right**): an iron tube with a
+/// top-lit highlight, a banded muzzle ring, a dark bore, and a trunnion
+/// knob on the bore axis. Luminance texture tinted by the barrel color.
+pub fn cannon_image() -> Image {
+    let w = CANNON_PX;
+    let h = CANNON_PX / 2;
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Normalized coords, u: 0 (breech) → 1 (muzzle), v: 0 top.
+            let u = x as f32 / w as f32;
+            let v = y as f32 / h as f32;
+            // Tube: rounded rectangle spanning the barrel band.
+            let tube = round_rect_norm(u, v, 0.06, 0.94, 0.26, 0.74, 0.10);
+            // Muzzle ring (wider collar) near the bore end.
+            let ring = round_rect_norm(u, v, 0.78, 0.90, 0.20, 0.80, 0.06);
+            // Bore (dark muzzle opening) at the far right.
+            let bore_d = ((u - 0.965) / 0.05).powi(2) + ((v - 0.5) / 0.16).powi(2);
+            let bore = ((1.0 - bore_d).max(0.0)).smoothstep01();
+            // Trunnion knob on the axis at the breech end (pivots the barrel).
+            let knob_d = ((u - 0.16) / 0.10).powi(2) + ((v - 0.5) / 0.22).powi(2);
+            let knob = ((1.0 - knob_d).max(0.0)).smoothstep01();
+
+            let cover = (tube + ring + knob).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                put_white(&mut data, 0.0, 1.0);
+                continue;
+            }
+            // Top-lit tube shading, brightened by the ring, darkened by the bore.
+            let mut b = 0.55 - 0.80 * (v - 0.30).abs();
+            b = b.clamp(0.28, 0.92);
+            b += 0.18 * ring;
+            b *= 1.0 - 0.85 * bore;
+            put_white(&mut data, cover, b.clamp(0.0, 1.0));
+        }
+    }
+    image(data, w, h)
+}
+
+/// CANNONS cannonball (64×64): a top-lit iron sphere with a specular
+/// catch-light upper-left. Luminance texture tinted near-black by the render.
+pub fn ball_image() -> Image {
+    let n = BALL_PX;
+    let mut data = Vec::with_capacity((n * n * 4) as usize);
+    let c = n as f32 / 2.0;
+    for y in 0..n {
+        for x in 0..n {
+            // Sphere disc with a soft ~1px edge.
+            let dx = x as f32 + 0.5 - c;
+            let dy = y as f32 + 0.5 - c;
+            let r = (dx * dx + dy * dy).sqrt() / c;
+            let cover = (1.0 - (r - 0.86) / 0.14).clamp(0.0, 1.0).smoothstep01();
+            if cover <= 0.0 {
+                put_white(&mut data, 0.0, 1.0);
+                continue;
+            }
+            // Lambert-ish top-left lighting across the lit hemisphere…
+            let nx = dx / c;
+            let ny = -(dy / c);
+            let ndotl = (0.58 * nx + 0.80 * ny).clamp(0.0, 1.0);
+            let mut b = 0.30 + 0.55 * ndotl;
+            // Tight specular catch-light.
+            let sx = nx + 0.42;
+            let sy = ny - 0.42;
+            let spec = (1.0 - (sx * sx + sy * sy) / 0.10).max(0.0);
+            b += 0.45 * spec;
+            put_white(&mut data, cover, b.clamp(0.0, 1.0));
+        }
+    }
+    image(data, n, n)
+}
+
+/// Coverage of an axis-aligned rounded rectangle in normalized `u/v` space
+/// (`[u0,u1] × [v0,v1]`, corner radius `radius` in u units), supersampled
+/// 4×4 per texel for smooth edges (radius clamped to half the band height).
+fn round_rect_norm(u: f32, v: f32, u0: f32, u1: f32, v0: f32, v1: f32, radius: f32) -> f32 {
+    let rx = radius.min((u1 - u0) * 0.5);
+    let ry = radius.min((v1 - v0) * 0.5);
+    let du = 1.0 / CANNON_PX as f32;
+    let dv = 2.0 / CANNON_PX as f32;
+    let inside = |u: f32, v: f32| {
+        let cx = u.clamp(u0 + rx, u1 - rx);
+        let cy = v.clamp(v0 + ry, v1 - ry);
+        let dx = (u - cx) / rx;
+        let dy = (v - cy) / ry;
+        dx * dx + dy * dy <= 1.0
+    };
+    let mut hits = 0u32;
+    for sv in 0..4 {
+        for su in 0..4 {
+            let x = u + (su as f32 + 0.5) / 4.0 * du;
+            let y = v + (sv as f32 + 0.5) / 4.0 * dv;
+            if inside(x, y) {
+                hits += 1;
+            }
+        }
+    }
+    hits as f32 / 16.0
 }
 
 #[cfg(test)]

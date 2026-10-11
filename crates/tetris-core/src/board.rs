@@ -43,12 +43,13 @@ impl Board {
         self.grid.iter().all(|row| row.iter().all(Option::is_none))
     }
 
-    /// Collision test for `state`: true if any cell is out of bounds
-    /// horizontally, at or below the floor, or overlaps an occupied cell.
-    /// Cells with `row < 0` are NOT a collision — pieces may overhang the
-    /// top edge, which is what makes block-out detection possible in T8.
+    /// Collision test for `state`: true if any *alive* cell is out of
+    /// bounds horizontally, at or below the floor, or overlaps an occupied
+    /// cell. Cells with `row < 0` are NOT a collision — pieces may overhang
+    /// the top edge, which is what makes block-out detection possible in T8.
+    /// Dead cells (chipped by the future cannon mechanic) are ignored.
     pub fn collides(&self, state: &PieceState) -> bool {
-        state.cells().iter().any(|&(r, c)| {
+        state.alive_cells().any(|(r, c)| {
             c < 0
                 || c >= COLS as i32
                 || r >= ROWS as i32
@@ -56,11 +57,11 @@ impl Board {
         })
     }
 
-    /// Stamp `state`'s piece into the grid. Caller must ensure the state
-    /// does not collide; out-of-range cells (e.g. overhanging rows `row<0`)
-    /// are silently skipped rather than panicking.
+    /// Stamp `state`'s alive cells into the grid. Caller must ensure the
+    /// state does not collide; out-of-range cells (e.g. overhanging rows `row<0`)
+    /// are silently skipped rather than panicking. Dead cells leave holes.
     pub fn merge(&mut self, state: &PieceState) {
-        for (r, c) in state.cells() {
+        for (r, c) in state.alive_cells() {
             if r >= 0 && r < ROWS as i32 && c >= 0 && c < COLS as i32 {
                 self.grid[r as usize][c as usize] = Some(state.piece);
             }
@@ -138,7 +139,7 @@ pub fn ghost_row(board: &Board, state: &PieceState) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::piece::{spawn_state, Rotation};
+    use crate::piece::{spawn_state, Rotation, FULL_CELLS};
 
     fn state(piece: Piece, rot: Rotation, row: i32, col: i32) -> PieceState {
         PieceState {
@@ -146,6 +147,7 @@ mod tests {
             rot,
             row,
             col,
+            alive: FULL_CELLS,
         }
     }
 
@@ -340,5 +342,66 @@ mod tests {
         assert_eq!(ghost_row(&board, &stuck), 20);
         let below_floor = state(Piece::O, Rotation::Spawn, ROWS as i32, 4);
         assert_eq!(ghost_row(&board, &below_floor), ROWS as i32);
+    }
+
+    #[test]
+    fn collides_ignores_dead_cells() {
+        let mut board = Board::new();
+        // T spawn cells: slot 0 is the nub at (row+0, col+1). Box (20, 3)
+        // puts the nub on (20, 4); plant a blocker exactly there.
+        board.set(20, 4, Some(Piece::Z));
+        let full = state(Piece::T, Rotation::Spawn, 20, 3);
+        assert!(board.collides(&full), "intact nub must collide");
+        // Chip the nub (slot 0): the piece fits into the notch.
+        let chipped = PieceState {
+            alive: FULL_CELLS & !(1 << 0),
+            ..full
+        };
+        assert!(!board.collides(&chipped), "dead nub must not collide");
+        // Alive cells may still collide: with the nub dead, a blocker under
+        // the still-alive bar cell (slot 2 at (21,5)) must be caught.
+        let bar_hit = state(Piece::T, Rotation::Spawn, 20, 4); // cells (20,5) + bar 4..=6 row 21
+        board.set(21, 5, Some(Piece::Z));
+        let dead_wrong_slot = PieceState {
+            alive: FULL_CELLS & !(1 << 0),
+            ..bar_hit
+        };
+        assert!(
+            board.collides(&dead_wrong_slot),
+            "alive bar cell under a blocker must still collide"
+        );
+    }
+
+    #[test]
+    fn merge_skips_dead_cells_leaving_a_hole() {
+        let mut board = Board::new();
+        // T at box (20, 3) with the nub (slot 0, board cell (20,4)) dead.
+        let chipped = PieceState {
+            alive: FULL_CELLS & !(1 << 0),
+            ..state(Piece::T, Rotation::Spawn, 20, 3)
+        };
+        board.merge(&chipped);
+        assert_eq!(board.get(20, 4), None, "dead nub must leave a hole");
+        assert_eq!(board.get(21, 3), Some(Piece::T));
+        assert_eq!(board.get(21, 4), Some(Piece::T));
+        assert_eq!(board.get(21, 5), Some(Piece::T));
+        assert!(!board.full_rows().contains(&21), "row 21 is 3 cells only");
+    }
+
+    #[test]
+    fn ghost_row_honours_the_alive_mask() {
+        let mut board = Board::new();
+        // T in Cw at box col 3: column cells (r,4),(r+1,4),(r+2,4) plus the
+        // nub (slot 2) at (r+1,5). A blocker at (20,5) is touched only by
+        // the nub: the intact piece rests one row higher than the chipped
+        // one, which sinks its (dead) nub cell onto the blocker.
+        board.set(20, 5, Some(Piece::Z));
+        let intact = state(Piece::T, Rotation::Cw, 0, 3);
+        assert_eq!(ghost_row(&board, &intact), 18);
+        let chipped = PieceState {
+            alive: FULL_CELLS & !(1 << 2),
+            ..intact
+        };
+        assert_eq!(ghost_row(&board, &chipped), 19);
     }
 }

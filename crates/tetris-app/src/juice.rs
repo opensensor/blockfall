@@ -216,6 +216,39 @@ pub fn effect_plan(event: &GameEvent, quality: EffectsQuality) -> EffectPlan {
             shake: (1.0, 0.06),
             ..off
         },
+        // CANNONS mutator: the volley report nudges the camera; a chip is a
+        // compact warm pop with a knock, the dud spark of a last
+        // cell is a fainter tick. Both stay well below the lock/clear tiers.
+        (GameEvent::CannonFired { .. }, Low) => off,
+        (GameEvent::CannonFired { .. }, Medium) => EffectPlan {
+            shake: (2.0, 0.08),
+            ..off
+        },
+        (GameEvent::CannonFired { .. }, High) => EffectPlan {
+            flash: (0.08, 0.04),
+            shake: (3.0, 0.10),
+            ..off
+        },
+        (GameEvent::CannonImpact { chipped: true, .. }, Low) => EffectPlan {
+            flash: (0.15, 0.05),
+            ..off
+        },
+        (GameEvent::CannonImpact { chipped: true, .. }, Medium) => EffectPlan {
+            flash: (0.25, 0.08),
+            shake: (3.5, 0.10),
+            ..off
+        },
+        (GameEvent::CannonImpact { chipped: true, .. }, High) => EffectPlan {
+            flash: (0.32, 0.10),
+            shake: (5.0, 0.14),
+            ..off
+        },
+        (GameEvent::CannonImpact { .. }, Low | Medium) => off,
+        (GameEvent::CannonImpact { .. }, High) => EffectPlan {
+            flash: (0.12, 0.05),
+            shake: (1.5, 0.06),
+            ..off
+        },
         _ => off,
     }
 }

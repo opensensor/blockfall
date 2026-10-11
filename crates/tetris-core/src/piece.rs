@@ -158,15 +158,40 @@ impl Rotation {
     }
 }
 
+/// Full [`PieceState::alive`] mask: all four table cells are present.
+/// This is the only value any current code path ever sets; the cannon
+/// mechanic (future work) will chip bits out of it.
+pub const FULL_CELLS: u8 = 0b1111;
+
+/// Serde default for the skipped [`PieceState::alive`] field: states
+/// deserialized from older bytes carry the full mask.
+fn full_cells() -> u8 {
+    FULL_CELLS
+}
+
 /// A piece on the playfield: shape, rotation, and the board position of
 /// its bounding box's top-left corner. `row`/`col` may be negative (a
 /// piece may legally overhang the top edge; see `Board::collides`).
+///
+/// `alive` is a 4-bit mask over the *table slots* of [`Piece::cells`]:
+/// bit `i` means cell `piece.cells(rot)[i]` is still present. Because the
+/// SRS tables are pure rotations of the spawn table (slot `i` rotates with the
+/// geometry), carrying the mask unchanged across rotations makes the
+/// surviving-cell pattern rotate together with the piece. Collision and
+/// merge consume the mask via [`PieceState::alive_cells`]; [`PieceState::cells`]
+/// deliberately ignores it (fixed-size array contract for rendering and
+/// other full-geometry consumers). The mask is `serde`-skipped: it never
+/// touches serialized bytes, keeping snapshot/event wire shapes stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieceState {
     pub piece: Piece,
     pub rot: Rotation,
     pub row: i32,
     pub col: i32,
+    /// Bit `i` (`1 << i`) means table cell `piece.cells(rot)[i]` is still
+    /// present; [`FULL_CELLS`] is the intact piece. Slots 4..=7 are unused.
+    #[serde(default = "full_cells", skip)]
+    pub alive: u8,
 }
 
 impl PieceState {
@@ -177,6 +202,26 @@ impl PieceState {
             out[i] = (self.row + dr, self.col + dc);
         }
         out
+    }
+
+    /// True when table slot `index` is still present in this piece.
+    /// Indices outside the four table slots are never alive.
+    pub fn is_alive(&self, index: usize) -> bool {
+        index < 4 && self.alive & (1u8 << index) != 0
+    }
+
+    /// Number of cells currently alive (4 for an intact piece).
+    pub fn alive_count(&self) -> u32 {
+        self.alive.count_ones()
+    }
+
+    /// Absolute board coordinates of the alive cells, in table order
+    /// (the [`PieceState::cells`] sequence filtered by [`PieceState::is_alive`]).
+    pub fn alive_cells(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        let cells = self.cells();
+        (0..4)
+            .filter(move |&i| self.is_alive(i))
+            .map(move |i| cells[i])
     }
 }
 
@@ -195,6 +240,7 @@ pub fn spawn_state(piece: Piece) -> PieceState {
         rot: Rotation::Spawn,
         row: 0,
         col,
+        alive: FULL_CELLS,
     }
 }
 
@@ -389,6 +435,7 @@ mod tests {
             rot: Rotation::Spawn,
             row: 2,
             col: 3,
+            alive: FULL_CELLS,
         };
         assert_eq!(ps.cells(), [(3, 3), (3, 4), (3, 5), (3, 6)]);
         let ps = PieceState {
@@ -396,8 +443,87 @@ mod tests {
             rot: Rotation::Spawn,
             row: -1,
             col: 0,
+            alive: FULL_CELLS,
         };
         assert_eq!(ps.cells(), [(-1, 0), (-1, 1), (0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn alive_cells_filters_dead_slots_and_preserves_order() {
+        // T spawn cells: [(0,1), (1,0), (1,1), (1,2)]; kill slots 1 and 2,
+        // keep nub (slot 0) and bar-right (slot 3) -> table order preserved.
+        let ps = PieceState {
+            piece: Piece::T,
+            rot: Rotation::Spawn,
+            row: 10,
+            col: 3,
+            alive: 0b1001,
+        };
+        assert_eq!(ps.alive_cells().collect::<Vec<_>>(), vec![(10, 4), (11, 5)]);
+        // Full mask yields exactly `cells()` in the same order.
+        let full = PieceState {
+            alive: FULL_CELLS,
+            ..ps
+        };
+        assert_eq!(
+            full.alive_cells().collect::<Vec<_>>(),
+            full.cells().to_vec()
+        );
+        // Empty mask yields nothing.
+        let dead = PieceState { alive: 0, ..ps };
+        assert_eq!(dead.alive_cells().count(), 0);
+    }
+
+    #[test]
+    fn alive_count_and_is_alive_track_the_mask() {
+        let ps = PieceState {
+            piece: Piece::J,
+            rot: Rotation::Spawn,
+            row: 0,
+            col: 0,
+            alive: FULL_CELLS,
+        };
+        assert_eq!(ps.alive_count(), 4);
+        for i in 0..4 {
+            assert!(ps.is_alive(i));
+        }
+        assert!(!ps.is_alive(4));
+        assert!(!ps.is_alive(99));
+
+        let chipped = PieceState {
+            alive: 0b0110,
+            ..ps
+        };
+        assert_eq!(chipped.alive_count(), 2);
+        assert!(!chipped.is_alive(0));
+        assert!(chipped.is_alive(1));
+        assert!(chipped.is_alive(2));
+        assert!(!chipped.is_alive(3));
+    }
+
+    /// The mask is serde-skipped: serialized bytes are identical whether
+    /// the mask is full or chipped, and deserialization always yields
+    /// `FULL_CELLS`. This is what keeps the T1 golden snapshot lengths
+    /// (`tests/marathon_regression.rs`) byte-stable.
+    #[test]
+    fn alive_mask_is_skipped_by_serde() {
+        let full = PieceState {
+            piece: Piece::S,
+            rot: Rotation::Cw,
+            row: 5,
+            col: 2,
+            alive: FULL_CELLS,
+        };
+        let chipped = PieceState {
+            alive: 0b0011,
+            ..full
+        };
+        assert_ne!(full, chipped, "mask must participate in PartialEq");
+        let a = bincode::serialize(&full).unwrap();
+        let b = bincode::serialize(&chipped).unwrap();
+        assert_eq!(a, b, "skipped field must not touch bytes");
+        let back: PieceState = bincode::deserialize(&b).unwrap();
+        assert_eq!(back, full, "deserialized states get FULL_CELLS");
     }
 
     #[test]

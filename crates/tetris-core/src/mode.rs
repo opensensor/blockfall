@@ -208,6 +208,12 @@ pub struct ModeConfig {
     /// Optional timed garbage feed (T12, Survival). `None` (the default)
     /// means no feed: every pre-T12 config behaves exactly as before.
     pub garbage_feed: Option<GarbageFeed>,
+    /// Side-battery cannon schedule (CANNONS mutator). `None` (the default)
+    /// means no cannons: the game behaves exactly as before and the cannon
+    /// RNG stream is never created. Only the app's CANNONS mutator sets
+    /// this; versus/net mirrors always play with `None` (mutators are
+    /// solo-only), so lockstep peers can never diverge over it.
+    pub cannons: Option<crate::cannons::CannonRules>,
 }
 
 impl Default for ModeConfig {
@@ -222,6 +228,7 @@ impl Default for ModeConfig {
             start_board: None,
             on_block_out: BlockOutBehavior::End,
             garbage_feed: None,
+            cannons: None,
         }
     }
 }
@@ -241,6 +248,7 @@ mod tests {
         assert_eq!(c.start_board, None);
         assert_eq!(c.on_block_out, BlockOutBehavior::End);
         assert_eq!(c.garbage_feed, None);
+        assert_eq!(c.cannons, None);
     }
 
     #[test]

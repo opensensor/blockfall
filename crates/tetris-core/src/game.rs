@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::Action;
 use crate::bag::Bag;
 use crate::board::{self, Board};
+use crate::cannons::{CannonRules, CannonShot, CannonSide, CANNON_SALT};
 use crate::event::GameEvent;
 use crate::gravity;
 use crate::hold::HoldSlot;
@@ -43,6 +44,11 @@ pub const NEXT_PREVIEW: usize = 5;
 /// salt constant, `mode::BURIED_GARBAGE_SALT`).
 const FEED_HOLE_SALT: u64 = 0x51F0_7D3A_9C6B_4E21;
 
+/// Maximum number of cannonballs allowed in flight at once; a fire whose
+/// volley is already at the cap still emits `CannonFired` and still
+/// reschedules, it simply spawns no ball.
+const MAX_SHOTS_IN_FLIGHT: usize = 8;
+
 /// Survival garbage-feed runtime state (T12); `Some` only when
 /// `config.garbage_feed` is `Some`. Queue events derive from game ticks
 /// alone; rows touch the board only when they land on a lock.
@@ -58,6 +64,23 @@ struct FeedState {
     /// *landing* batch (hole constant within a batch, like versus), never
     /// from the bag's stream — bag draws stay untouched.
     hole_rng: Rng,
+}
+
+/// CANNONS runtime state; `Some` only when `config.cannons` is `Some`. The
+/// firing schedule is driven by game ticks alone on an independent splitmix64
+/// stream (salted with `CANNON_SALT`), so neither the 7-bag nor the Survival
+/// feed stream ever sees a cannon draw and a run stays fully
+/// reproducible from its seed. Not part of `GameSnapshot` (wire stability).
+struct CannonState {
+    /// The firing schedule this game was configured with.
+    rules: CannonRules,
+    /// Absolute game tick on which the next cannon fires.
+    next_fire_tick: u64,
+    /// Independent splitmix64 stream: exactly two draws per shot — the
+    /// cannon pick (`0..6`) and the gap jitter (`0..=max_gap - min_gap`).
+    rng: Rng,
+    /// Cannonballs in flight, oldest fire first.
+    shots: Vec<CannonShot>,
 }
 
 /// Everything T11/T13/T18 need to render a full frame from scratch —
@@ -120,6 +143,10 @@ pub struct Game {
     /// Survival garbage feed (T12); `Some` only under a `garbage_feed`
     /// config. Not part of `GameSnapshot` (wire stability).
     feed: Option<FeedState>,
+    /// Side-battery cannons (CANNONS mutator); `Some` only under a `cannons`
+    /// config. Not part of `GameSnapshot` (wire stability); in-flight balls
+    /// are read through [`Game::cannon_shots`].
+    cannons: Option<CannonState>,
 }
 
 impl Game {
@@ -144,6 +171,12 @@ impl Game {
             pending: 0,
             hole_rng: Rng::new(seed ^ FEED_HOLE_SALT),
         });
+        let cannons = config.cannons.map(|rules| CannonState {
+            next_fire_tick: rules.first_shot_delay,
+            rules,
+            rng: Rng::new(seed ^ CANNON_SALT),
+            shots: Vec::new(),
+        });
         let mut g = Self {
             board,
             bag: Bag::new(seed),
@@ -162,6 +195,7 @@ impl Game {
             ticks: 0,
             finished: None,
             feed,
+            cannons,
         };
         let first = g.bag.next();
         g.spawn(first, &mut Vec::new());
@@ -187,6 +221,74 @@ impl Game {
             if self.ticks >= feed.next_queue_tick {
                 feed.pending += 1;
                 feed.next_queue_tick = self.ticks + feed.rules.interval_at(self.ticks);
+            }
+        }
+        // CANNONS (CANNONS mutator): fire first, then advance every ball one
+        // step, both ahead of this frame's gravity/lock bookkeeping so a
+        // chipped cell is gone before the piece moves or grounds (and the
+        // events always precede any lock events of the same tick). The ball
+        // checks the active piece at the column its step covers; a meeting
+        // chips that cell — never the piece's last one, which sparks off —
+        // and is spent either way. Only the independent cannon stream is
+        // drawn on, so bag and feed sequences are untouched.
+        if let Some(cannons) = self.cannons.as_mut() {
+            if self.active.is_some() && self.ticks >= cannons.next_fire_tick {
+                let pick = cannons.rng.next_below(6);
+                let side = if pick < 3 {
+                    CannonSide::Left
+                } else {
+                    CannonSide::Right
+                };
+                let row = crate::cannons::CANNON_ROWS[(pick % 3) as usize];
+                if cannons.shots.len() < MAX_SHOTS_IN_FLIGHT {
+                    let x8 = if side == CannonSide::Left {
+                        crate::cannons::SHOT_SPAWN_LEFT_X8
+                    } else {
+                        crate::cannons::SHOT_SPAWN_RIGHT_X8
+                    };
+                    cannons.shots.push(CannonShot { side, row, x8 });
+                }
+                let (min_gap, max_gap) = cannons.rules.gap_range();
+                let jitter = cannons.rng.next_below(max_gap - min_gap + 1);
+                cannons.next_fire_tick = self.ticks + min_gap + jitter;
+                ev.push(GameEvent::CannonFired {
+                    side,
+                    row,
+                    tick: self.ticks,
+                });
+            }
+            if !cannons.shots.is_empty() {
+                let mut shots = std::mem::take(&mut cannons.shots);
+                let mut active = self.active;
+                let tick = self.ticks;
+                shots.retain_mut(|shot| {
+                    shot.x8 += shot.velocity_x8();
+                    let covered = shot.covered_col();
+                    if (0..board::COLS as i32).contains(&covered) {
+                        if let Some(ps) = active.as_mut() {
+                            let cells = ps.cells();
+                            if let Some(slot) =
+                                (0..4).find(|&i| ps.is_alive(i) && cells[i] == (shot.row, covered))
+                            {
+                                let chipped = ps.alive_count() >= 2;
+                                if chipped {
+                                    ps.alive &= !(1u8 << slot);
+                                }
+                                ev.push(GameEvent::CannonImpact {
+                                    side: shot.side,
+                                    row: shot.row,
+                                    col: covered,
+                                    tick,
+                                    chipped,
+                                });
+                                return false;
+                            }
+                        }
+                    }
+                    !shot.off_field()
+                });
+                cannons.shots = shots;
+                self.active = active;
             }
         }
         self.gravity_elapsed += 1;
@@ -375,6 +477,16 @@ impl Game {
             .map(|feed| feed.next_queue_tick.saturating_sub(self.ticks))
     }
 
+    /// Cannonballs in flight (CANNONS mutator); empty without a `cannons`
+    /// config. Render-only view — in-flight state is not part of
+    /// `GameSnapshot` (wire stability, like the feed). Positions advance once
+    /// per live [`Game::tick`]; a frozen game keeps its last volley, so
+    /// renderers must gate on their own run state.
+    #[must_use]
+    pub fn cannon_shots(&self) -> &[CannonShot] {
+        self.cannons.as_ref().map_or(&[], |cannons| &cannons.shots)
+    }
+
     /// T24 versus contract exception (crate-internal only; not part of the
     /// frozen public `Game` API): replace the settled stack with `board`
     /// after [`crate::versus`] has pushed garbage rows underneath it.
@@ -450,6 +562,12 @@ impl Game {
     }
 
     /// Merge the active piece, score the lock, then spawn the next piece.
+    ///
+    /// Mask note (cannon-ready): merge and all collision checks go through
+    /// `Board`/`ghost_row`, which consume the `alive` mask; `PieceLocked`
+    /// and `PieceSpawned` events carry the *full* state including the mask
+    /// (serde-skipped, so wire bytes are unchanged). Gravity/movement mutate
+    /// only `row`/`col`, so struct copies keep the mask.
     fn lock_and_spawn(&mut self, ev: &mut Vec<GameEvent>) {
         let Some(state) = self.active.take() else {
             return;
@@ -549,7 +667,7 @@ mod tests {
     use super::*;
     use crate::board::{COLS, ROWS};
     use crate::mode::BlockOutBehavior;
-    use crate::piece::Rotation;
+    use crate::piece::{Rotation, FULL_CELLS};
 
     fn state(piece: Piece, rot: Rotation, row: i32, col: i32) -> PieceState {
         PieceState {
@@ -557,6 +675,7 @@ mod tests {
             rot,
             row,
             col,
+            alive: FULL_CELLS,
         }
     }
 
@@ -1076,6 +1195,7 @@ mod tests {
             start_board: None,
             on_block_out: BlockOutBehavior::WipeAndContinue,
             garbage_feed: None,
+            cannons: None,
         }
     }
 
@@ -1664,6 +1784,7 @@ mod tests {
             rot: Rotation::Spawn,
             row: -1,
             col: 4,
+            alive: FULL_CELLS,
         });
         let ev = g.apply(Action::HardDrop);
         assert_eq!(g.snapshot().lines, 0, "the lock must not clear anything");
@@ -1736,6 +1857,7 @@ mod tests {
             rot: Rotation::Cw,
             row: -3,
             col: 3,
+            alive: FULL_CELLS,
         });
         let ev = g.apply(Action::HardDrop);
         assert_eq!(g.snapshot().lines, 1, "the I completes exactly row 21");
@@ -2000,6 +2122,7 @@ mod tests {
                     rot,
                     row: 0,
                     col: boxcol,
+                    alive: FULL_CELLS,
                 };
                 if board.collides(&ps) {
                     continue;
@@ -2333,5 +2456,301 @@ mod tests {
             assert!(g.tick().is_empty());
             assert!(g.apply(Action::HardDrop).is_empty());
         }
+    }
+
+    /// Cannon-ready mask consumption in the full lock pipeline: a locked
+    /// piece with a chipped cell stamps only its alive cells, leaves a hole
+    /// where the dead cell was, and must not falsely complete (clear) the
+    /// row it was supposed to finish.
+    #[test]
+    fn locked_damaged_piece_leaves_a_hole_and_does_not_clear() {
+        let mut g = Game::new(7);
+        g.board = Board::new();
+        // Row 21 complete except the O spawn columns 4-5: an intact O
+        // dropped there completes the row; one with its bottom-right cell
+        // chipped out leaves (21,5) as a hole.
+        for c in 0..COLS {
+            if c != 4 && c != 5 {
+                g.board.set(ROWS - 1, c, Some(Piece::Z));
+            }
+        }
+        // O slots: 0=(0,0) 1=(0,1) 2=(1,0) 3=(1,1) at box col 4. Chip
+        // slot 3 — the cell that would land on (21,5).
+        let chipped_o = PieceState {
+            alive: FULL_CELLS & !(1 << 3),
+            ..state(Piece::O, Rotation::Spawn, 0, 4)
+        };
+        g.active = Some(chipped_o);
+        let ev = g.apply(Action::HardDrop);
+
+        // The lock event carries the full state including the chip.
+        assert!(
+            ev.contains(&GameEvent::PieceLocked {
+                piece: Piece::O,
+                state: PieceState {
+                    alive: FULL_CELLS & !(1 << 3),
+                    ..state(Piece::O, Rotation::Spawn, 20, 4)
+                },
+            }),
+            "PieceLocked must carry the damaged state: {ev:?}"
+        );
+        // Hole where the dead cell was; alive cells stamped.
+        let s = g.snapshot();
+        assert_eq!(s.board.get(21, 5), None, "dead cell must leave a hole");
+        assert_eq!(s.board.get(21, 4), Some(Piece::O));
+        assert_eq!(s.board.get(20, 4), Some(Piece::O));
+        assert_eq!(s.board.get(20, 5), Some(Piece::O));
+        // No false clear: row 21 still has the hole.
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, GameEvent::LineCleared { .. })),
+            "a hole must not clear: {ev:?}"
+        );
+        assert_eq!(s.lines, 0);
+
+        // Control: the intact mask at the same position completes row 21.
+        let mut h = Game::new(7);
+        h.board = Board::new();
+        for c in 0..COLS {
+            if c != 4 && c != 5 {
+                h.board.set(ROWS - 1, c, Some(Piece::Z));
+            }
+        }
+        h.active = Some(state(Piece::O, Rotation::Spawn, 0, 4));
+        let ev = h.apply(Action::HardDrop);
+        assert!(
+            ev.contains(&GameEvent::LineCleared { lines: 1 }),
+            "intact O completes the row: {ev:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // CANNONS mutator: batteries, chipping, determinism
+    // ------------------------------------------------------------------
+
+    /// Marathon + the CANNONS schedule (the app's `start_mode` override's
+    /// core twin): the config knob the CANNONS bit flips on.
+    fn cannon_config(rules: CannonRules) -> ModeConfig {
+        ModeConfig {
+            cannons: Some(rules),
+            ..ModeConfig::default()
+        }
+    }
+
+    /// A rapid-fire schedule (shot every 0.5–1 s) so soak/determinism
+    /// tests see many interactions inside a bounded tick budget. The
+    /// chipping invariants are schedule-independent, the volume is not.
+    fn rapid_cannon_rules() -> CannonRules {
+        CannonRules {
+            first_shot_delay: 30,
+            min_gap_ticks: 30,
+            max_gap_ticks: 60,
+        }
+    }
+
+    /// Marathon with the batteries silenced (`first_shot_delay` past any
+    /// reachable tick): the shot list can then be poked without a
+    /// concurrent fire disturbing it.
+    fn silenced_cannon_config() -> ModeConfig {
+        cannon_config(CannonRules {
+            first_shot_delay: u64::MAX,
+            ..CannonRules::default()
+        })
+    }
+
+    #[test]
+    fn cannonball_chips_the_exact_cell_it_meets() {
+        let mut g = Game::with_config(3, &silenced_cannon_config());
+        g.board = Board::new();
+        // Horizontal I at box row 8, col 3: live cells on board row 9, cols 3..=6.
+        g.active = Some(state(Piece::I, Rotation::Spawn, 8, 3));
+        // Ball one step (4 x8) left of covering col 5: post-step x8 = 40
+        // covers (40 + 4) / 8 → col 5 (table slot 2 of the I).
+        g.cannons.as_mut().unwrap().shots.push(CannonShot {
+            side: CannonSide::Left,
+            row: 9,
+            x8: 36,
+        });
+        let ev = g.tick();
+        assert!(
+            ev.contains(&GameEvent::CannonImpact {
+                side: CannonSide::Left,
+                row: 9,
+                col: 5,
+                tick: 1,
+                chipped: true,
+            }),
+            "expected the chipping impact: {ev:?}"
+        );
+        let ps = g.snapshot().active.unwrap();
+        assert_eq!(ps.alive, 0b1111u8 & !(1u8 << 2), "slot 2 is gone");
+        assert!(g.cannon_shots().is_empty(), "the ball is spent");
+        // Gravity has not moved the piece yet (level 1 interval is 48).
+        assert_eq!(ps.row, 8);
+    }
+
+    #[test]
+    fn cannonball_sparks_off_the_last_alive_cell() {
+        let mut g = Game::with_config(3, &silenced_cannon_config());
+        g.board = Board::new();
+        // T at box (8, 3) with only table slot 1 alive: cells are
+        // [(8,4),(9,3),(9,4),(9,5)] → the survivor sits at (9, 3).
+        g.active = Some(PieceState {
+            alive: 1 << 1,
+            ..state(Piece::T, Rotation::Spawn, 8, 3)
+        });
+        g.cannons.as_mut().unwrap().shots.push(CannonShot {
+            side: CannonSide::Left,
+            row: 9,
+            x8: 16, // post-step x8 = 20 covers col 3
+        });
+        let ev = g.tick();
+        assert!(
+            ev.contains(&GameEvent::CannonImpact {
+                side: CannonSide::Left,
+                row: 9,
+                col: 3,
+                tick: 1,
+                chipped: false,
+            }),
+            "expected the dud spark: {ev:?}"
+        );
+        assert_eq!(
+            g.snapshot().active.unwrap().alive,
+            1 << 1,
+            "the last cell is never taken"
+        );
+        assert!(g.cannon_shots().is_empty(), "the ball is spent either way");
+    }
+
+    #[test]
+    fn cannon_fires_land_on_the_scheduled_cadence() {
+        let rules = CannonRules {
+            first_shot_delay: 1,
+            min_gap_ticks: 3,
+            max_gap_ticks: 3,
+        };
+        let mut g = Game::with_config(9, &cannon_config(rules));
+        let mut fired = Vec::new();
+        // 120 ticks at level 1: the piece is still falling the whole time,
+        // so every scheduled tick fires.
+        for _ in 0..120 {
+            for e in g.tick() {
+                if let GameEvent::CannonFired { tick, .. } = e {
+                    fired.push(tick);
+                }
+            }
+        }
+        assert!(!fired.is_empty(), "the batteries stayed silent");
+        assert_eq!(fired[0], 1, "first shot at `first_shot_delay`");
+        assert!(
+            fired.windows(2).all(|w| w[1] - w[0] == 3),
+            "min == max must give an exact 3-tick cadence: {fired:?}"
+        );
+    }
+
+    #[test]
+    fn cannons_never_disturb_the_bag_stream() {
+        // Structural guard for the independent stream: the dealt piece
+        // sequence must be the same 7-bag stream with and without cannons
+        // (if firing drew from the bag's RNG these would diverge).
+        let dealt = |cannons: bool| {
+            let config = if cannons {
+                cannon_config(CannonRules::default())
+            } else {
+                ModeConfig::default()
+            };
+            let mut g = Game::with_config(1234, &config);
+            let mut spawned = vec![g.snapshot().active.unwrap().piece];
+            for _ in 0..10_000 {
+                for e in g.tick() {
+                    if let GameEvent::PieceSpawned { piece, .. } = e {
+                        spawned.push(piece);
+                    }
+                }
+            }
+            spawned
+        };
+        let clean = dealt(false);
+        let armed = dealt(true);
+        assert!(clean.len() >= 5, "clean run reached multiple locks");
+        assert!(armed.len() >= 5, "armed run reached multiple locks");
+        let common = clean.len().min(armed.len());
+        assert_eq!(
+            &clean[..common],
+            &armed[..common],
+            "the bag stream must be cannon-invariant"
+        );
+    }
+
+    #[test]
+    fn cannons_never_destroy_their_last_target_cell() {
+        // Scripted soak under the rapid schedule: mid-air manipulation
+        // keeps pieces over the batteries, the piece must always keep at
+        // least one cell alive, and the run must actually see action.
+        let mut g = Game::with_config(20261010, &cannon_config(rapid_cannon_rules()));
+        let script = [
+            Action::MoveLeft,
+            Action::RotateCw,
+            Action::MoveRight,
+            Action::RotateCcw,
+            Action::Rotate180,
+            Action::SoftDrop,
+            Action::MoveRight,
+            Action::MoveLeft,
+        ];
+        let (mut chips, mut sparks) = (0u32, 0u32);
+        for i in 0..20_000 {
+            g.apply(script[i % script.len()]);
+            for e in g.tick() {
+                if let GameEvent::CannonImpact { chipped, .. } = e {
+                    if chipped {
+                        chips += 1;
+                    } else {
+                        sparks += 1;
+                    }
+                }
+            }
+            let s = g.snapshot();
+            assert!(
+                s.active.is_none_or(|p| p.alive_count() >= 1),
+                "tick {i}: a chipped-away-to-nothing piece {s:?}",
+            );
+            if g.finished_reason().is_some() {
+                break;
+            }
+        }
+        assert!(chips >= 5, "the soak must actually chip (got {chips})");
+        let _ = sparks; // a spark is situational; chips are the invariant.
+    }
+
+    #[test]
+    fn cannons_replay_determinism() {
+        // Zero-input replay: pieces ride gravity through the battery rows,
+        // the rapid schedule guarantees overlap, and the whole event and
+        // snapshot streams must match tick-for-tick across runs.
+        let run = |seed: u64| {
+            let mut g = Game::with_config(seed, &cannon_config(rapid_cannon_rules()));
+            let mut events = Vec::new();
+            let mut snaps = Vec::new();
+            for tick in 1..=8_000 {
+                events.extend(g.tick());
+                if tick % 250 == 0 {
+                    snaps.push(g.snapshot());
+                }
+            }
+            (events, snaps)
+        };
+        let (e1, s1) = run(4242);
+        let (e2, s2) = run(4242);
+        assert_eq!(e1, e2, "cannon event streams must match");
+        assert_eq!(s1, s2, "cannon snapshots must match");
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, GameEvent::CannonImpact { chipped: true, .. })),
+            "the scripted run must actually get chipped"
+        );
+        let (_, s3) = run(4243);
+        assert_ne!(s1.last().unwrap(), s3.last().unwrap(), "seeds diverge");
     }
 }

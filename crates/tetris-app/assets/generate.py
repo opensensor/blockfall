@@ -109,6 +109,15 @@ def main():
     write("sfx/hard-drop.wav", noise(0.07, 40.0, 0.35))
     write("sfx/hold.wav", tone(523, 0.07, 35.0))
     write("sfx/game-over.wav", sweep(440, 110, 0.30, 4.0))
+    # CANNONS mutator trio: a deep battery boom (falling pitch under a low
+    # noise thump), the dull crunch of a ball chipping a cell, and a short
+    # metallic tinkle when it sparks off the piece's last cell.
+    write(
+        "sfx/cannon.wav",
+        mix([sweep(110, 38, 0.35, 5.0), amp(0.60, noise(0.10, 22.0, 0.12))]),
+    )
+    write("sfx/chip.wav", mix([tone(160, 0.12, 22.0), amp(0.50, noise(0.06, 40.0, 0.30))]))
+    write("sfx/spark.wav", mix([tone(2093, 0.20, 16.0, vib=0.35), amp(0.30, tone(3136, 0.10, 25.0))]))
 
     # BGM "Classic": 8 eighth notes of 0.25 s at 120 BPM = exactly 2.000 s.
     bass = [110, 110, 165, 110, 147, 147, 110, 98]

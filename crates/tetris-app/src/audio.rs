@@ -101,11 +101,19 @@ pub enum Sfx {
     Hold,
     /// Block-out.
     GameOver,
+    /// CANNONS: a side battery cannon fired (deep low boom).
+    Cannon,
+    /// CANNONS: a cannonball chipped a cell out of the falling piece
+    /// (dull crunch).
+    Chip,
+    /// CANNONS: a cannonball sparked off the piece's last remaining cell
+    /// (short metallic tinkle).
+    Spark,
 }
 
 impl Sfx {
     /// All cues in canonical order.
-    pub const ALL: [Sfx; 10] = [
+    pub const ALL: [Sfx; 13] = [
         Sfx::Move,
         Sfx::Rotate,
         Sfx::Lock,
@@ -116,6 +124,9 @@ impl Sfx {
         Sfx::HardDrop,
         Sfx::Hold,
         Sfx::GameOver,
+        Sfx::Cannon,
+        Sfx::Chip,
+        Sfx::Spark,
     ];
 
     /// Asset path of this cue relative to the app `assets/` root.
@@ -131,6 +142,9 @@ impl Sfx {
             Sfx::HardDrop => "sfx/hard-drop.wav",
             Sfx::Hold => "sfx/hold.wav",
             Sfx::GameOver => "sfx/game-over.wav",
+            Sfx::Cannon => "sfx/cannon.wav",
+            Sfx::Chip => "sfx/chip.wav",
+            Sfx::Spark => "sfx/spark.wav",
         }
     }
 }
@@ -193,6 +207,20 @@ pub fn sfx_for_event(event: &GameEvent) -> Option<EventSfx> {
         GameOver => EventSfx {
             label: "game-over",
             sfx: Sfx::GameOver,
+        },
+        // CANNONS mutator (T25). `CannonImpact` splits on `chipped` into two
+        // labels so the director counts a chip and a dud spark separately.
+        CannonFired { .. } => EventSfx {
+            label: "cannon-fired",
+            sfx: Sfx::Cannon,
+        },
+        CannonImpact { chipped: true, .. } => EventSfx {
+            label: "cannon-chip",
+            sfx: Sfx::Chip,
+        },
+        CannonImpact { chipped: false, .. } => EventSfx {
+            label: "cannon-spark",
+            sfx: Sfx::Spark,
         },
         // T14 Zen stack wipe: kept silent — no fitting WAV asset exists and
         // a wipe is deliberately calm (PRD "relax"). The arm keeps the match
@@ -537,7 +565,8 @@ impl Plugin for AudioPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tetris_core::piece::{Piece, PieceState, Rotation};
+    use tetris_core::cannons::CannonSide;
+    use tetris_core::piece::{Piece, PieceState, Rotation, FULL_CELLS};
     use tetris_core::tspin::TSpinKind;
 
     fn state(piece: Piece) -> PieceState {
@@ -546,6 +575,7 @@ mod tests {
             rot: Rotation::default(),
             row: 2,
             col: 4,
+            alive: FULL_CELLS,
         }
     }
 
@@ -580,6 +610,25 @@ mod tests {
             GameEvent::PerfectClear,
             GameEvent::ComboChanged { n: 1 },
             GameEvent::GameOver,
+            GameEvent::CannonFired {
+                side: CannonSide::Left,
+                row: 4,
+                tick: 240,
+            },
+            GameEvent::CannonImpact {
+                side: CannonSide::Left,
+                row: 4,
+                col: 5,
+                tick: 260,
+                chipped: true,
+            },
+            GameEvent::CannonImpact {
+                side: CannonSide::Right,
+                row: 9,
+                col: 4,
+                tick: 261,
+                chipped: false,
+            },
         ]
     }
 
@@ -596,7 +645,7 @@ mod tests {
         app
     }
 
-    const AUDIBLE_LABELS: [&str; 9] = [
+    const AUDIBLE_LABELS: [&str; 12] = [
         "lock",
         "line-clear",
         "tetris",
@@ -606,6 +655,9 @@ mod tests {
         "perfect-clear",
         "combo",
         "game-over",
+        "cannon-fired",
+        "cannon-chip",
+        "cannon-spark",
     ];
 
     #[test]
@@ -661,6 +713,37 @@ mod tests {
             (GameEvent::PerfectClear, "perfect-clear", Sfx::Tetris),
             (GameEvent::ComboChanged { n: 0 }, "combo", Sfx::Move),
             (GameEvent::GameOver, "game-over", Sfx::GameOver),
+            (
+                GameEvent::CannonFired {
+                    side: CannonSide::Left,
+                    row: 4,
+                    tick: 240,
+                },
+                "cannon-fired",
+                Sfx::Cannon,
+            ),
+            (
+                GameEvent::CannonImpact {
+                    side: CannonSide::Left,
+                    row: 4,
+                    col: 5,
+                    tick: 260,
+                    chipped: true,
+                },
+                "cannon-chip",
+                Sfx::Chip,
+            ),
+            (
+                GameEvent::CannonImpact {
+                    side: CannonSide::Right,
+                    row: 9,
+                    col: 4,
+                    tick: 261,
+                    chipped: false,
+                },
+                "cannon-spark",
+                Sfx::Spark,
+            ),
         ];
         for (event, label, sfx) in cases {
             let mapped = sfx_for_event(&event).unwrap_or_else(|| panic!("{event:?} unmapped"));

@@ -52,7 +52,7 @@ use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
 use tetris_core::mode::{FinishReason, Goal, ModeConfig};
-use tetris_core::piece::{Piece, PieceState, Rotation};
+use tetris_core::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
 use crate::modes::{self, ModeId};
 use crate::records::Records;
@@ -251,6 +251,9 @@ impl GameCore {
         let mutators = self.selected_mutators;
         if mutators.contains(crate::mutators::Mutators::TWENTY_G) {
             config.start_level = 20;
+        }
+        if mutators.contains(crate::mutators::Mutators::CANNONS) {
+            config.cannons = Some(tetris_core::cannons::CannonRules::default());
         }
         self.game = Game::with_config(seed, &config);
         self.seed = seed;
@@ -868,6 +871,7 @@ fn dig_landings(board: &Board, piece: Piece) -> Vec<(Rotation, i32, PieceState)>
                 rot,
                 row: 0,
                 col: boxcol,
+                alive: FULL_CELLS,
             };
             if board.collides(&ps) {
                 continue;
@@ -951,6 +955,7 @@ fn bot_move(snapshot: &GameSnapshot) -> Option<BotMove> {
             rot,
             row: active.row,
             col: active.col,
+            alive: FULL_CELLS,
         };
         if snapshot.board.collides(&base) {
             continue;
@@ -1973,6 +1978,7 @@ mod tests {
                 rot: Rotation::Spawn,
                 row: 0,
                 col: 4,
+                alive: FULL_CELLS,
             }),
             ghost_row: None,
             hold: None,
@@ -2092,6 +2098,7 @@ mod tests {
                 rot: Rotation::Spawn,
                 row: 0,
                 col: 4,
+                alive: FULL_CELLS,
             }),
             ghost_row: None,
             hold: None,
@@ -2119,6 +2126,7 @@ mod tests {
             rot: mv.rot,
             row: 0,
             col: mv.target_col,
+            alive: FULL_CELLS,
         };
         let ghost = board::ghost_row(&snapshot.board, &boxed);
         let landed = PieceState {

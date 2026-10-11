@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cannons::CannonSide;
 use crate::piece::{Piece, PieceState};
 use crate::tspin::TSpinKind;
 
@@ -99,5 +100,36 @@ pub enum GameEvent {
     StackWiped {
         /// Logical tick (`Game::tick_count()`) the wipe happened on.
         tick: u64,
+    },
+    /// CANNONS mutator: the battery on `side` fired the cannon mounted at
+    /// board `row` at `tick`. A cannonball (see
+    /// [`Game::cannon_shots`](crate::game::Game::cannon_shots)) now travels
+    /// that row; the renderer uses this for the muzzle flash and audio for
+    /// the boom. Appended last so older `GameEvent` streams stay decodable.
+    CannonFired {
+        /// Battery that fired.
+        side: CannonSide,
+        /// Board row of the barrel that fired (one of
+        /// [`CANNON_ROWS`](crate::cannons::CANNON_ROWS)).
+        row: i32,
+        /// Logical tick the shot left the barrel on.
+        tick: u64,
+    },
+    /// A cannonball met the falling piece on its row at board `(row, col)`.
+    /// `chipped == true` took one table cell out of the piece's
+    /// [`alive`](crate::piece::PieceState::alive) mask; `false` sparked off
+    /// the piece's last remaining cell (a ball never annihilates a piece).
+    /// Either way the ball is spent and leaves the shot list.
+    CannonImpact {
+        /// Battery that fired the ball.
+        side: CannonSide,
+        /// Board row of the impact.
+        row: i32,
+        /// Board column of the met cell at impact.
+        col: i32,
+        /// Logical tick of the impact.
+        tick: u64,
+        /// `true` when a cell was chipped out of the piece.
+        chipped: bool,
     },
 }

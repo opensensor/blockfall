@@ -10,6 +10,7 @@
 //! | `4`   | [`Mutators::ONE_PREVIEW`] | HUD next queue forces a single preview (`hud::sync_hud_previews`) |
 //! | `8`   | [`Mutators::TWENTY_G`] | `start_level = 20` override in `GameCore::start_mode` (R1 config, plan R7) |
 //! | `16`  | [`Mutators::HORROR`] | night render: the active piece is a downward flashlight — everything outside its widening beam dims to a dark silhouette and the well grid mutes under night-shade quads (`render::render_playfield` light factor) |
+//! | `32`  | [`Mutators::CANNONS`] | side batteries: three cannons per side of the well fire cannonballs across random rows; a ball that meets the falling piece chips one cell out of it (never its last). Core mechanic via `ModeConfig::cannons` (`GameCore::start_mode`), rendered by `render::render_playfield` |
 //! | `128` | [`Mutators::INVISIBLE`] | locked cells fade out in the render (`render::render_playfield` per-cell lock ages, T24) |
 //!
 //! ## Lifecycle
@@ -47,6 +48,15 @@ impl Mutators {
     /// lit; the ghost light follows its own beam position. Render-only:
     /// the snapshot, replay and all HUD elements are untouched.
     pub const HORROR: Self = Self(16);
+    /// Side-battery cannons (`GameCore::start_mode` arms
+    /// `ModeConfig::cannons`): three barrels flank each side of the well
+    /// and fire a cannonball along one of three rows every few seconds. A
+    /// ball crossing the falling piece's row chips one cell out of the
+    /// piece (never its last — a lone cell just sparks off); chips ride
+    /// the piece through moves and rotations and show as a hole when the
+    /// piece locks. Deterministic from the run seed (independent core RNG
+    /// stream); suppressed records like every mutator.
+    pub const CANNONS: Self = Self(32);
     /// Locked cells fade out in the render (grace then linear fade over 60
     /// fixed steps, see `render::lock_fade_alpha`); active piece and ghost
     /// untouched. Wired in T24.
@@ -54,13 +64,14 @@ impl Mutators {
 
     /// The mutators the mode-select screen exposes as toggles, in fixed
     /// left-to-right UI order (deterministic layout order).
-    pub const SELECTABLE: [Self; 6] = [
+    pub const SELECTABLE: [Self; 7] = [
         Self::NO_HOLD,
         Self::NO_GHOST,
         Self::ONE_PREVIEW,
         Self::TWENTY_G,
         Self::INVISIBLE,
         Self::HORROR,
+        Self::CANNONS,
     ];
 
     /// No mutators (clean run).
@@ -102,6 +113,7 @@ impl Mutators {
             Self::TWENTY_G => "20G",
             Self::INVISIBLE => "INVISIBLE",
             Self::HORROR => "HORROR",
+            Self::CANNONS => "CANNONS",
             _ => "?",
         }
     }
@@ -126,6 +138,7 @@ mod tests {
         assert_eq!(Mutators::ONE_PREVIEW.bits(), 4);
         assert_eq!(Mutators::TWENTY_G.bits(), 8);
         assert_eq!(Mutators::HORROR.bits(), 16);
+        assert_eq!(Mutators::CANNONS.bits(), 32);
         assert_eq!(Mutators::INVISIBLE.bits(), 128);
         let all = Mutators::SELECTABLE
             .into_iter()
@@ -134,7 +147,7 @@ mod tests {
             assert_eq!(all & m.bits(), m.bits(), "{m:?} is a distinct single bit");
         }
         // INVISIBLE uses the sign-free top bit, clear of everything else.
-        assert_eq!(all, 1 | 2 | 4 | 8 | 16 | 128);
+        assert_eq!(all, 1 | 2 | 4 | 8 | 16 | 32 | 128);
     }
 
     #[test]
@@ -165,6 +178,7 @@ mod tests {
     fn selectable_runs_in_fixed_left_to_right_order() {
         assert!(Mutators::SELECTABLE.contains(&Mutators::INVISIBLE));
         assert!(Mutators::SELECTABLE.contains(&Mutators::HORROR));
+        assert!(Mutators::SELECTABLE.contains(&Mutators::CANNONS));
         assert_eq!(
             Mutators::SELECTABLE,
             [
@@ -174,6 +188,7 @@ mod tests {
                 Mutators::TWENTY_G,
                 Mutators::INVISIBLE,
                 Mutators::HORROR,
+                Mutators::CANNONS,
             ],
             "fixed left-to-right UI order"
         );

@@ -82,7 +82,7 @@ impl Plugin for RunStatsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tetris_core::piece::{Piece, PieceState, Rotation};
+    use tetris_core::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
     fn locked(events: &mut bevy::ecs::message::Messages<CoreEvent>) {
         events.write(CoreEvent(GameEvent::PieceLocked {
@@ -92,6 +92,7 @@ mod tests {
                 rot: Rotation::default(),
                 row: 2,
                 col: 4,
+                alive: FULL_CELLS,
             },
         }));
     }

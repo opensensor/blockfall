@@ -115,13 +115,22 @@ pub fn try_rotate(board: &Board, ps: &PieceState, dir: RotateDir) -> Option<Rota
         RotateDir::HalfTurn => ps.rot.half_turn(),
     };
     for (i, &(x, y)) in kick_offsets(dir, ps.piece, ps.rot).iter().enumerate() {
+        // The alive mask carries through unchanged: it indexes table slots,
+        // and the tables are pure rotations of spawn, so the chipped-cell
+        // pattern rotates with the piece geometry. The headroom guard below
+        // is deliberately mask-aware (`alive_cells()`): it exists so
+        // *rendered* cells never clip above the frame, and a dead cell is
+        // never rendered — chipping the nub (future cannon) must free the
+        // kicks it used to block. With the mask always full this is
+        // behavior-identical to `cells()`.
         let candidate = PieceState {
             piece: ps.piece,
             rot,
             row: ps.row - y,
             col: ps.col + x,
+            alive: ps.alive,
         };
-        if candidate.cells().iter().any(|&(r, _)| r < MIN_ROT_ROW) {
+        if candidate.alive_cells().any(|(r, _)| r < MIN_ROT_ROW) {
             continue;
         }
         if !board.collides(&candidate) {
@@ -138,7 +147,7 @@ pub fn try_rotate(board: &Board, ps: &PieceState, dir: RotateDir) -> Option<Rota
 mod tests {
     use super::{kick_offsets, try_rotate, RotateDir, RotationAttempt, MIN_ROT_ROW};
     use crate::board::{Board, COLS, ROWS};
-    use crate::piece::{Piece, PieceState, Rotation};
+    use crate::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
     const QUARTER_DIRS: [RotateDir; 2] = [RotateDir::Clockwise, RotateDir::CounterClockwise];
     const ALL_DIRS: [RotateDir; 3] = [
@@ -154,6 +163,7 @@ mod tests {
             rot,
             row,
             col,
+            alive: FULL_CELLS,
         }
     }
 
@@ -421,5 +431,39 @@ mod tests {
             "{:?}",
             a.state.cells()
         );
+    }
+
+    #[test]
+    fn rotation_carries_the_alive_mask_through_every_kick_state() {
+        // Chip table slot 0 of a T. The mask is slot-indexed and must
+        // survive every rotation unchanged (contract: the chip travels with
+        // the table slot as the piece rotates); at each state `alive_cells()`
+        // is exactly `cells()` minus the dead slot's absolute cell.
+        let board = Board::new();
+        let nub_dead: u8 = FULL_CELLS & !(1 << 0);
+        let start = PieceState {
+            alive: nub_dead,
+            ..ps(Piece::T, Rotation::Spawn, 4, 3)
+        };
+        let mut state = start;
+        for expected_rot in [Rotation::Cw, Rotation::R180, Rotation::Ccw, Rotation::Spawn] {
+            let a = try_rotate(&board, &state, RotateDir::Clockwise).expect("open rotation");
+            assert_eq!(a.state.rot, expected_rot);
+            assert_eq!(
+                a.state.alive, nub_dead,
+                "mask must survive rotation to {expected_rot:?}"
+            );
+            assert_eq!(a.state.alive_count(), 3);
+            let expected: Vec<(i32, i32)> = a
+                .state
+                .cells()
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 0)
+                .map(|(_, c)| c)
+                .collect();
+            assert_eq!(a.state.alive_cells().collect::<Vec<_>>(), expected);
+            state = a.state;
+        }
     }
 }

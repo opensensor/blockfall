@@ -44,6 +44,7 @@ use bevy::prelude::*;
 use bevy::window::Window;
 
 use tetris_core::board::{COLS, ROWS};
+use tetris_core::cannons::{CannonShot, CannonSide, CANNON_ROWS};
 
 use crate::state::Settings;
 use tetris_core::game::GameSnapshot;
@@ -388,7 +389,10 @@ pub fn row_glow_light(age: u16) -> f32 {
 /// the boost. Cell identity is untouched: same (kind, row, col) entries,
 /// only the light value of the same cell changes.
 pub fn night_glow_boost(cells: &mut [SnapshotCell], glow_ages: &[u16; ROWS]) {
-    for cell in cells.iter_mut().filter(|cell| cell.kind != CellKind::Active) {
+    for cell in cells
+        .iter_mut()
+        .filter(|cell| cell.kind != CellKind::Active)
+    {
         let age = glow_ages[cell.row as usize];
         if age == NO_GLOW {
             continue;
@@ -640,11 +644,14 @@ pub fn frame_cells_night(snapshot: &GameSnapshot, night: bool) -> Vec<SnapshotCe
         }
     }
     if let Some(active) = snapshot.active {
-        for (row, col) in active.cells() {
+        // `alive_cells` (not `cells`): a cell chipped out by the CANNONS
+        // batteries disappears from the falling piece and its ghost the
+        // same frame it dies, and never stamps into the ghost footprint.
+        for (row, col) in active.alive_cells() {
             push_visible(&mut cells, row, col, active.piece, CellKind::Active);
         }
         if let Some(ghost) = snapshot.ghost_row {
-            for (row, col) in active.cells() {
+            for (row, col) in active.alive_cells() {
                 let shifted = ghost + (row - active.row);
                 push_visible(&mut cells, shifted, col, active.piece, CellKind::Ghost);
             }
@@ -800,7 +807,9 @@ fn sync_shades(
             let transform = Transform::from_xyz(center.x, center.y, NIGHT_SHADE_Z);
             if index < pool.len() {
                 let entity = pool[index];
-                commands.entity(entity).insert((NightShade, sprite, transform));
+                commands
+                    .entity(entity)
+                    .insert((NightShade, sprite, transform));
             } else {
                 let entity = commands.spawn((NightShade, sprite, transform)).id();
                 pool.push(entity);
@@ -917,6 +926,270 @@ fn sync_backdrop(
         commands.entity(*entity).insert((marker, sprite, transform));
     } else {
         pool.push(commands.spawn((marker, sprite, transform)).id());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CANNONS mutator visuals: side barrels, in-flight balls, muzzle flashes and
+// impact pops. Solo field only (mutators never reach versus/net mirrors).
+// ---------------------------------------------------------------------------
+
+/// Iron tint of the six flank barrels (luminance texture
+/// [`art::cannon_image`], muzzle facing right; the left battery flips it).
+pub const CANNON_BARREL_COLOR: Color = Color::srgb(0.42, 0.44, 0.52);
+
+/// Cannonball tint: near-black iron kept legible by the texture's shading.
+pub const CANNON_BALL_COLOR: Color = Color::srgb(0.6, 0.61, 0.68);
+
+/// Muzzle flash tint (warm ember).
+pub const MUZZLE_FLASH_COLOR: Color = Color::srgb(1.0, 0.72, 0.3);
+
+/// Impact pop tint when the ball **chipped** a cell (chunky warm dust).
+pub const CANNON_CHIP_COLOR: Color = Color::srgb(1.0, 0.55, 0.25);
+
+/// Impact pop tint when the ball sparked off the piece's **last** cell
+/// (dull steel glint).
+pub const CANNON_SPARK_COLOR: Color = Color::srgb(0.8, 0.85, 0.95);
+
+/// Muzzle-flash / impact-pop lifetime in `Update` frames (decorative, so
+/// frame-decayed rather than step-aged).
+pub const CANNON_FX_FRAMES: u16 = 8;
+
+/// Z order: barrels over every cell layer, balls over barrels, flashes and
+/// pops above both (still under the juice overlay at z 10).
+const CANNON_BARREL_Z: f32 = 2.5;
+const CANNON_BALL_Z: f32 = 3.0;
+const CANNON_FX_Z: f32 = 3.2;
+
+/// Marks a pooled barrel sprite (`left` = the left battery).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CannonBarrel {
+    /// True for the barrels of the left battery (texture mirrored).
+    pub left: bool,
+}
+
+/// Marks a pooled cannonball sprite.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CannonBall;
+
+/// Marks a pooled muzzle-flash or impact-pop sprite.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CannonFxSprite;
+
+/// Pooled CANNONS sprites (solo field only).
+#[derive(Resource, Default)]
+struct CannonPools {
+    barrels: Vec<Entity>,
+    balls: Vec<Entity>,
+    fx: Vec<Entity>,
+}
+
+/// Transient CANNONS event visuals: a fired shot flashes its barrel's
+/// muzzle for [`CANNON_FX_FRAMES`] frames; an impact pops at the met cell
+/// (warm dust when a cell was taken, a steel glint when the ball sparked
+/// off the piece's last one).
+#[derive(Resource, Default)]
+struct CannonFx {
+    /// (board row, fired from the left battery, frames elapsed).
+    flashes: Vec<(i32, bool, u16)>,
+    /// (board row, board column, frames elapsed, chipped).
+    pops: Vec<(i32, i32, u16, bool)>,
+}
+
+/// Collect fresh cannon events into [`CannonFx`]. Own [`MessageReader`]
+/// (distinct cursor), so the Horror glow pass keeps reading the same
+/// stream with its own reader untouched.
+fn read_cannon_events(mut events: MessageReader<CoreEvent>, mut fx: ResMut<CannonFx>) {
+    for event in events.read() {
+        match event.0 {
+            GameEvent::CannonFired { side, row, .. } => {
+                fx.flashes.push((row, side == CannonSide::Left, 0));
+            }
+            GameEvent::CannonImpact {
+                row, col, chipped, ..
+            } => {
+                fx.pops.push((row, col, 0, chipped));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Age the transient CANNONS visuals one `Update` frame and drop the dead.
+fn advance_cannon_fx(mut fx: ResMut<CannonFx>) {
+    for (_, _, age) in fx.flashes.iter_mut() {
+        *age = age.saturating_add(1);
+    }
+    fx.flashes.retain(|&(_, _, age)| age < CANNON_FX_FRAMES);
+    for (_, _, age, _) in fx.pops.iter_mut() {
+        *age = age.saturating_add(1);
+    }
+    fx.pops.retain(|&(_, _, age, _)| age < CANNON_FX_FRAMES);
+}
+
+/// Fade-out alpha of an effect at `age` frames: 1.0 fresh, 0.0 at death.
+#[must_use]
+pub fn cannon_fx_alpha(age: u16) -> f32 {
+    1.0 - (age.min(CANNON_FX_FRAMES) as f32 / CANNON_FX_FRAMES as f32)
+}
+
+/// Expanding scale factor of an effect sprite at `age` frames.
+#[must_use]
+pub fn cannon_fx_scale(age: u16) -> f32 {
+    0.55 + 0.65 * (1.0 - cannon_fx_alpha(age))
+}
+
+/// World center of an in-flight cannonball. `x8` counts 1/8 cells in
+/// column space (`x8 = col * 8` is the center of `col`), so the ball
+/// interpolates smoothly between the core's integer collision steps; the
+/// y maps exactly like [`FieldLayout::cell_center`].
+#[must_use]
+pub fn shot_center(layout: &FieldLayout, shot: &CannonShot) -> Vec2 {
+    Vec2::new(
+        layout.origin.x + (shot.x8 as f32 / 8.0 + 0.5) * layout.cell,
+        layout.origin.y - ((shot.row - DRAWN_TOP) as f32 + 0.5) * layout.cell,
+    )
+}
+
+/// Barrel center `x` of one battery: half a barrel outside the frame bar's
+/// outer face (0.32 cells = `pad + t` of [`frame_bars`]).
+#[must_use]
+pub fn barrel_center_x(layout: &FieldLayout, left: bool) -> f32 {
+    let field_w = COLS as f32 * layout.cell;
+    let off = 0.32 * layout.cell + 0.55 * layout.cell;
+    if left {
+        layout.origin.x - off
+    } else {
+        layout.origin.x + field_w + off
+    }
+}
+
+/// Bring all CANNONS sprites in line with the frame: six barrels on
+/// [`CANNON_ROWS`], one ball per live entry of `shots`, and pooled flash/pop
+/// sprites from `fx`.
+#[allow(clippy::too_many_arguments)]
+fn sync_cannons(
+    commands: &mut Commands,
+    pools: &mut CannonPools,
+    layout: &FieldLayout,
+    shots: &[CannonShot],
+    fx: &CannonFx,
+    art: Option<&ArtAssets>,
+) {
+    let c = layout.cell;
+
+    // Barrels: fixed grid of six (row tier outer loop, then side), reused
+    // by index so a run never churns entities.
+    let mut index = 0usize;
+    for &row in CANNON_ROWS.iter() {
+        for &left in &[true, false] {
+            let mut sprite = Sprite {
+                color: CANNON_BARREL_COLOR,
+                custom_size: Some(Vec2::new(1.10 * c, 0.55 * c)),
+                ..default()
+            };
+            if let Some(art) = art {
+                sprite.image = art.cannon.clone();
+                sprite.flip_x = left;
+            }
+            let center = Vec2::new(barrel_center_x(layout, left), layout.cell_center(row, 0).y);
+            let transform = Transform::from_xyz(center.x, center.y, CANNON_BARREL_Z);
+            let marker = CannonBarrel { left };
+            if index < pools.barrels.len() {
+                let entity = pools.barrels[index];
+                commands.entity(entity).insert((marker, sprite, transform));
+            } else {
+                pools
+                    .barrels
+                    .push(commands.spawn((marker, sprite, transform)).id());
+            }
+            index += 1;
+        }
+    }
+
+    // Balls: one sprite per live shot, positions interpolated from `x8`.
+    if pools.balls.len() > shots.len() {
+        let surplus = pools.balls.split_off(shots.len());
+        for entity in surplus {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (index, shot) in shots.iter().enumerate() {
+        let mut sprite = Sprite {
+            color: CANNON_BALL_COLOR,
+            custom_size: Some(Vec2::splat(0.46 * c)),
+            ..default()
+        };
+        if let Some(art) = art {
+            sprite.image = art.ball.clone();
+        }
+        let center = shot_center(layout, shot);
+        let transform = Transform::from_xyz(center.x, center.y, CANNON_BALL_Z);
+        if index < pools.balls.len() {
+            let entity = pools.balls[index];
+            commands
+                .entity(entity)
+                .insert((CannonBall, sprite, transform));
+        } else {
+            pools
+                .balls
+                .push(commands.spawn((CannonBall, sprite, transform)).id());
+        }
+    }
+
+    // Flashes + pops share one pool; each carries its own fade and scale.
+    let mut marks: Vec<(Vec2, u16, Color)> = Vec::new();
+    for &(row, left, age) in &fx.flashes {
+        // The flash sits at the muzzle mouth, aimed into the well.
+        let mouth = if left { 0.62 * c } else { -0.62 * c };
+        marks.push((
+            Vec2::new(
+                barrel_center_x(layout, left) + mouth,
+                layout.cell_center(row, 0).y,
+            ),
+            age,
+            MUZZLE_FLASH_COLOR,
+        ));
+    }
+    for &(row, col, age, chipped) in &fx.pops {
+        let center = layout.cell_center(row, usize::try_from(col).unwrap_or(0).min(COLS - 1));
+        marks.push((
+            center,
+            age,
+            if chipped {
+                CANNON_CHIP_COLOR
+            } else {
+                CANNON_SPARK_COLOR
+            },
+        ));
+    }
+    if pools.fx.len() > marks.len() {
+        let surplus = pools.fx.split_off(marks.len());
+        for entity in surplus {
+            commands.entity(entity).despawn();
+        }
+    }
+    for (index, (center, age, color)) in marks.into_iter().enumerate() {
+        let mut sprite = Sprite {
+            color: color.with_alpha(cannon_fx_alpha(age)),
+            custom_size: Some(Vec2::splat(cannon_fx_scale(age) * c)),
+            ..default()
+        };
+        // The ball texture doubles as the round flash/pop puff.
+        if let Some(art) = art {
+            sprite.image = art.ball.clone();
+        }
+        let transform = Transform::from_xyz(center.x, center.y, CANNON_FX_Z);
+        if index < pools.fx.len() {
+            let entity = pools.fx[index];
+            commands
+                .entity(entity)
+                .insert((CannonFxSprite, sprite, transform));
+        } else {
+            pools
+                .fx
+                .push(commands.spawn((CannonFxSprite, sprite, transform)).id());
+        }
     }
 }
 
@@ -1237,6 +1510,8 @@ fn render_playfield(
     mut frames: ResMut<FramePools>,
     mut backdrops: ResMut<BackdropPools>,
     mut shades: ResMut<NightShadePool>,
+    mut cannon_pools: ResMut<CannonPools>,
+    cannon_fx: Res<CannonFx>,
     art: Option<Res<ArtAssets>>,
     settings: Option<Res<Settings>>,
 ) {
@@ -1258,6 +1533,9 @@ fn render_playfield(
         clear_pool(&mut commands, &mut frames.solo);
         clear_pool(&mut commands, &mut backdrops.solo);
         clear_pool(&mut commands, &mut shades.entities);
+        clear_pool(&mut commands, &mut cannon_pools.barrels);
+        clear_pool(&mut commands, &mut cannon_pools.balls);
+        clear_pool(&mut commands, &mut cannon_pools.fx);
         let snapshot = versus.match_.snapshot();
         let [left, right] = versus_layouts(size.x, size.y);
         sync_frame(
@@ -1390,6 +1668,29 @@ fn render_playfield(
     } else {
         clear_pool(&mut commands, &mut shades.entities);
     }
+    // **CANNONS**: barrels stand watch while the run carries the mutator,
+    // balls track the core's live volley (`Game::cannon_shots`), and the
+    // event-driven muzzle flashes / impact pops decay on their own. The
+    // chipped cells themselves need no special pass — `frame_cells` already
+    // draws only the piece's alive cells.
+    if core
+        .active_mode
+        .mutators
+        .contains(crate::mutators::Mutators::CANNONS)
+    {
+        sync_cannons(
+            &mut commands,
+            &mut cannon_pools,
+            &layout,
+            core.game.cannon_shots(),
+            &cannon_fx,
+            art.as_deref(),
+        );
+    } else {
+        clear_pool(&mut commands, &mut cannon_pools.barrels);
+        clear_pool(&mut commands, &mut cannon_pools.balls);
+        clear_pool(&mut commands, &mut cannon_pools.fx);
+    }
     sync_pool(
         &mut commands,
         entities,
@@ -1414,8 +1715,19 @@ impl Plugin for RenderPlugin {
             .init_resource::<FramePools>()
             .init_resource::<BackdropPools>()
             .init_resource::<NightShadePool>()
+            .init_resource::<CannonPools>()
+            .init_resource::<CannonFx>()
             .add_systems(Startup, art::init_art_assets)
-            .add_systems(Update, (update_vignette, render_playfield).chain());
+            .add_systems(
+                Update,
+                (
+                    update_vignette,
+                    advance_cannon_fx,
+                    read_cannon_events,
+                    render_playfield,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -1425,7 +1737,7 @@ mod tests {
     use crate::core_bridge::{CoreBridgePlugin, PendingActions};
     use crate::state::AppState;
     use tetris_core::board::{Board, HIDDEN_ROWS};
-    use tetris_core::piece::{PieceState, Rotation};
+    use tetris_core::piece::{PieceState, Rotation, FULL_CELLS};
 
     use bevy::app::FixedUpdate;
     use bevy::window::WindowPlugin;
@@ -1447,6 +1759,76 @@ mod tests {
                 "garbage must not share a tetromino palette color"
             );
         }
+    }
+
+    /// CANNONS: a chipped cell must vanish from the falling piece **and its
+    /// ghost** the same frame it dies (it used to keep drawing until the
+    /// lock merged the mask into the stack).
+    #[test]
+    fn chipped_cells_vanish_from_active_piece_and_ghost() {
+        let snapshot = GameSnapshot {
+            board: Board::new(),
+            // T at box (5, 3): table cells (5,4),(6,3),(6,4),(6,5); slot 1
+            // (the (6,3) nub) is the one the cannonball took.
+            active: Some(PieceState {
+                piece: Piece::T,
+                rot: Rotation::Spawn,
+                row: 5,
+                col: 3,
+                alive: 0b1101,
+            }),
+            ghost_row: Some(18),
+            hold: None,
+            hold_used: false,
+            next: Vec::new(),
+            score: 0,
+            level: 1,
+            lines: 0,
+            combo: 0,
+            b2b: false,
+            game_over: false,
+        };
+        let cells = frame_cells(&snapshot);
+        let active: Vec<(i32, usize)> = cells
+            .iter()
+            .filter(|c| c.kind == CellKind::Active)
+            .map(|c| (c.row, c.col))
+            .collect();
+        assert_eq!(active, vec![(5, 4), (6, 4), (6, 5)]);
+        let ghost: Vec<(i32, usize)> = cells
+            .iter()
+            .filter(|c| c.kind == CellKind::Ghost)
+            .map(|c| (c.row, c.col))
+            .collect();
+        assert_eq!(ghost, vec![(18, 4), (19, 4), (19, 5)]);
+    }
+
+    /// CANNONS render contract: `x8` counts 1/8 cells in column space, so a
+    /// shot at `x8 = col * 8` lands on the cell center and each +4 step is
+    /// half a cell of smooth travel.
+    #[test]
+    fn cannon_shot_positions_map_x8_to_world_space() {
+        let layout = FieldLayout::fit(640.0, 1_408.0);
+        let shot = CannonShot {
+            side: CannonSide::Left,
+            row: 9,
+            x8: 24,
+        };
+        let p = shot_center(&layout, &shot);
+        let col3 = layout.cell_center(9, 3);
+        assert!((p.x - col3.x).abs() < 1e-3 && (p.y - col3.y).abs() < 1.0e-3);
+        let later = shot_center(&layout, &CannonShot { x8: 28, ..shot });
+        assert!((later.x - (col3.x + 0.5 * layout.cell)).abs() < 1e-3);
+    }
+
+    /// CANNONS fx helpers: full on fire, zero at expiry, and the
+    /// pop grows while it fades.
+    #[test]
+    fn cannon_fx_helpers_fade_and_grow_over_lifetime() {
+        assert!((cannon_fx_alpha(0) - 1.0).abs() < 1e-6);
+        assert!(cannon_fx_alpha(0) > cannon_fx_alpha(4));
+        assert_eq!(cannon_fx_alpha(CANNON_FX_FRAMES), 0.0);
+        assert!(cannon_fx_scale(CANNON_FX_FRAMES - 1) > cannon_fx_scale(0));
     }
 
     /// Portrait-native viewport: HUD strip + touch deck reserved, field
@@ -1626,6 +2008,7 @@ mod tests {
                 rot: Rotation::Cw,
                 row: DRAWN_TOP,
                 col: 4,
+                alive: FULL_CELLS,
             }),
             ghost_row: None,
             hold: None,
@@ -1656,6 +2039,7 @@ mod tests {
             rot: Rotation::Cw,
             row: DRAWN_TOP - 1,
             col: 4,
+            alive: FULL_CELLS,
         });
         assert!(
             frame_cells(&lifted)
@@ -2738,7 +3122,11 @@ mod horror_tests {
             "one row above the lamp glows: {near}"
         );
         // ... and is fully dark a few rows up — the beam points down.
-        assert_eq!(lit(6, 4), HORROR_DIM_FACTOR, "nothing lights above the halo");
+        assert_eq!(
+            lit(6, 4),
+            HORROR_DIM_FACTOR,
+            "nothing lights above the halo"
+        );
 
         // The shaft widens with depth: a fixed side column goes from dark
         // near the piece to lit further down.
@@ -2761,7 +3149,10 @@ mod horror_tests {
             right: 5,
         };
         let deep = horror_light_factor(21, 4, Some(low));
-        assert!(deep > 0.5 && deep < 1.0, "depth falloff at the well floor: {deep}");
+        assert!(
+            deep > 0.5 && deep < 1.0,
+            "depth falloff at the well floor: {deep}"
+        );
 
         // The beam follows the piece: with the lamp over the left wall the
         // far-left bottom cell is full light.
@@ -2818,9 +3209,8 @@ mod horror_tests {
             "mutator-off pass stamps light 1.0 everywhere"
         );
         assert!(
-            on.iter()
-                .all(|c| c.kind == CellKind::Active
-                    || c.light == horror_light_factor(c.row, c.col, Some(beam))),
+            on.iter().all(|c| c.kind == CellKind::Active
+                || c.light == horror_light_factor(c.row, c.col, Some(beam))),
             "non-active cells carry the factor of their own beam position"
         );
         assert!(
@@ -3031,14 +3421,21 @@ mod horror_tests {
         let snapshot = app.world().non_send::<GameCore>().game.snapshot();
         let beam = active_beam(&snapshot).expect("piece active");
 
-        let count = app.world_mut().query::<&NightShade>().iter(app.world()).count();
+        let count = app
+            .world_mut()
+            .query::<&NightShade>()
+            .iter(app.world())
+            .count();
         assert_eq!(count, VISIBLE_ROWS * COLS, "one shade quad per drawn cell");
 
         // The cell the shaft points at draws clear: the grid beneath is
         // revealed.
         let axis_col = (beam.axis().floor() as usize).min(COLS - 1);
         let lit = shade_alpha(&mut app, beam.bottom + 1, axis_col).expect("shade drawn");
-        assert!(lit < 0.1, "the beam reveals the grid under the piece: {lit}");
+        assert!(
+            lit < 0.1,
+            "the beam reveals the grid under the piece: {lit}"
+        );
 
         // The far bottom corner is outside the centered spawn beam (the
         // settled stack hugs the left wall): full mute coverage there.
@@ -3061,7 +3458,11 @@ mod horror_tests {
     #[test]
     fn night_shade_absent_without_horror() {
         let mut app = start_and_script(Mutators::empty(), 0xF05, 2);
-        let count = app.world_mut().query::<&NightShade>().iter(app.world()).count();
+        let count = app
+            .world_mut()
+            .query::<&NightShade>()
+            .iter(app.world())
+            .count();
         assert_eq!(count, 0, "no night shade without the mutator");
     }
 }

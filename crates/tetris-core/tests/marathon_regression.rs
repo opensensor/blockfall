@@ -38,7 +38,7 @@ use tetris_core::actions::Action;
 use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
-use tetris_core::piece::{Piece, PieceState, Rotation};
+use tetris_core::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
 // --- wire-shape helpers (mirrors of tetris-app's protocol codec) ----------
 
@@ -181,6 +181,7 @@ fn best_move(snapshot: &GameSnapshot) -> Option<(Rotation, i32)> {
             rot,
             row: active.row,
             col: active.col,
+            alive: FULL_CELLS,
         };
         if snapshot.board.collides(&base) {
             continue;

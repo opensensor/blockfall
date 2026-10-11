@@ -32,7 +32,7 @@ use tetris_core::board::{self, Board, COLS, ROWS};
 use tetris_core::event::GameEvent;
 use tetris_core::game::{Game, GameSnapshot};
 use tetris_core::mode::{FinishReason, Goal, ModeConfig, StartBoard};
-use tetris_core::piece::{Piece, PieceState, Rotation};
+use tetris_core::piece::{Piece, PieceState, Rotation, FULL_CELLS};
 
 const ROTATIONS: [Rotation; 4] = [Rotation::Spawn, Rotation::Cw, Rotation::R180, Rotation::Ccw];
 
@@ -119,6 +119,7 @@ fn best_move(snapshot: &GameSnapshot) -> Option<(Rotation, i32)> {
             rot,
             row: active.row,
             col: active.col,
+            alive: FULL_CELLS,
         };
         if snapshot.board.collides(&base) {
             continue;
@@ -483,6 +484,7 @@ fn landings(board: &Board, piece: Piece) -> Vec<(Rotation, i32, PieceState)> {
                 rot,
                 row: 0,
                 col: boxcol,
+                alive: FULL_CELLS,
             };
             if board.collides(&ps) {
                 continue;

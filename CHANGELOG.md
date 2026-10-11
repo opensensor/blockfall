@@ -3,6 +3,21 @@
 All notable changes to Blockfall are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased]
+
+### Added
+
+- **Cannons mutator** — three cannons mounted per side of the well (rows 4,
+  9 and 14) fire cannonballs straight across the board on a seeded,
+  deterministic cadence. A hit chips the exact cell it meets out of the
+  falling piece (the piece keeps rotating and playing with the bite taken
+  out of it); a piece down to its last cell only sparks instead of being
+  destroyed. Chipped cells vanish from the piece and its ghost the
+  instant they're hit. Barrels, balls and muzzle-flash/impact pops are
+  drawn procedurally; cannon fire, impacts and sparks have their own
+  synthesized SFX. The mutator is solo-only (never crosses the netplay
+  wire) and, like all mutators, suppresses best records.
+
 ## [0.7.0] — 2026-10-10
 
 ### Added
